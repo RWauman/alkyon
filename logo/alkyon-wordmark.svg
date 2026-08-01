@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="660" height="220" viewBox="0 0 660 220" role="img" aria-label="Alkyon">
+  <title>Alkyon</title>
+  <g transform="translate(4,-6) scale(0.85)">
+    <polygon points="112,188 78,124 140,34 160,102" fill="#1B8C9B"/>
+    <g stroke="#1B8C9B" stroke-width="10" stroke-linecap="round">
+      <line x1="34" y1="178" x2="98" y2="178"/>
+      <line x1="126" y1="178" x2="222" y2="178"/>
+    </g>
+    <g stroke="#CC6B33" stroke-width="6" stroke-linecap="round" fill="none">
+      <path d="M100,198 Q112,208 124,198"/>
+      <path d="M88,214 Q112,226 136,214"/>
+    </g>
+  </g>
+  <text x="228" y="146" font-family="ui-monospace, 'Berkeley Mono', 'JetBrains Mono', 'SF Mono', Menlo, monospace" font-size="104" letter-spacing="2" fill="#1B8C9B">alkyon</text>
+</svg>

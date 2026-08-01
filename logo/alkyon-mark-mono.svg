@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256" fill="currentColor" role="img" aria-label="Alkyon">
+  <title>Alkyon</title>
+  <polygon points="112,188 78,124 140,34 160,102"/>
+  <g stroke="currentColor" stroke-width="10" stroke-linecap="round">
+    <line x1="34" y1="178" x2="98" y2="178"/>
+    <line x1="126" y1="178" x2="222" y2="178"/>
+  </g>
+  <g stroke="currentColor" stroke-width="6" stroke-linecap="round" fill="none" opacity="0.55">
+    <path d="M100,198 Q112,208 124,198"/>
+    <path d="M88,214 Q112,226 136,214"/>
+  </g>
+</svg>

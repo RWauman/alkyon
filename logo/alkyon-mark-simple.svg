@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256" role="img" aria-label="Alkyon">
+  <title>Alkyon</title>
+  <polygon points="112,196 78,132 140,42 160,110" fill="#1B8C9B"/>
+  <g stroke="#1B8C9B" stroke-width="12" stroke-linecap="round">
+    <line x1="34" y1="186" x2="97" y2="186"/>
+    <line x1="127" y1="186" x2="222" y2="186"/>
+  </g>
+</svg>
