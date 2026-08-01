@@ -3,12 +3,13 @@
 </h1>
 
 <p align="center">
-  A portable data workbench: real dialect SQL, optional federation,<br>
+  A portable data workbench: real dialect SQL, DuckDB federation,<br>
   and a terminal your LLM agent can drive.
 </p>
 
-**A portable data workbench: real dialect SQL, optional federation, and a terminal your
-LLM agent can drive.**
+<p align="center">
+  <a href="GUIDE.md"><strong>User guide →</strong></a>
+</p>
 
 ἀλκυών — the Greek word for the kingfisher, the bird that dives through opaque water and
 comes back with the catch. English borrowed it as *halcyon*, along with an H that ancient
@@ -19,19 +20,19 @@ scribes added by mistake. Pronounced *AL-kee-on*.
 ## What it is
 
 Alkyon is a single Rust binary. It exposes an HTTP + WebSocket API and serves a static web
-UI that consumes it. That is the entire architecture — the desktop installer and the Docker
-image are two ways of shipping the same executable, not two codebases.
+UI that consumes it. That is the entire architecture — there is no second codebase for the
+desktop build.
 
 It connects to **SQL Server** (on-prem, Azure SQL, Microsoft Fabric) and **PostgreSQL**, and
-gives you a schema explorer, a multi-dialect SQL editor, a streaming result grid and an
-integrated terminal, in roughly ten megabytes.
+gives you a schema explorer, a multi-dialect SQL editor with cross-schema search, a streaming
+result grid, an integrated terminal, and DuckDB for joining across all of it.
 
 ## Why
 
 Heavyweight database IDEs are built for teams and for every engine on earth. Alkyon is built
 for one engineer with two or three sources, who needs to write vendor-specific SQL, join a
 spreadsheet against a production table, and hand the tedious parts to an agent — without a
-JVM, a workspace concept, or a licence server.
+JVM, a licence server, or a workspace concept.
 
 ## Two ways to query
 
@@ -40,26 +41,66 @@ translation layer and no lowest common denominator, so DDL, views, stored proced
 vendor-specific syntax all behave exactly as the server expects. Nothing sits between your
 text and the engine.
 
-**Federated.** An optional DuckDB source that attaches Excel files, CSVs and your registered
-databases so you can join across them. Enabled per source — if you never turn it on, it is
-never in the way.
-
-## Agent-native
-
-The built-in terminal is not a convenience feature, it is the point. Alkyon carries a
-Git-versioned folder of Markdown **skills and agents** — a query reviewer, a login and user
-provisioner, a procedure scaffolder — injected into the terminal's context. Point Claude Code
-or any other CLI agent at it and it inherits your conventions along with your connections.
+**Federated.** A buffer that starts with `-- @duckdb` runs in DuckDB, over tables you pull in
+with `-- @import` and files in the open folder — join two servers against a spreadsheet, or
+export a table straight to Parquet. Each import is still written in *its own* source's
+dialect; only the query on top is DuckDB's. A buffer without the directive never touches
+DuckDB.
 
 ## Also
 
 - Credentials live in the OS keychain (Windows Credential Manager, Keychain, libsecret),
   never in a config file
 - Results stream over WebSocket in batches, so a large `SELECT` renders as it arrives
-- Ships as a Tauri installer and as a Docker image
+- Sources come from your own registry and, optionally, a committable one in the project
+- Night Owl and Light Owl themes, following the OS unless you say otherwise
 
-## Not in v1
+## Running it
 
-No in-grid data editing, no migration management, no MySQL or Oracle connectors (the
-`Connector` trait is ready for them), no multi-user auth. This is a personal tool and it
-is early.
+```sh
+cargo run          # http://127.0.0.1:8787
+```
+
+The first build compiles DuckDB from source and takes a few minutes. See the
+[user guide](GUIDE.md) for everything else — adding a source, the keyboard, federation,
+settings and the HTTP API.
+
+### Development databases
+
+```sh
+docker compose -f docker/compose.dev.yml up -d      # postgres :55432, sql server :51433
+ALKYON_SOURCES=docker/sources.dev.json cargo run
+ALKYON_SOURCES=docker/sources.dev.json cargo test   # live tests skip themselves without it
+node --test tests/ui/swap.test.mjs                  # the JS unit tests
+docker compose -f docker/compose.dev.yml down -v
+```
+
+Both servers get the same `sales` demo schema — two tables, a composite primary key, a view,
+and 1500 rows so a streamed `SELECT` spans several batches. The federated tests join the two
+engines and assert the results agree exactly, which is what proves the type handling.
+
+## State of things
+
+Working and covered by tests against live servers: both connectors, streaming and
+cancellation, the keychain, the schema explorer and cross-schema search, tabs and file
+save, the open folder, the PTY terminal, and DuckDB federation over Postgres, SQL Server,
+CSV and Parquet.
+
+Written but not yet exercised: Excel import (calamine), Windows integrated authentication,
+and Entra ID token auth — the last two need servers this has not been run against.
+
+Not built yet:
+
+- **Skills and agents** — the Git-versioned folder of Markdown skills meant to be injected
+  into the terminal's context. The terminal is there; the skills are not.
+- **Packaging** — no Tauri installer and no Docker image yet, though the architecture is
+  built for both. Today it is `cargo run`.
+- **`ATTACH`-based federation**, for when predicate pushdown matters more than keeping the
+  import in its native dialect.
+- **Registered folder and blob-storage sources.** Files come from the open folder for now.
+
+Deliberately out of scope: in-grid editing, migration management, multi-user auth. MySQL and
+Oracle are absent but the `Connector` trait is ready for them.
+
+One thing to know: DuckDB is compiled in unconditionally, which puts the binary in the tens
+of megabytes rather than the ten the design originally aimed at.
