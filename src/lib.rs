@@ -1,3 +1,5 @@
+pub mod api;
+pub mod assets;
 pub mod connectors;
 pub mod error;
 pub mod federation;
