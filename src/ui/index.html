@@ -1,0 +1,208 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Alkyon</title>
+<link rel="icon" href="/logo/alkyon-mark.svg">
+
+<link rel="stylesheet" href="/vendor/codemirror.min.css">
+<link rel="stylesheet" href="/vendor/cm-show-hint.min.css">
+<link rel="stylesheet" href="/vendor/cm-dialog.css">
+<link rel="stylesheet" href="/vendor/cm-matchesonscrollbar.css">
+<link rel="stylesheet" href="/vendor/tabulator.min.css">
+<link rel="stylesheet" href="/vendor/xterm.css">
+<link rel="stylesheet" href="/theme.css">
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+
+<header id="chrome">
+  <img id="logo" src="/logo/alkyon-mark.svg" alt="" width="20" height="20">
+  <span class="brand">ALKYON</span>
+
+  <label>Source
+    <select id="source-select"></select>
+  </label>
+  <span class="dot" id="source-status" title="connection state"></span>
+
+  <label>Database
+    <select id="database-select"></select>
+  </label>
+
+  <button id="run" title="Ctrl+Enter — runs the selection if there is one">Run</button>
+  <button id="cancel" disabled>Cancel</button>
+  <button id="toggle-duckdb" aria-pressed="false"
+          title="Federate with DuckDB — adds `-- @duckdb` to the buffer">DuckDB</button>
+
+  <span class="spacer"></span>
+
+  <button id="theme-toggle" title="Cycle theme">◐ Auto</button>
+  <button id="toggle-terminal" aria-pressed="false">Terminal</button>
+  <span class="muted" id="build"></span>
+</header>
+
+<main>
+  <aside id="explorer-pane">
+    <div id="search-box">
+      <input id="search-input" type="search" placeholder="Search schemas… (Ctrl+K)"
+             autocomplete="off" spellcheck="false">
+    </div>
+    <div id="search-results"></div>
+    <div id="search-foot">
+      <span class="muted" id="search-coverage">nothing indexed yet</span>
+      <span class="spacer"></span>
+      <button id="index-all" title="Load the schema of every registered source">Index all</button>
+    </div>
+
+    <div class="pane-head divider">
+      <span>Sources</span>
+      <span class="spacer"></span>
+      <button id="add-source" title="Register a source">+</button>
+      <button id="refresh-explorer" title="Reload and re-check connections">&#x21bb;</button>
+    </div>
+    <div id="explorer" class="tree" role="tree"></div>
+
+    <div class="pane-head divider">
+      <span>Folder</span>
+      <span class="spacer"></span>
+      <button id="open-folder" title="Open a folder on the machine running alkyon">Open…</button>
+      <button id="close-folder" title="Close the folder" hidden>&#x2715;</button>
+    </div>
+    <div id="workspace-root" hidden></div>
+    <div id="workspace" class="tree"></div>
+  </aside>
+
+  <div class="splitter" id="split-sidebar" role="separator" aria-orientation="vertical"></div>
+
+  <section id="work">
+    <div id="tab-bar-row">
+      <div id="tab-bar" role="tablist"></div>
+      <button id="new-tab" title="New tab (Alt+N)">+</button>
+      <span class="spacer"></span>
+      <button id="open-file" title="Open .sql (Ctrl+O)">Open</button>
+      <button id="save-file" title="Save (Ctrl+S)">Save</button>
+      <button id="save-as-file" title="Save as (Ctrl+Shift+S)">Save as</button>
+    </div>
+    <div id="editor-pane"></div>
+    <div class="splitter horizontal" id="split-editor" role="separator" aria-orientation="horizontal"></div>
+    <div id="grid-pane">
+      <div id="grid"></div>
+    </div>
+    <div class="splitter horizontal" id="split-terminal" role="separator" aria-orientation="horizontal" hidden></div>
+
+    <div id="terminal-pane" hidden>
+      <div class="pane-head">
+        <span>Terminal</span>
+        <span class="gear" title="Shell">&#x2699;</span>
+        <select id="shell-select" title="Changing the shell restarts the session"></select>
+        <span class="spacer"></span>
+        <button id="terminal-close" title="Close the terminal">&#x2715;</button>
+      </div>
+      <div id="terminal"></div>
+    </div>
+  </section>
+</main>
+
+<footer id="status">
+  <span id="status-text">idle</span>
+  <span class="spacer"></span>
+  <span class="muted" id="status-detail"></span>
+</footer>
+
+<dialog id="folder-dialog">
+  <form id="folder-form" method="dialog">
+    <h2>Open a folder</h2>
+    <label>Path <input name="path" required placeholder="C:\projects\warehouse" size="44"></label>
+    <p class="hint">A path on the machine running alkyon — that is where the terminal
+      will start. Only <code>.sql</code> files are listed. <code>~</code> works.</p>
+    <p class="note" id="folder-note" hidden></p>
+    <div class="actions">
+      <button type="button" id="folder-cancel">Cancel</button>
+      <button type="submit" id="folder-open">Open</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="source-dialog">
+  <form id="source-form" method="dialog">
+    <h2>Register a source</h2>
+
+    <label>Id <input name="id" required placeholder="pg-prod" pattern="[A-Za-z0-9._-]+"></label>
+    <label>Registry
+      <select name="scope">
+        <option value="user">Mine — kept in my config directory</option>
+        <option value="project">This folder — .alkyon/sources.json, committable</option>
+      </select>
+    </label>
+    <label>Engine
+      <select name="kind">
+        <option value="postgres">PostgreSQL</option>
+        <option value="ms_sql">SQL Server</option>
+      </select>
+    </label>
+    <label>Host <input name="host" required placeholder="127.0.0.1"></label>
+    <label>Port <input name="port" type="number" min="1" max="65535" placeholder="default"></label>
+    <label class="mssql-only">Named instance <input name="instance" placeholder="SQLEXPRESS — leave port empty"></label>
+    <label>Database <input name="database" id="database-field" placeholder="optional"></label>
+
+    <label>Authentication
+      <select name="method">
+        <option value="password">Login and password</option>
+        <option value="integrated">Windows integrated</option>
+        <option value="aad_token">Entra ID access token</option>
+      </select>
+    </label>
+    <label class="auth-password">Username <input name="username"></label>
+    <label class="auth-password">Password <input name="password" type="password"></label>
+    <label class="auth-aad_token">Access token <input name="token" type="password"
+      placeholder="az account get-access-token --resource https://database.windows.net/"></label>
+
+    <label>Encryption
+      <select name="tls">
+        <option value="prefer">Prefer — encrypt, do not verify</option>
+        <option value="require">Require — verify certificate</option>
+        <option value="trust_certificate">Require, trust any certificate</option>
+        <option value="disable">Disable</option>
+      </select>
+    </label>
+
+    <p class="hint">The credential is verified against the server, then stored in the
+      OS keychain. Only the connection details are written to disk.</p>
+    <p class="note" id="source-note" hidden></p>
+
+    <div class="actions">
+      <button type="button" id="source-cancel">Cancel</button>
+      <button type="button" id="source-test">Test</button>
+      <button type="submit" id="source-save">Connect and save</button>
+    </div>
+  </form>
+</dialog>
+
+<!-- Vendored, MIT, see vendor/LICENSE-*.txt. Classic scripts: they publish
+     globals the modules below rely on, so order matters. -->
+<script src="/vendor/codemirror.min.js"></script>
+<script src="/vendor/cm-mode-sql.min.js"></script>
+<script src="/vendor/cm-show-hint.min.js"></script>
+<script src="/vendor/cm-sql-hint.min.js"></script>
+<script src="/vendor/cm-matchbrackets.min.js"></script>
+<script src="/vendor/cm-closebrackets.min.js"></script>
+<script src="/vendor/cm-comment.min.js"></script>
+<script src="/vendor/cm-active-line.min.js"></script>
+<script src="/vendor/cm-dialog.min.js"></script>
+<script src="/vendor/cm-searchcursor.min.js"></script>
+<script src="/vendor/cm-search.min.js"></script>
+<script src="/vendor/cm-jump-to-line.min.js"></script>
+<script src="/vendor/cm-annotatescrollbar.min.js"></script>
+<script src="/vendor/cm-matchesonscrollbar.min.js"></script>
+<script src="/vendor/cm-match-highlighter.min.js"></script>
+<!-- Loaded for the commands it registers (findAllUnder, selectNextOccurrence);
+     the sublime keymap itself is never activated. -->
+<script src="/vendor/cm-keymap-sublime.min.js"></script>
+<script src="/vendor/tabulator.min.js"></script>
+<script src="/vendor/xterm.js"></script>
+<script src="/vendor/xterm-addon-fit.js"></script>
+
+<script type="module" src="/app.js"></script>
+</body>
+</html>

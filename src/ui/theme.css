@@ -1,0 +1,212 @@
+/* Night Owl and Light Owl, after Sarah Drasner's VS Code themes.
+   https://github.com/sdras/night-owl-vscode-theme
+
+   Resolution order: an explicit [data-theme] on <html> wins; otherwise the OS
+   preference decides. Both directions are spelled out so the header toggle can
+   override a dark OS as well as a light one. */
+
+:root,
+:root[data-theme='light'] {
+  --bg: #fbfbfb;
+  --bg-sunken: #f0f0f0;
+  --bg-raised: #ffffff;
+  --fg: #403f53;
+  --fg-muted: #90a7b2;
+  --line: #d9d9d9;
+  --accent: #4876d6;
+  --accent-soft: #e0e7f7;
+  --error: #c96765;
+  --ok: #2aa198;
+  --editor-theme-bg: #fbfbfb;
+  --watermark: .10;
+  color-scheme: light;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme='light']) {
+    --bg: #011627;
+    --bg-sunken: #01111d;
+    --bg-raised: #0b2942;
+    --fg: #d6deeb;
+    --fg-muted: #637777;
+    --line: #1d3b53;
+    --accent: #82aaff;
+    --accent-soft: #1d3b53;
+    --error: #ef5350;
+    --ok: #22da6e;
+    --editor-theme-bg: #011627;
+    --watermark: .14;
+    color-scheme: dark;
+  }
+}
+
+:root[data-theme='dark'] {
+  --bg: #011627;
+  --bg-sunken: #01111d;
+  --bg-raised: #0b2942;
+  --fg: #d6deeb;
+  --fg-muted: #637777;
+  --line: #1d3b53;
+  --accent: #82aaff;
+  --accent-soft: #1d3b53;
+  --error: #ef5350;
+  --ok: #22da6e;
+  --editor-theme-bg: #011627;
+  --watermark: .14;
+  color-scheme: dark;
+}
+
+/* ------------------------------------------------------- CodeMirror: dark */
+
+.cm-s-night-owl.CodeMirror {
+  background: #011627;
+  color: #d6deeb;
+}
+.cm-s-night-owl .CodeMirror-gutters {
+  background: #011627;
+  border-right: 1px solid #1d3b53;
+}
+.cm-s-night-owl .CodeMirror-linenumber { color: #4b6479; }
+.cm-s-night-owl .CodeMirror-cursor { border-left: 1px solid #80a4c2; }
+.cm-s-night-owl div.CodeMirror-selected,
+.cm-s-night-owl.CodeMirror-focused div.CodeMirror-selected { background: #1d3b53; }
+.cm-s-night-owl .CodeMirror-line::selection,
+.cm-s-night-owl .CodeMirror-line > span::selection { background: #1d3b53; }
+.cm-s-night-owl .CodeMirror-activeline-background { background: #0b2942; }
+.cm-s-night-owl .CodeMirror-matchingbracket {
+  color: #d6deeb !important;
+  border-bottom: 1px solid #7fdbca;
+}
+
+.cm-s-night-owl .cm-comment { color: #637777; font-style: italic; }
+.cm-s-night-owl .cm-keyword { color: #c792ea; font-style: italic; }
+.cm-s-night-owl .cm-atom { color: #82aaff; }
+.cm-s-night-owl .cm-number { color: #f78c6c; }
+.cm-s-night-owl .cm-string,
+.cm-s-night-owl .cm-string-2 { color: #ecc48d; }
+.cm-s-night-owl .cm-operator { color: #7fdbca; }
+.cm-s-night-owl .cm-punctuation { color: #7fdbca; }
+.cm-s-night-owl .cm-variable { color: #d6deeb; }
+.cm-s-night-owl .cm-variable-2 { color: #addb67; }
+.cm-s-night-owl .cm-variable-3,
+.cm-s-night-owl .cm-type { color: #ffcb8b; }
+.cm-s-night-owl .cm-builtin { color: #82aaff; }
+.cm-s-night-owl .cm-def { color: #82aaff; }
+.cm-s-night-owl .cm-error { color: #ef5350; }
+.cm-s-night-owl .cm-bracket { color: #7fdbca; }
+
+/* ------------------------------------------------------ CodeMirror: light */
+
+.cm-s-light-owl.CodeMirror {
+  background: #fbfbfb;
+  color: #403f53;
+}
+.cm-s-light-owl .CodeMirror-gutters {
+  background: #f0f0f0;
+  border-right: 1px solid #d9d9d9;
+}
+.cm-s-light-owl .CodeMirror-linenumber { color: #90a7b2; }
+.cm-s-light-owl .CodeMirror-cursor { border-left: 1px solid #90a7b2; }
+.cm-s-light-owl div.CodeMirror-selected,
+.cm-s-light-owl.CodeMirror-focused div.CodeMirror-selected { background: #e0e0e0; }
+.cm-s-light-owl .CodeMirror-activeline-background { background: #f0f0f0; }
+.cm-s-light-owl .CodeMirror-matchingbracket {
+  color: #403f53 !important;
+  border-bottom: 1px solid #0c969b;
+}
+
+.cm-s-light-owl .cm-comment { color: #989fb1; font-style: italic; }
+.cm-s-light-owl .cm-keyword { color: #994cc3; font-style: italic; }
+.cm-s-light-owl .cm-atom { color: #4876d6; }
+.cm-s-light-owl .cm-number { color: #aa0982; }
+.cm-s-light-owl .cm-string,
+.cm-s-light-owl .cm-string-2 { color: #c96765; }
+.cm-s-light-owl .cm-operator { color: #0c969b; }
+.cm-s-light-owl .cm-punctuation { color: #0c969b; }
+.cm-s-light-owl .cm-variable { color: #403f53; }
+.cm-s-light-owl .cm-variable-2 { color: #0c969b; }
+.cm-s-light-owl .cm-variable-3,
+.cm-s-light-owl .cm-type { color: #111111; }
+.cm-s-light-owl .cm-builtin { color: #4876d6; }
+.cm-s-light-owl .cm-def { color: #4876d6; }
+.cm-s-light-owl .cm-error { color: #c96765; }
+.cm-s-light-owl .cm-bracket { color: #0c969b; }
+
+/* ------------------------------------------------- completion popup, both */
+
+.CodeMirror-hints {
+  background: var(--bg-raised);
+  color: var(--fg);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  box-shadow: 0 4px 14px rgb(0 0 0 / .25);
+  font-family: var(--mono);
+  z-index: 20;
+}
+.CodeMirror-hint { color: var(--fg); }
+li.CodeMirror-hint-active {
+  background: var(--accent);
+  color: var(--bg);
+}
+
+/* ------------------------------------------ search dialog and match marks */
+
+.CodeMirror-dialog {
+  background: var(--bg-raised);
+  color: var(--fg);
+  border-bottom: 1px solid var(--line);
+  font-family: var(--mono);
+  font-size: 12px;
+  padding: .3rem .5rem;
+}
+.CodeMirror-dialog input {
+  font: inherit;
+  color: var(--fg);
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  padding: .1rem .3rem;
+  width: 20rem;
+}
+.CodeMirror-dialog button { display: none; }
+
+/* Other occurrences of the selection, and their marks in the scrollbar. */
+.cm-matchhighlight {
+  background: var(--accent-soft);
+  outline: 1px solid color-mix(in srgb, var(--accent) 45%, transparent);
+}
+.CodeMirror-selection-highlight-scrollbar { background: var(--accent); }
+.CodeMirror-search-match {
+  background: var(--accent);
+  opacity: .5;
+  border-top: 1px solid var(--accent);
+  border-bottom: 1px solid var(--accent);
+}
+
+/* ---------------------------------------------------- Tabulator, variables */
+
+.tabulator {
+  border: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font-size: 12px;
+}
+.tabulator .tabulator-header,
+.tabulator .tabulator-header .tabulator-col {
+  background: var(--bg-sunken);
+  color: var(--fg);
+  border-color: var(--line);
+}
+.tabulator .tabulator-header .tabulator-col .tabulator-col-content { color: var(--fg); }
+.tabulator-row,
+.tabulator-row.tabulator-row-even { background: var(--bg); color: var(--fg); }
+.tabulator-row.tabulator-row-odd { background: var(--bg-raised); }
+.tabulator-row:hover { background: var(--accent-soft) !important; }
+.tabulator-row .tabulator-cell { border-color: var(--line); }
+.tabulator .tabulator-footer,
+.tabulator .tabulator-tableholder .tabulator-placeholder-contents {
+  background: var(--bg-sunken);
+  color: var(--fg-muted);
+  border-color: var(--line);
+}
+.tabulator .tabulator-tableholder { background: var(--bg); }

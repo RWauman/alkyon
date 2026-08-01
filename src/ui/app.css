@@ -1,0 +1,383 @@
+/* Layout and chrome. The palette, the CodeMirror themes and the Tabulator
+   overrides all live in theme.css. */
+
+:root {
+  --font: 13px/1.5 ui-sans-serif, system-ui, "Segoe UI", sans-serif;
+  --mono: ui-monospace, "Cascadia Mono", Consolas, monospace;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  font: var(--font);
+  color: var(--fg);
+  background: var(--bg);
+  height: 100vh;
+  display: grid;
+  grid-template-rows: auto 1fr auto;
+  overflow: hidden;
+}
+
+.spacer { flex: 1; }
+.muted { color: var(--fg-muted); }
+
+/* ---------------------------------------------------------------- chrome */
+
+#chrome, #status {
+  display: flex;
+  align-items: center;
+  gap: .6rem;
+  padding: .35rem .6rem;
+  background: var(--bg-sunken);
+}
+#chrome { border-bottom: 1px solid var(--line); }
+#status { border-top: 1px solid var(--line); font-family: var(--mono); font-size: 12px; }
+#status.error #status-text { color: var(--error); }
+
+#logo { display: block; flex: none; }
+.brand { font-weight: 600; letter-spacing: .12em; margin-right: .4rem; }
+
+#chrome label { display: flex; align-items: center; gap: .3rem; color: var(--fg-muted); }
+#chrome #source-status { margin-left: -.35rem; }
+
+select, input, button {
+  font: inherit;
+  color: var(--fg);
+  background: var(--bg-raised);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: .2rem .4rem;
+}
+button { cursor: pointer; }
+button:hover:not(:disabled) { border-color: var(--accent); }
+button:disabled { opacity: .45; cursor: default; }
+button[aria-pressed="true"] { border-color: var(--accent); color: var(--accent); }
+
+/* In DuckDB mode the source pickers do not apply, so say so quietly rather than
+   leaving them looking live. */
+body.federated #chrome label { opacity: .45; }
+body.federated #toggle-duckdb { background: var(--accent); color: var(--bg); }
+
+/* ------------------------------------------------------------ status dot */
+
+.dot {
+  width: .5rem;
+  height: .5rem;
+  border-radius: 50%;
+  flex: none;
+  background: var(--fg-muted);
+  opacity: .5;
+}
+.dot.ok { background: var(--ok); opacity: 1; }
+.dot.down { background: var(--error); opacity: 1; }
+.dot.checking { animation: dot-pulse 1.1s ease-in-out infinite; }
+
+@keyframes dot-pulse {
+  0%, 100% { opacity: .25; }
+  50% { opacity: .9; }
+}
+
+/* ---------------------------------------------------------------- layout */
+
+main {
+  display: grid;
+  grid-template-columns: var(--sidebar, 260px) auto 1fr;
+  min-height: 0;
+}
+
+#work {
+  display: grid;
+  grid-template-rows: auto var(--editor, 38%) auto 1fr auto var(--terminal, 0px);
+  min-height: 0;
+  min-width: 0;
+}
+
+/* Pinned to explicit rows: hiding the terminal splitter must not shift the pane
+   below it into the wrong track. */
+#tab-bar-row    { grid-row: 1; }
+#editor-pane    { grid-row: 2; }
+#split-editor   { grid-row: 3; }
+#grid-pane      { grid-row: 4; }
+#split-terminal { grid-row: 5; }
+#terminal-pane  { grid-row: 6; }
+
+/* ------------------------------------------------------------------- tabs */
+
+#tab-bar-row {
+  display: flex;
+  align-items: stretch;
+  gap: .25rem;
+  padding: 0 .4rem;
+  background: var(--bg-sunken);
+  border-bottom: 1px solid var(--line);
+  min-width: 0;
+}
+#tab-bar-row button {
+  align-self: center;
+  padding: .1rem .5rem;
+  font-size: 12px;
+}
+
+#tab-bar {
+  display: flex;
+  align-items: stretch;
+  gap: .15rem;
+  overflow-x: auto;
+  min-width: 0;
+  scrollbar-width: thin;
+}
+
+.tab {
+  display: flex;
+  align-items: center;
+  gap: .3rem;
+  padding: .25rem .1rem .25rem .55rem;
+  cursor: pointer;
+  white-space: nowrap;
+  border-bottom: 2px solid transparent;
+  color: var(--fg-muted);
+  font-size: 12px;
+}
+.tab:hover { color: var(--fg); }
+.tab.active {
+  color: var(--fg);
+  background: var(--bg);
+  border-bottom-color: var(--accent);
+}
+.tab-dirty { color: var(--accent); font-size: 9px; }
+.tab-close {
+  border: 0;
+  background: none;
+  color: var(--fg-muted);
+  padding: 0 .3rem;
+  font-size: 11px;
+  visibility: hidden;
+}
+.tab:hover .tab-close, .tab.active .tab-close { visibility: visible; }
+.tab-close:hover { color: var(--error); }
+
+#editor-pane, #grid-pane { min-height: 0; overflow: hidden; }
+
+#grid-pane { position: relative; }
+
+/* The mark stands in for an empty result pane, and gets out of the way the
+   moment a grid exists so it never competes with data. */
+#grid-pane::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: url('/logo/alkyon-mark.svg') no-repeat center / min(30%, 190px);
+  opacity: var(--watermark);
+  pointer-events: none;
+}
+#grid-pane:has(.tabulator)::before { content: none; }
+
+#terminal-pane {
+  min-height: 0;
+  display: grid;
+  grid-template-rows: auto 1fr;
+  background: var(--bg-sunken);
+}
+#terminal-pane[hidden] { display: none; }
+#terminal-pane .pane-head { border-bottom: 1px solid var(--line); border-top: 0; }
+#terminal-pane .gear { color: var(--fg-muted); }
+#shell-select { font-size: 11px; padding: 0 .2rem; }
+#terminal { min-height: 0; padding: .25rem .35rem; overflow: hidden; }
+
+.splitter { background: var(--line); }
+.splitter:not(.horizontal) { width: 4px; cursor: col-resize; }
+.splitter.horizontal { height: 4px; cursor: row-resize; }
+.splitter:hover, .splitter.dragging { background: var(--accent); }
+.splitter[hidden] { display: none; }
+
+/* -------------------------------------------------------------- explorer */
+
+/* Folder above, sources below, each scrolling independently. `minmax(0, …)` is
+   what stops a long list from pushing the other section off the pane. */
+#explorer-pane {
+  display: grid;
+  /* `minmax(0, 1fr)` pins the single column to the pane's width. Without it the
+     implicit `auto` column sizes to the widest tree row — which is `max-content`
+     by design — and every header stretches past the pane with it. */
+  grid-template-columns: minmax(0, 1fr);
+  /* search box, hits, coverage, sources head, sources tree,
+     folder head, folder path, folder tree */
+  grid-template-rows:
+    auto minmax(0, auto) auto
+    auto minmax(0, 1fr)
+    auto auto minmax(0, var(--folder, 0.9fr));
+  min-height: 0;
+  background: var(--bg-sunken);
+}
+
+.pane-head.divider { border-top: 1px solid var(--line); }
+
+/* ----------------------------------------------------------------- search */
+
+#search-box { padding: .4rem .5rem .3rem; }
+#search-input { width: 100%; font-size: 12px; }
+
+#search-results {
+  overflow: auto;
+  /* Never let the hits crowd out the trees below — they scroll instead. */
+  max-height: 40vh;
+}
+#search-results:empty { display: none; }
+
+#search-foot {
+  display: flex;
+  align-items: center;
+  gap: .3rem;
+  padding: 0 .5rem .35rem;
+  font-size: 10px;
+  font-family: var(--mono);
+}
+#search-foot button { padding: 0 .3rem; font-size: 10px; }
+#search-foot button[hidden] { display: none; }
+
+/* Two lines: the name, then where it lives. One line cannot hold a name, a type
+   and a source in a 260px pane without ellipsising all three. */
+.hit {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  grid-template-areas: 'kind name' 'kind meta';
+  gap: 0 .35rem;
+  padding: .2rem .5rem;
+  cursor: pointer;
+  font-size: 12px;
+}
+.hit:hover { background: var(--accent-soft); }
+
+.hit-kind {
+  grid-area: kind;
+  align-self: start;
+  margin-top: .15rem;
+  font-size: 9px;
+  font-family: var(--mono);
+  color: var(--fg-muted);
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  padding: 0 .2rem;
+}
+.hit-table { color: var(--accent); border-color: var(--accent); }
+
+.hit-line {
+  grid-area: name;
+  display: flex;
+  align-items: center;
+  gap: .3rem;
+  min-width: 0;
+}
+.hit-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.hit-meta {
+  grid-area: meta;
+  color: var(--fg-muted);
+  font-family: var(--mono);
+  font-size: 10px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+#workspace-root {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--fg-muted);
+  padding: 0 .5rem .3rem;
+  white-space: nowrap;
+  overflow: hidden;
+}
+#workspace-root[hidden] { display: none; }
+
+.pane-head {
+  display: flex;
+  align-items: center;
+  gap: .3rem;
+  padding: .3rem .5rem;
+  border-bottom: 1px solid var(--line);
+  color: var(--fg-muted);
+  text-transform: uppercase;
+  font-size: 11px;
+  letter-spacing: .08em;
+}
+.pane-head button { padding: 0 .35rem; line-height: 1.4; }
+
+.tree { overflow: auto; padding: .25rem 0; user-select: none; }
+
+.node > .row {
+  display: flex;
+  align-items: center;
+  gap: .3rem;
+  padding: .1rem .5rem;
+  cursor: default;
+  white-space: nowrap;
+  /* Size to content so long names scroll the tree sideways rather than being
+     truncated, while the hover highlight still spans the full pane. */
+  width: max-content;
+  min-width: 100%;
+}
+.node > .row:hover { background: var(--accent-soft); }
+.node > .row.selected { background: var(--accent-soft); box-shadow: inset 2px 0 0 var(--accent); }
+
+.twisty { width: 1em; text-align: center; color: var(--fg-muted); cursor: pointer; }
+.twisty.leaf { visibility: hidden; }
+.node .children { margin-left: 1em; border-left: 1px solid var(--line); }
+.node[aria-expanded="false"] > .children { display: none; }
+
+.label { white-space: nowrap; }
+.badge { color: var(--fg-muted); font-size: 11px; font-family: var(--mono); }
+.badge.pk { color: var(--accent); }
+
+/* Where a source is defined. Ordered after the name so the eye reads the name
+   first and the origin second. */
+.scope {
+  font-size: 9px;
+  letter-spacing: .06em;
+  text-transform: uppercase;
+  padding: 0 .25rem;
+  border-radius: 3px;
+  border: 1px solid var(--line);
+  color: var(--fg-muted);
+  flex: none;
+}
+.scope-project { color: var(--accent); border-color: var(--accent); }
+.row .drop { visibility: hidden; padding: 0 .3rem; border: 0; background: none; color: var(--fg-muted); }
+.row:hover .drop { visibility: visible; }
+.row .drop:hover { color: var(--error); }
+.tree .empty, .tree .failed { padding: .2rem .5rem .2rem 1.8rem; font-size: 12px; }
+.tree .failed { color: var(--error); }
+
+/* ---------------------------------------------------------------- editor */
+
+#editor-pane .CodeMirror {
+  height: 100%;
+  font-family: var(--mono);
+  font-size: 13px;
+}
+
+/* ------------------------------------------------------------------ grid */
+
+#grid { height: 100%; }
+.tabulator .tabulator-cell, .tabulator .tabulator-col { font-family: var(--mono); }
+.cell-null { color: var(--fg-muted); font-style: italic; }
+
+/* ---------------------------------------------------------------- dialog */
+
+dialog {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--bg-raised);
+  color: var(--fg);
+  min-width: 28rem;
+  padding: 1rem 1.2rem;
+}
+dialog::backdrop { background: rgb(0 0 0 / .45); }
+dialog h2 { margin: 0 0 .8rem; font-size: 14px; }
+dialog label { display: grid; grid-template-columns: 9rem 1fr; align-items: center; gap: .4rem; margin-bottom: .4rem; }
+dialog .hint { color: var(--fg-muted); font-size: 12px; margin: .8rem 0 0; }
+dialog .note { font-size: 12px; white-space: pre-wrap; margin: .5rem 0 0; }
+dialog .note.bad { color: var(--error); }
+dialog .note.good { color: var(--ok); }
+dialog .actions { display: flex; justify-content: flex-end; gap: .5rem; margin-top: 1rem; }
+dialog [hidden] { display: none; }
