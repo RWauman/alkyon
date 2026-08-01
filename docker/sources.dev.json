@@ -1,0 +1,20 @@
+[
+  {
+    "id": "pg-dev",
+    "kind": "postgres",
+    "host": "127.0.0.1",
+    "port": 55432,
+    "database": "alkyon_demo",
+    "tls": "disable",
+    "auth": { "method": "password", "username": "postgres", "password": "alkyon-dev" }
+  },
+  {
+    "id": "mssql-dev",
+    "kind": "ms_sql",
+    "host": "127.0.0.1",
+    "port": 51433,
+    "database": "alkyon_demo",
+    "tls": "trust_certificate",
+    "auth": { "method": "password", "username": "sa", "password": "Alkyon-dev-1" }
+  }
+]

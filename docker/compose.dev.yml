@@ -1,0 +1,61 @@
+# Development databases for Alkyon. Non-default host ports so this never collides
+# with a local PostgreSQL or SQL Server install.
+#
+#   docker compose -f docker/compose.dev.yml up -d
+#   docker compose -f docker/compose.dev.yml down -v
+name: alkyon-dev
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_PASSWORD: alkyon-dev
+      POSTGRES_DB: alkyon_demo
+    ports:
+      - "55432:5432"
+    volumes:
+      - ./seed/postgres:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d alkyon_demo"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  mssql:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: "Alkyon-dev-1"
+      MSSQL_PID: Developer
+    ports:
+      - "51433:1433"
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P "$$MSSQL_SA_PASSWORD" -C -Q "SELECT 1"
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+
+  # The SQL Server image has no init-script hook, so seed it once the server is up.
+  mssql-seed:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    depends_on:
+      mssql:
+        condition: service_healthy
+    volumes:
+      - ./seed/mssql:/seed:ro
+    entrypoint:
+      - /opt/mssql-tools18/bin/sqlcmd
+      - -S
+      - mssql
+      - -U
+      - sa
+      - -P
+      - Alkyon-dev-1
+      - -C
+      - -b
+      - -i
+      - /seed/01-demo.sql
+    restart: "no"
