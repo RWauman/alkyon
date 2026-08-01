@@ -1,0 +1,22 @@
+# Line endings are LF, in the repository and in the working tree, whatever a
+# contributor's `core.autocrlf` happens to be set to. Everything is already stored
+# as LF, so this settles the convention rather than changing any content — and it
+# stops a Windows checkout from producing a diff against a Linux one.
+* text=auto eol=lf
+
+# Never normalised, never diffed as text.
+*.png binary
+*.jpg binary
+*.ico binary
+
+# Built-in diff drivers: better hunk headers, so a diff says which function or
+# section it lands in.
+*.rs   diff=rust
+*.md   diff=markdown
+*.html diff=html
+*.css  diff=css
+
+# Third party, committed so that `cargo build` is the whole build and nothing is
+# fetched. It is twice the weight of the code we wrote, so keep it out of the
+# language statistics and collapsed in reviews.
+src/ui/vendor/** linguist-vendored
