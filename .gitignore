@@ -1,2 +1,12 @@
 # Credentials
 .env
+# An ALKYON_SOURCES import file, which does carry passwords. Anchored to the root
+# on purpose: a project's `.alkyon/sources.json` holds no credential and is meant
+# to be committed.
+/sources.json
+
+# Rust
+/target
+
+# Scratch notes on what is left to do
+/idea

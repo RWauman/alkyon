@@ -1,0 +1,89 @@
+[package]
+name = "alkyon"
+version = "0.1.0"
+edition = "2021"
+description = "A portable data workbench: real dialect SQL, optional federation, and a terminal your LLM agent can drive."
+license = "MIT"
+default-run = "alkyon"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
+axum = { version = "0.8", features = ["ws"] }
+tower-http = { version = "0.6", features = ["trace"] }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+async-trait = "0.1"
+futures = "0.3"
+async-stream = "0.3"
+
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+rust-embed = "8"
+mime_guess = "2"
+
+chrono = { version = "0.4", default-features = false, features = ["std", "serde"] }
+uuid = { version = "1", features = ["serde"] }
+rust_decimal = "1"
+
+sqlx = { version = "0.8", default-features = false, features = [
+    "runtime-tokio",
+    "tls-rustls-ring",
+    "postgres",
+    "json",
+    "chrono",
+    "uuid",
+    "rust_decimal",
+] }
+
+tiberius = { version = "0.12", default-features = false, features = [
+    "rustls",
+    "tds73",
+    "chrono",
+    "rust_decimal",
+    "sql-browser-tokio",
+    "winauth",
+] }
+tokio-util = { version = "0.7", features = ["compat"] }
+
+directories = "6"
+portable-pty = "0.9"
+
+# The federation engine. `bundled` statically links DuckDB, which is what keeps
+# the single-binary promise — at the cost of a much larger binary and a slow
+# first build.
+# `parquet` and `json` link those extensions in statically. Without them DuckDB
+# looks for `~/.duckdb/extensions/…` and wants to download, which would break the
+# offline promise the moment anyone reads a parquet file.
+duckdb = { version = "1.10505", features = ["bundled", "parquet", "json"] }
+# Excel, read in-process rather than through DuckDB's `excel` extension, so that
+# reading a spreadsheet never needs a network download.
+# `dates` is what turns an Excel serial number back into a real datetime.
+calamine = { version = "0.36", features = ["dates"] }
+
+# The platform backend is a feature, and enabling the wrong one for the target
+# fails to build — so pick it per target rather than in the shared table.
+[target.'cfg(windows)'.dependencies]
+keyring = { version = "3", features = ["windows-native"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3", features = ["apple-native"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "3", features = ["sync-secret-service"] }
+
+[dev-dependencies]
+# `oneshot` drives the router without binding a socket; the WebSocket tests need
+# a real client, and this is the one axum itself already pulls in.
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+tokio-tungstenite = "0.29"
+tempfile = "3"
+
+[profile.release]
+strip = true
+lto = "thin"
+codegen-units = 1
