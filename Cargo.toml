@@ -3,7 +3,10 @@ name = "alkyon"
 version = "0.1.0"
 edition = "2021"
 description = "A portable data workbench: real dialect SQL, optional federation, and a terminal your LLM agent can drive."
-license = "MIT"
+# PolyForm Noncommercial has no SPDX identifier, so the file is named instead of
+# a code. Not publishable to crates.io, which takes OSI licences only.
+license-file = "LICENSE"
+publish = false
 default-run = "alkyon"
 
 [dependencies]

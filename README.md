@@ -135,3 +135,19 @@ absent but the `Connector` trait is ready for it.
 
 One thing to know: DuckDB is compiled in unconditionally, which puts the binary in the tens
 of megabytes rather than the ten the design originally aimed at.
+
+## Licence
+
+[PolyForm Noncommercial 1.0.0](LICENSE). Use it, change it, share it, for any noncommercial
+purpose — personal projects, study, research, and any charity, school, public research body
+or government institution, whatever funds them. Selling it, or using it in the course of a
+business, needs a separate licence: ask.
+
+This is deliberately **not** an open-source licence, and calling it one would be wrong. It
+restricts a field of use, which the OSI definition does not allow.
+
+The vendored libraries keep their own terms and are unaffected: CodeMirror, xterm.js and the
+glide-data-grid bundle are all MIT, with their texts in `src/ui/vendor/`. So are DuckDB and
+the Rust crates, under MIT or Apache-2.0. None of them forbid the combined work being
+licensed as above, as long as their notices travel with it — which is why those files are
+committed rather than fetched.
