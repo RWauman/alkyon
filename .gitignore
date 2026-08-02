@@ -8,5 +8,10 @@
 # Rust
 /target
 
+# The grid bundle's build dependencies. Its *output* is committed under
+# src/ui/vendor/, so building or running alkyon never needs npm — only changing
+# the grid does.
+/tools/grid/node_modules
+
 # Scratch notes on what is left to do
 /idea

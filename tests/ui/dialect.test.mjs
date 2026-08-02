@@ -7,7 +7,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { previewSql, quoteFor } from '../../src/ui/dialect.js';
+import { previewSql, qualifyLoosely, quoteFor } from '../../src/ui/dialect.js';
 
 test('each engine gets the quoting it actually accepts', () => {
   assert.equal(quoteFor('tsql', 'orders'), '[orders]');
@@ -27,6 +27,30 @@ test('a name containing the quote character is escaped, not broken', () => {
 
 test('an unknown dialect falls back to the SQL standard', () => {
   assert.equal(quoteFor(undefined, 'orders'), '"orders"');
+});
+
+test('only the parts of a name that need quoting get it', () => {
+  // The case that started this: a folder called `2022` is a schema called
+  // `2022`, and SQL reads that as a number.
+  assert.equal(qualifyLoosely('duckdb', '2022.yellow_202212'), '"2022".yellow_202212');
+  // Ordinary names are left alone — quoting everything is safe and unreadable,
+  // and noise that is always there stops being read.
+  assert.equal(qualifyLoosely('duckdb', 'sales.customer'), 'sales.customer');
+  assert.equal(qualifyLoosely('pgsql', 'main.trips'), 'main.trips');
+});
+
+test('a name that collides with a keyword is quoted too', () => {
+  const reserved = { order: true, select: true };
+  assert.equal(qualifyLoosely('pgsql', 'sales.order', reserved), 'sales."order"');
+  assert.equal(qualifyLoosely('mysql', 'sales.order', reserved), 'sales.`order`');
+  assert.equal(qualifyLoosely('tsql', 'sales.order', reserved), 'sales.[order]');
+  // Case does not save you.
+  assert.equal(qualifyLoosely('pgsql', 'ORDER.x', reserved), '"ORDER".x');
+});
+
+test('quoting survives a name containing the quote character', () => {
+  assert.equal(qualifyLoosely('duckdb', 'we"rd.x'), '"we""rd".x');
+  assert.equal(qualifyLoosely('duckdb', 'a b.c-d'), '"a b"."c-d"');
 });
 
 test('the preview limits rows the way each engine spells it', () => {

@@ -1,6 +1,74 @@
 // The SQL editor: CodeMirror in whichever dialect the active source speaks,
 // with autocompletion fed from the schema the explorer has loaded so far.
 
+import { dialectForMime, qualifyLoosely } from './dialect.js';
+import { swapTargetAt } from './swap.js';
+
+/**
+ * Completions for the target of a `SWAP`, or null when that is not what is being
+ * typed.
+ *
+ * Without this the SQL hint answers `SWAP pg` with `PG_CONTEXT`,
+ * `PG_DATATYPE_NAME` and the rest of PL/pgSQL's `PG_*` keywords — and since the
+ * list pops up as you type, pressing Enter to move on accepts one. The directive
+ * silently becomes `SWAP PG_CONTEXT` and stops working. After `SWAP` the only
+ * words that mean anything are the sources you have registered, so those are the
+ * only ones offered.
+ */
+function swapCompletions(cm, sources) {
+  const cursor = cm.getCursor();
+  const at = swapTargetAt(cm.getValue().split('\n'), cursor.line, cursor.ch);
+  if (!at) return null;
+
+  const typed = at.token.toLowerCase();
+  const list = sources.filter((name) => name.toLowerCase().startsWith(typed));
+  return {
+    list,
+    from: CodeMirror.Pos(cursor.line, at.start),
+    // Replace the whole target, not just what is left of the cursor, so
+    // completing halfway through a name does not leave its tail behind.
+    to: CodeMirror.Pos(cursor.line, at.end),
+  };
+}
+
+/**
+ * `CodeMirror.hint.sql`, with the names it suggests made valid.
+ *
+ * The addon can quote a candidate — it has the code for it — but only once you
+ * have already typed a quote yourself, which is no help when you do not know a
+ * name needs one. A folder called `2022` is a schema called `2022`, and the
+ * completion cheerfully offered `2022.trips`, which is a syntax error.
+ *
+ * Matching still happens against the bare name inside the addon, so typing
+ * `2022` finds it; only the text that gets inserted changes. The list shows the
+ * bare name too, because that is the one you recognise.
+ */
+function quotingSqlHint(cm, options) {
+  const swap = swapCompletions(cm, options.sources ?? []);
+  if (swap) return swap;
+
+  const result = CodeMirror.hint.sql(cm, options);
+  if (!result?.list) return result;
+
+  const dialect = dialectForMime(cm.getOption('mode'));
+  const reserved = CodeMirror.resolveMode(cm.getOption('mode'))?.keywords;
+
+  result.list = result.list.map((item) => {
+    const bare = typeof item === 'string' ? item : item.text;
+    if (typeof bare !== 'string') return item;
+    // A keyword is offered *as* a keyword. Quoting `SELECT` would turn the
+    // completion into a column called "SELECT", which is the opposite of help.
+    if (typeof item !== 'string' && /hint-keyword/.test(item.className ?? '')) return item;
+
+    const quoted = qualifyLoosely(dialect, bare, reserved);
+    if (quoted === bare) return item;
+    return typeof item === 'string'
+      ? { text: quoted, displayText: bare }
+      : { ...item, text: quoted, displayText: item.displayText ?? bare };
+  });
+  return result;
+}
+
 /**
  * Teach every SQL mode that `SWAP` is a keyword.
  *
@@ -20,6 +88,8 @@ export function createEditor(element, { onRun, onOpen, onSave, onSaveAs, onNew, 
   // to column names. Table names are registered as soon as a database is
   // expanded; the columns fill in when a table is.
   let tables = {};
+  // Registered source names, for completing a SWAP target.
+  let sources = [];
 
   const editor = CodeMirror(element, {
     value: [
@@ -78,7 +148,7 @@ export function createEditor(element, { onRun, onOpen, onSave, onSaveAs, onNew, 
       'Alt-N': onNew,
       'Alt-W': onClose,
     },
-    hintOptions: { tables, completeSingle: false },
+    hintOptions: { tables, sources, completeSingle: false, hint: quotingSqlHint },
   });
 
   // Pop the completion list up while typing a word or just after a dot, rather
@@ -93,7 +163,7 @@ export function createEditor(element, { onRun, onOpen, onSave, onSaveAs, onNew, 
   if (onChange) editor.on('changes', () => onChange());
 
   function refreshHints() {
-    editor.setOption('hintOptions', { tables, completeSingle: false });
+    editor.setOption('hintOptions', { tables, sources, completeSingle: false, hint: quotingSqlHint });
   }
 
   return {
@@ -144,6 +214,12 @@ export function createEditor(element, { onRun, onOpen, onSave, onSaveAs, onNew, 
 
     text() {
       return editor.getValue();
+    },
+
+    /** What a SWAP may name. Bare ids, plus the qualified key when it differs. */
+    setSources(names) {
+      sources = names;
+      refreshHints();
     },
 
     /** Forget the schema — the active source or database changed. */

@@ -17,7 +17,10 @@ const state = {
   sources: [],
   source: null,
   database: null,
+  /** The open result, kept for as long as its pages may still be read. */
   running: null,
+  /** True while a page is on its way; what stops two queries overlapping. */
+  inFlight: false,
   /** id → { ok, detail }, filled in by the explorer's probes. */
   health: new Map(),
 };
@@ -352,6 +355,8 @@ const theme = createTheme({
   onResolve: (resolved) => {
     editor.setTheme(theme.editorTheme());
     terminal.setTheme(resolved);
+    // The grid paints on a canvas and inherits no CSS, so it has to be told.
+    grid.setTheme();
     $('theme-toggle').textContent = theme.label();
   },
 });
@@ -373,7 +378,7 @@ const explorer = createExplorer($('explorer'), {
   // Clicking a table peeks at it. The buffer is left alone — this is a look, not
   // an edit, so whatever you were writing survives.
   onPreview: (source, qualified) => {
-    if (state.busy || state.running) return;
+    if (state.busy || state.inFlight) return;
     stream(previewSql(source.dialect, qualified));
   },
   onTables: (source, db, tables) => {
@@ -480,6 +485,18 @@ async function loadSources({ keep = true } = {}) {
     return option;
   }));
 
+  // What a SWAP may name: the bare id, and the qualified key when telling two
+  // scopes apart is the only way to be unambiguous.
+  editor.setSources([
+    ...new Set(
+      state.sources.flatMap((source) =>
+        ambiguous.has(source.id) || source.scope === 'project'
+          ? [source.key, source.id]
+          : [source.id],
+      ),
+    ),
+  ]);
+
   const previous = keep ? state.source?.key : null;
   const next = state.sources.find((source) => source.key === previous) ?? state.sources[0];
   state.source = null;
@@ -531,7 +548,10 @@ async function applySwaps(sql) {
 // -------------------------------------------------------------------- query
 
 async function run() {
-  if (state.busy || state.running) return;
+  // `state.running` is no longer the guard: a finished result keeps its socket
+  // open so the next page can be read off the same query, so it stays set for as
+  // long as the result is on screen. What must not overlap is a page in flight.
+  if (state.busy || state.inFlight) return;
   state.busy = true;
   try {
     await execute();
@@ -553,28 +573,145 @@ async function execute() {
   stream(sql);
 }
 
-/** The row cap the header picker is set to; `0` means the user asked for none. */
-function maxRows() {
-  return Number($('max-rows').value);
+/** Rows per page, from the header picker. */
+function pageSize() {
+  return Number($('page-size').value);
 }
 
-/** Send one statement to the active source and render what comes back. */
+/**
+ * How many rows of already-seen pages to keep so **‹ Prev** can go back.
+ *
+ * There is no page count to jump to — for a CSV or a streamed query nobody knows
+ * how many pages there are until the last one arrives, which is why there is no
+ * page picker. So going back means remembering, and remembering has to be
+ * bounded or it becomes the very accumulation that paging exists to prevent.
+ * Past this, the oldest pages are dropped and Prev stops at what is left.
+ */
+const HISTORY_ROWS = 250_000;
+
+/**
+ * The pages this result has produced, and where we are among them.
+ *
+ * `more` is what the server said about the page at the end of `pages` — going
+ * back and forward again reads from here rather than from the socket, so it is
+ * instant and cannot disturb the cursor.
+ */
+const paging = { pages: [], at: -1, more: false, first: 1 };
+
+function resetPaging() {
+  paging.pages = [];
+  paging.at = -1;
+  paging.more = false;
+  paging.first = 1;
+}
+
+/** Remember a page, dropping the oldest ones once the budget is spent. */
+function keepPage(rows) {
+  paging.pages.push(rows);
+  paging.at = paging.pages.length - 1;
+
+  let held = paging.pages.reduce((total, page) => total + page.length, 0);
+  while (paging.pages.length > 1 && held > HISTORY_ROWS) {
+    held -= paging.pages.shift().length;
+    paging.at -= 1;
+    paging.first += 1;
+  }
+}
+
+/** The page number on screen, counting from one. */
+function pageNumber() {
+  return paging.first + paging.at;
+}
+
+function paintPaging() {
+  const known = paging.pages.length;
+  // A result that fits in one page says nothing about pages at all — a lone
+  // disabled pair of arrows is just furniture.
+  const paged = paging.more || known > 1;
+  const label = $('page-label');
+  const previous = $('prev-page');
+  const next = $('next-page');
+
+  label.textContent = paged ? `page ${pageNumber()}` : '';
+  label.hidden = !paged;
+  previous.hidden = !paged;
+  next.hidden = !paged;
+
+  previous.disabled = paging.at <= 0 || state.inFlight;
+  previous.title =
+    paging.at > 0
+      ? 'Back to the previous page'
+      : paging.first > 1
+        ? 'Earlier pages were dropped to keep memory bounded — run the query again to start over'
+        : 'This is the first page';
+
+  // Forward is free while there is a remembered page ahead; past that it costs
+  // a read off the still-open query.
+  const ahead = paging.at < known - 1;
+  next.disabled = (!ahead && !paging.more) || state.inFlight || state.running === null;
+  next.title = ahead
+    ? 'Forward to the next page'
+    : paging.more
+      ? 'Read the next page of this result'
+      : 'This is the last page';
+}
+
+/** Put a remembered page back on screen. */
+function showPage(at) {
+  paging.at = at;
+  grid.replace(paging.pages[at]);
+  status(`page ${pageNumber()}: ${paging.pages[at].length.toLocaleString()} row(s)`);
+  paintPaging();
+}
+
+/**
+ * Put the transport controls into their running state.
+ *
+ * `aria-busy` rather than a class of our own: it is what the CSS keys off *and*
+ * what a screen reader reads, so the spinner and the announcement cannot drift
+ * apart.
+ */
+function setRunning(running) {
+  state.inFlight = running;
+  const run = $('run');
+  run.disabled = running;
+  run.setAttribute('aria-busy', String(running));
+  run.title = running
+    ? 'Running — press Stop to give up on it'
+    : 'Run — Ctrl+Enter, and only the selection if there is one';
+  $('cancel').disabled = !running;
+}
+
+/** Send one statement to the active source and render its first page. */
 function stream(sql) {
   if (!state.source) return status('no source selected', true);
 
+  // A previous result is holding a connection open until it is let go.
+  state.running?.close();
+  state.running = null;
+  paintPaging();
+
   let rows = 0;
   let sawColumns = false;
-  $('run').disabled = true;
-  $('cancel').disabled = false;
+  let seen = 0;
+  resetPaging();
+  setRunning(true);
   status('running…');
   detail(`${state.source.key} · ${state.database ?? state.source.database}`);
 
-  state.running = runQuery(
+  // Closing the previous socket fires its `closed` handler a tick later, by
+  // which time this query owns `state.running`. Every handler therefore checks
+  // that it is still the current result before touching anything — otherwise a
+  // superseded socket tears down its successor on the way out.
+  let handle;
+  const current = () => state.running === handle;
+
+  handle = runQuery(
     {
       sourceId: state.source.key,
       database: state.database,
       sql,
-      maxRows: maxRows(),
+      pageSize: pageSize(),
     },
     {
       columns: ({ columns }) => {
@@ -584,36 +721,79 @@ function stream(sql) {
       rows: (message) => {
         rows += message.rows.length;
         grid.append(message.rows);
-        status(`${rows.toLocaleString()} rows…`);
+        status(`${(seen + rows).toLocaleString()} rows…`);
       },
       affected: ({ rows_affected }) => {
         if (!sawColumns) grid.message(`${rows_affected} row(s) affected`);
         status(`${rows_affected} row(s) affected`);
       },
-      end: ({ rows: total, elapsed_ms, truncated }) => {
-        if (!sawColumns && total === 0) grid.message('statement completed, no rows returned');
-        else grid.finish();
-        // Say plainly that there was more, rather than letting a capped result
-        // read as the whole answer.
+      end: ({ rows: inPage, page, elapsed_ms, more }) => {
+        if (!current()) return;
+        if (!sawColumns && inPage === 0 && page === 1) {
+          grid.message('statement completed, no rows returned');
+        } else {
+          grid.finish();
+        }
+        seen += inPage;
+        rows = 0;
+        keepPage(grid.take());
+        paging.more = more;
+        setRunning(false);
+        // The count is of the whole result so far, not of this page — that is
+        // the number you are actually keeping track of.
         status(
-          truncated
-            ? `first ${total.toLocaleString()} row(s) in ${elapsed_ms} ms — stopped at the row limit, there are more`
-            : `${total.toLocaleString()} row(s) in ${elapsed_ms} ms`,
+          more
+            ? `page ${page}: ${inPage.toLocaleString()} row(s) in ${elapsed_ms} ms — ${seen.toLocaleString()} so far, more to come`
+            : page > 1
+              ? `page ${page}: ${inPage.toLocaleString()} row(s) in ${elapsed_ms} ms — ${seen.toLocaleString()} in all, the last page`
+              : `${inPage.toLocaleString()} row(s) in ${elapsed_ms} ms`,
         );
+        paintPaging();
       },
-      cancelled: () => status('cancelled'),
+      cancelled: () => {
+        if (!current()) return;
+        status('cancelled');
+        paging.more = false;
+        paintPaging();
+      },
       error: ({ message }) => {
+        if (!current()) return;
         grid.message(message);
         status(message, true);
       },
       closed: () => {
+        if (!current()) return;
         state.running = null;
-        $('run').disabled = false;
-        $('cancel').disabled = true;
+        setRunning(false);
+        paintPaging();
       },
     },
   );
+  state.running = handle;
 }
+
+/** Forward: to a page already held if there is one, else read the next. */
+function nextPage() {
+  if (state.inFlight) return;
+  if (paging.at < paging.pages.length - 1) return showPage(paging.at + 1);
+  if (!state.running || !paging.more) return;
+
+  setRunning(true);
+  status(`reading page ${pageNumber() + 1}…`);
+  paintPaging();
+  // The page just finished belongs to `paging.pages` now; the grid needs its own
+  // array to fill, or it would append into the one being kept.
+  grid.newPage();
+  state.running.more();
+}
+
+function previousPage() {
+  if (state.inFlight || paging.at <= 0) return;
+  showPage(paging.at - 1);
+}
+
+$('next-page').addEventListener('click', nextPage);
+$('prev-page').addEventListener('click', previousPage);
 
 $('run').addEventListener('click', run);
 $('cancel').addEventListener('click', () => state.running?.cancel());

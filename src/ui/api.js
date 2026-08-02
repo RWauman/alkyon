@@ -73,23 +73,30 @@ export function socketUrl(path) {
 }
 
 /**
- * Run a statement, dispatching each streamed message to the handler of the same
- * name: columns, rows, affected, end, error, cancelled, closed.
+ * Run a statement and read its first page, dispatching each streamed message to
+ * the handler of the same name: columns, rows, affected, end, error, cancelled,
+ * closed.
  *
- * Returns a handle whose `cancel()` asks the server to stop — the server drops
- * the database stream, which is what actually cancels the query.
+ * **The socket stays open between pages.** The query it started stays open with
+ * it, positioned where the last page stopped, so `more()` reads on rather than
+ * re-running with an `OFFSET` — which would be slower and, for a statement with
+ * no `ORDER BY`, would quietly repeat or skip rows.
+ *
+ * `close()` is therefore required once you are done with the result: it is what
+ * releases the connection the query is holding.
  */
-export function runQuery({ sourceId, database, sql, maxRows }, handlers) {
+export function runQuery({ sourceId, database, sql, pageSize }, handlers) {
   const socket = new WebSocket(socketUrl('/ws/query'));
-  const terminal = new Set(['end', 'error', 'cancelled']);
+  // `end` finishes a page, not the result, so it no longer closes the socket.
+  const fatal = new Set(['error', 'cancelled']);
 
   socket.addEventListener('open', () =>
-    socket.send(JSON.stringify({ source_id: sourceId, database, sql, max_rows: maxRows })));
+    socket.send(JSON.stringify({ source_id: sourceId, database, sql, page_size: pageSize })));
 
   socket.addEventListener('message', ({ data }) => {
     const message = JSON.parse(data);
     handlers[message.type]?.(message);
-    if (terminal.has(message.type)) socket.close();
+    if (fatal.has(message.type)) socket.close();
   });
 
   // A socket-level failure is reported the same way as a server-side one, so
@@ -98,13 +105,19 @@ export function runQuery({ sourceId, database, sql, maxRows }, handlers) {
     handlers.error?.({ message: 'lost the connection to alkyon' }));
   socket.addEventListener('close', () => handlers.closed?.());
 
+  const send = (payload) => {
+    if (socket.readyState !== WebSocket.OPEN) return false;
+    socket.send(JSON.stringify(payload));
+    return true;
+  };
+
   return {
+    /** Ask for the next page of the query already running. */
+    more: () => send({ type: 'more' }),
     cancel() {
-      if (socket.readyState === WebSocket.OPEN) {
-        socket.send(JSON.stringify({ type: 'cancel' }));
-      } else {
-        socket.close();
-      }
+      if (!send({ type: 'cancel' })) socket.close();
     },
+    /** Let go of the query and its connection. */
+    close: () => socket.close(),
   };
 }

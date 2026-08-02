@@ -183,30 +183,9 @@ li.CodeMirror-hint-active {
   border-bottom: 1px solid var(--accent);
 }
 
-/* ---------------------------------------------------- Tabulator, variables */
+/* --------------------------------------------------------- the result grid */
 
-.tabulator {
-  border: 0;
-  background: var(--bg);
-  color: var(--fg);
-  font-size: 12px;
-}
-.tabulator .tabulator-header,
-.tabulator .tabulator-header .tabulator-col {
-  background: var(--bg-sunken);
-  color: var(--fg);
-  border-color: var(--line);
-}
-.tabulator .tabulator-header .tabulator-col .tabulator-col-content { color: var(--fg); }
-.tabulator-row,
-.tabulator-row.tabulator-row-even { background: var(--bg); color: var(--fg); }
-.tabulator-row.tabulator-row-odd { background: var(--bg-raised); }
-.tabulator-row:hover { background: var(--accent-soft) !important; }
-.tabulator-row .tabulator-cell { border-color: var(--line); }
-.tabulator .tabulator-footer,
-.tabulator .tabulator-tableholder .tabulator-placeholder-contents {
-  background: var(--bg-sunken);
-  color: var(--fg-muted);
-  border-color: var(--line);
-}
-.tabulator .tabulator-tableholder { background: var(--bg); }
+/* glide-data-grid paints on a canvas, so almost nothing here applies to it —
+   its colours are handed over as a theme object in grid.js. This is only the
+   frame around the canvas. */
+.gdg-wmyidgi { background: var(--bg); }

@@ -1,4 +1,4 @@
-/* Layout and chrome. The palette, the CodeMirror themes and the Tabulator
+/* Layout and chrome. The palette, the CodeMirror themes and the grid
    overrides all live in theme.css. */
 
 :root {
@@ -63,6 +63,41 @@ button.icon {
 }
 #run { color: var(--ok); }
 #cancel { color: var(--error); }
+
+/* While a query runs, the triangle is replaced by a spinner.
+   Greying the button says "you cannot press this"; it does not say "something is
+   happening", and those are different facts. */
+#run[aria-busy='true'] {
+  /* The glyph is still there for screen readers, just not on screen. */
+  color: transparent;
+  position: relative;
+  opacity: 1;
+}
+#run[aria-busy='true']::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  margin: auto;
+  width: .8rem;
+  height: .8rem;
+  border: 2px solid color-mix(in srgb, var(--ok) 30%, transparent);
+  border-top-color: var(--ok);
+  border-radius: 50%;
+  animation: spin .7s linear infinite;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+/* Someone who has asked not to be shown motion still needs to know it is
+   running, so the ring pulses in place instead of turning. */
+@media (prefers-reduced-motion: reduce) {
+  #run[aria-busy='true']::after {
+    animation: dot-pulse 1.1s ease-in-out infinite;
+    border-color: var(--ok);
+  }
+}
 button[aria-pressed="true"] { border-color: var(--accent); color: var(--accent); }
 
 /* In DuckDB mode the source pickers do not apply, so say so quietly rather than
@@ -188,7 +223,7 @@ main {
   opacity: var(--watermark);
   pointer-events: none;
 }
-#grid-pane:has(.tabulator)::before { content: none; }
+#grid-pane:has(#grid.has-grid)::before { content: none; }
 
 #terminal-pane {
   min-height: 0;
@@ -376,10 +411,11 @@ main {
 /* ------------------------------------------------------------------ grid */
 
 #grid { height: 100%; }
-.tabulator .tabulator-cell, .tabulator .tabulator-col { font-family: var(--mono); }
-.cell-null { color: var(--fg-muted); font-style: italic; }
-/* The row number is scaffolding, not data — it should not compete with it. */
-.tabulator .tabulator-cell.rownum { color: var(--fg-muted); background: var(--bg-sunken); }
+/* The grid measures this box and sizes its canvas to it, so it has to fill the
+   pane rather than take a height from its content — the canvas is its content. */
+.grid-host { position: absolute; inset: 0; overflow: hidden; }
+/* The overlay glide opens for a copied selection is portalled to <body>. */
+#portal { position: fixed; left: 0; top: 0; z-index: 40; }
 
 /* ---------------------------------------------------------------- dialog */
 

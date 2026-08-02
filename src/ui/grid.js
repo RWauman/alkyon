@@ -1,139 +1,245 @@
-// The result grid.
+// The result grid, drawn on a canvas by glide-data-grid.
 //
-// Rows arrive in batches while the query is still running, and the grid holds on
-// to them until the end rather than feeding each batch to Tabulator as it lands.
+// Two properties matter here, and they are the same property twice:
 //
-// That is not an optimisation, it is the difference between working and not.
-// `table.addData()` reprocesses the whole dataset on every call, so filling a
-// grid batch by batch is quadratic — measured on 19 columns:
+//   1. Rows are kept **exactly as they arrive off the socket** — arrays of JSON
+//      values, no per-row object, no copy. glide asks for the cells it is about
+//      to paint and nothing else, so holding a million rows costs a million rows
+//      and not a million row components.
 //
-//     5 000 rows   in 500-row batches   5 480 ms      one setData    469 ms
-//    10 000 rows   in 500-row batches  17 616 ms
-//   100 000 rows   in 500-row batches   never finished (froze the tab)
-//   100 000 rows                                      one setData  1 733 ms
+//   2. There is no ingestion step. Handing the grid a result is telling it how
+//      many rows exist; it reads what it needs, when it needs it.
 //
-// Doubling the rows tripled the time. Loaded in one call it is linear, about
-// 10 µs a row, and 100 000 rows land in under two seconds.
+// The predecessor built one object per row and fed Tabulator batch by batch,
+// which reprocessed the whole dataset on every call — 10 000 rows took 17.6
+// seconds and 100 000 never finished at all.
 
 /**
- * Tabulator writes a formatter's return value as HTML, so returning an element
- * with `textContent` set is what keeps a cell containing `<script>` inert.
- */
-function formatCell(cell) {
-  const value = cell.getValue();
-  const span = document.createElement('span');
-  if (value === null || value === undefined) {
-    span.className = 'cell-null';
-    span.textContent = 'NULL';
-  } else if (typeof value === 'object') {
-    span.textContent = JSON.stringify(value);
-  } else {
-    span.textContent = String(value);
-  }
-  return span;
-}
-
-/**
- * Rows shown while the query is still running, so a long one is not answered by
- * an empty pane. Small enough that painting it twice costs nothing.
+ * Rows painted while a query is still streaming, so a long one is not answered
+ * by an empty pane.
  */
 const PREVIEW_ROWS = 500;
 
+/** Read a theme custom property off the document. */
+function css(name) {
+  return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+}
+
 /**
- * The leading row-number column.
- *
- * A fixed width rather than one measured from the data: the grid renders only the
- * visible rows, so sizing to content would fit `1`–`40` and then clip once you
- * scrolled to six digits. Frozen, so the number stays put while you scroll a wide
- * result sideways — which is the whole point of having it.
- *
- * It counts *displayed* position, so sorting renumbers. That is what a row number
- * means in a grid; the row's identity is whatever key the data carries.
+ * glide paints on a canvas, so it cannot inherit anything from the stylesheet —
+ * every colour has to be handed over, and handed over again when the theme
+ * changes.
  */
-function rowNumberColumn() {
+function gridTheme() {
   return {
-    title: '#',
-    field: '__row',
-    formatter: 'rownum',
-    hozAlign: 'right',
-    headerHozAlign: 'right',
-    headerSort: false,
-    resizable: false,
-    frozen: true,
-    width: 68,
-    cssClass: 'rownum',
+    accentColor: css('--accent'),
+    accentLight: css('--accent-soft'),
+    textDark: css('--fg'),
+    textMedium: css('--fg'),
+    textLight: css('--fg-muted'),
+    textHeader: css('--fg'),
+    textHeaderSelected: css('--bg'),
+    textBubble: css('--fg'),
+    bgCell: css('--bg'),
+    bgCellMedium: css('--bg-raised'),
+    bgHeader: css('--bg-sunken'),
+    bgHeaderHovered: css('--bg-raised'),
+    bgHeaderHasFocus: css('--bg-raised'),
+    bgBubble: css('--bg-raised'),
+    bgBubbleSelected: css('--bg-raised'),
+    bgIconHeader: css('--fg-muted'),
+    fgIconHeader: css('--bg'),
+    borderColor: css('--line'),
+    horizontalBorderColor: css('--line'),
+    drilldownBorder: css('--line'),
+    linkColor: css('--accent'),
+    fontFamily: css('--mono'),
+    baseFontStyle: '12px',
+    headerFontStyle: '600 12px',
+    cellHorizontalPadding: 8,
   };
+}
+
+/** What a cell shows. NULL is spelled out, because empty and absent differ. */
+function display(value) {
+  if (value === null || value === undefined) return 'NULL';
+  if (typeof value === 'object') return JSON.stringify(value);
+  return String(value);
+}
+
+/** Logical types whose values must be ordered as numbers, not as text. */
+const NUMERIC = new Set(['int', 'float', 'decimal']);
+
+/**
+ * A comparator for a column, chosen from what the server said the column holds.
+ *
+ * The type matters and cannot be guessed from the value: `numeric` and `decimal`
+ * arrive as **strings**, deliberately, so their digits survive a round trip
+ * through JSON. Comparing those as text sorts 1002.75 before 13.37, which is
+ * what a sort on a money column did until someone looked at it.
+ *
+ * NULLs go last whichever direction you sort — they are the absence of an
+ * answer, not the smallest one.
+ */
+function comparatorFor(logical) {
+  const numeric = NUMERIC.has(logical);
+  return (a, b) => {
+    const missing = (v) => v === null || v === undefined;
+    if (missing(a)) return missing(b) ? 0 : 1;
+    if (missing(b)) return -1;
+
+    if (numeric) {
+      // Beyond 2^53 two adjacent values may tie rather than order. Exact
+      // ordering there would mean comparing digit strings by hand; ties in the
+      // eighteenth significant figure are not what a sort is for.
+      const [x, y] = [Number(a), Number(b)];
+      if (!Number.isNaN(x) && !Number.isNaN(y)) return x - y;
+    }
+
+    const [x, y] = [display(a), display(b)];
+    // Deliberately not `localeCompare`: it is an order of magnitude slower, and
+    // this runs over every row of a result that may have a million of them.
+    return x < y ? -1 : x > y ? 1 : 0;
+  };
+}
+
+/** Width in pixels for a column, measured against a sample of the data. */
+function widthFor(name, rows, index) {
+  const sample = Math.min(rows.length, 200);
+  let widest = name.length;
+  for (let r = 0; r < sample; r += 1) {
+    const length = display(rows[r][index]).length;
+    if (length > widest) widest = length;
+  }
+  // 7.6px per character at 12px monospace, plus padding, clamped so one long
+  // JSON blob cannot push every other column off screen.
+  return Math.min(Math.max(Math.round(widest * 7.6) + 26, 72), 420);
 }
 
 export class ResultGrid {
   constructor(element) {
     this.element = element;
-    this.table = null;
-    this.ready = null;
-    /** Every row received so far, handed to Tabulator in one go at the end. */
+    this.handle = null;
+    this.host = null;
+    /** Column metadata from the server. */
+    this.meta = [];
+    /** Raw rows, exactly as received. */
     this.rows = [];
+    /** Row indices in display order, or null while unsorted. */
+    this.view = null;
+    this.order = null;
     this.primed = false;
-    this.width = 0;
   }
 
-  /**
-   * Start a new result set. A fresh table per query avoids reconciling column
-   * definitions, and duplicate column names stay distinct because the field is
-   * the position, not the name.
-   */
+  /** Start a new result set. */
   reset(columns) {
     this.destroy();
-    this.width = columns.length;
-    this.table = new Tabulator(this.element, {
-      height: '100%',
-      layout: 'fitDataStretch',
-      renderVertical: 'virtual',
-      placeholder: 'no rows',
-      columnDefaults: { formatter: formatCell, headerHozAlign: 'left' },
-      columns: [rowNumberColumn(), ...columns.map((column, index) => ({
-        field: `c${index}`,
-        title: column.name,
-        headerTooltip: `${column.name} — ${column.type_name}`,
-      }))],
-      data: [],
-    });
-    // Tabulator 6 rejects addData before the table is built.
-    this.ready = new Promise((resolve) => this.table.on('tableBuilt', resolve));
+    this.meta = columns;
+    this.rows = [];
+    this.view = null;
+    this.order = null;
+    this.primed = false;
+
+    // A fresh node per result: unmounting a React root is deferred, and mounting
+    // a new one on a container that still has one is asking for trouble.
+    this.host = document.createElement('div');
+    this.host.className = 'grid-host';
+    this.element.replaceChildren(this.host);
+    this.element.classList.add('has-grid');
+    this.handle = window.AlkyonGrid.create(this.host);
   }
 
   append(rows) {
-    for (const row of rows) {
-      const record = {};
-      for (let i = 0; i < this.width; i += 1) record[`c${i}`] = row[i];
-      this.rows.push(record);
-    }
-    // One early paint, so a query that streams for a while shows its shape
-    // instead of an empty pane. After that the grid waits for the end — every
-    // extra load costs the whole dataset again.
+    // The whole point: no transformation, no allocation per row.
+    for (const row of rows) this.rows.push(row);
+
+    // One early paint so a long query shows its shape rather than an empty pane.
     if (!this.primed && this.rows.length >= PREVIEW_ROWS) {
       this.primed = true;
-      this.load(this.rows.slice(0, PREVIEW_ROWS));
+      this.show(PREVIEW_ROWS);
     }
   }
 
-  /** Hand `records` to Tabulator, guarding against a query that moved on. */
-  async load(records) {
-    if (!this.table) return;
-    const table = this.table;
-    await this.ready;
-    if (this.table === table) await table.setData(records);
+  /** Called once the last batch has arrived. */
+  finish() {
+    this.show(this.rows.length);
   }
 
   /**
-   * Called once the last batch has arrived: the single load that matters.
-   *
-   * `redraw(true)` is what sizes the columns — `fitDataStretch` measures against
-   * the data, and at `reset` time there was none, so without it every column
-   * stays as narrow as its header.
+   * Begin a page. The rows already here are left alone, not emptied: whoever
+   * called [`take`] owns that array now, and appending to it again would rewrite
+   * a page someone is still holding.
    */
-  async finish() {
-    await this.load(this.rows);
-    this.table?.redraw(true);
+  newPage() {
+    this.rows = [];
+    this.primed = false;
+  }
+
+  /**
+   * Hand this page's rows over. The caller owns them from here; the grid goes on
+   * showing them until the next [`newPage`].
+   */
+  take() {
+    return this.rows;
+  }
+
+  /**
+   * Show rows the caller already had: a page being revisited.
+   *
+   * The sort goes with the page it was applied to. Carrying it over would mean
+   * silently re-sorting a different set of rows under the same arrow.
+   */
+  replace(rows) {
+    this.rows = rows;
+    this.view = null;
+    this.order = null;
+    this.primed = true;
+    this.show(rows.length);
+  }
+
+  show(count) {
+    if (!this.handle) return;
+    this.handle.set({
+      columns: this.meta.map((column, index) => ({
+        id: `c${index}`,
+        title: this.titleFor(column, index),
+        width: widthFor(column.name, this.rows, index),
+      })),
+      rows: count,
+      getCell: (column, row) => {
+        const source = this.view ? this.rows[this.view[row]] : this.rows[row];
+        return window.AlkyonGrid.textCell(display(source?.[column]));
+      },
+      onHeaderClicked: (index) => this.sortBy(index),
+      theme: gridTheme(),
+    });
+  }
+
+  /** The arrow lives in the title: glide draws headers itself. */
+  titleFor(column, index) {
+    if (this.order?.index !== index) return column.name;
+    return `${column.name} ${this.order.ascending ? '▲' : '▼'}`;
+  }
+
+  /**
+   * Sort on a column, in place over an index array rather than over the rows —
+   * the rows stay in arrival order, which is what makes sorting reversible and
+   * cheap in memory.
+   */
+  sortBy(index) {
+    const ascending = !(this.order?.index === index && this.order.ascending);
+    this.order = { index, ascending };
+    const sign = ascending ? 1 : -1;
+    const compare = comparatorFor(this.meta[index]?.logical);
+
+    this.view = this.rows.map((_, i) => i);
+    this.view.sort((a, b) => sign * compare(this.rows[a][index], this.rows[b][index]));
+    this.show(this.rows.length);
+  }
+
+  /** Repaint with the current theme — the canvas inherits nothing. */
+  setTheme() {
+    this.handle?.set({ theme: gridTheme() });
   }
 
   /** Show a message instead of a grid — for DDL, or for a failed statement. */
@@ -148,14 +254,13 @@ export class ResultGrid {
 
   destroy() {
     this.rows = [];
+    this.view = null;
     this.primed = false;
-    if (this.table) {
-      this.table.destroy();
-      this.table = null;
-      this.ready = null;
-    }
+    this.handle?.destroy();
+    this.handle = null;
+    this.host = null;
     this.element.replaceChildren();
     // The empty-pane watermark keys off this class, so do not leave it behind.
-    this.element.classList.remove('tabulator');
+    this.element.classList.remove('has-grid');
   }
 }
