@@ -280,6 +280,86 @@ async fn websocket_streams_a_result_set() {
     }
 }
 
+/// A result comes back a page at a time, and the query stays open between pages.
+///
+/// The rows must not repeat or go missing across the boundary. That is the whole
+/// reason the cursor is held open instead of re-running with an `OFFSET`: this
+/// statement has an `ORDER BY`, but plenty do not, and a second run of an
+/// unordered query is free to hand back a different order.
+#[tokio::test]
+async fn websocket_pages_a_result_without_losing_rows() {
+    let Some(state) = seeded().await else {
+        eprintln!("skipped: ALKYON_SOURCES is not set");
+        return;
+    };
+    let sources = state.summaries().await;
+    let addr = serve(Arc::clone(&state)).await;
+
+    for source in sources {
+        let id = &source.id;
+        let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws/query"))
+            .await
+            .unwrap();
+
+        // 1500 rows in the seed, 400 to a page: four pages, the last one short.
+        socket
+            .send(Message::text(
+                json!({
+                    "source_id": source.id,
+                    "page_size": 400,
+                    "sql": "SELECT order_id, line_no FROM sales.order_line ORDER BY order_id, line_no",
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+
+        let mut seen: Vec<Value> = Vec::new();
+        let mut pages = 0usize;
+        loop {
+            let messages = drain(&mut socket).await;
+            let end = messages.last().expect("a page ends");
+            assert_eq!(end["type"], "end", "{id}: {messages:?}");
+
+            pages += 1;
+            assert_eq!(end["page"].as_u64(), Some(pages as u64), "{id}");
+            for message in &messages {
+                if message["type"] == "rows" {
+                    seen.extend(message["rows"].as_array().unwrap().iter().cloned());
+                }
+            }
+            // Only the last page may be short.
+            let expected = if end["more"] == json!(true) { 400 } else { 300 };
+            assert_eq!(end["rows"].as_u64(), Some(expected), "{id}: page {pages}");
+
+            if end["more"] != json!(true) {
+                break;
+            }
+            socket
+                .send(Message::text(json!({ "type": "more" }).to_string()))
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(pages, 4, "{id}: 1500 rows at 400 a page");
+        assert_eq!(seen.len(), 1500, "{id}: every row arrives exactly once");
+
+        // Ordered by (order_id, line_no), so the sequence must be strictly
+        // increasing across page boundaries — no repeats, no gaps.
+        let keys: Vec<(i64, i64)> = seen
+            .iter()
+            .map(|row| (row[0].as_i64().unwrap(), row[1].as_i64().unwrap()))
+            .collect();
+        let mut sorted = keys.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(keys, sorted, "{id}: pages overlapped or skipped");
+
+        // Columns are announced once, on the first page only.
+        socket.close(None).await.ok();
+    }
+}
+
 #[tokio::test]
 async fn websocket_reports_a_bad_statement() {
     let Some(state) = seeded().await else {

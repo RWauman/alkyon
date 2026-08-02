@@ -9,6 +9,7 @@ use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use super::cursor::{Chunk, Cursor};
 use crate::error::Result;
 use crate::model::{ColumnMeta, RowBatch};
 use crate::state::AppState;
@@ -24,29 +25,29 @@ struct QueryRequest {
     #[serde(default)]
     database: Option<String>,
     sql: String,
-    /// Stop after this many rows. `0` means no cap, which is the client asking
-    /// for it explicitly. Absent means [`max_rows`]'s default.
+    /// Rows per page. Absent falls back to [`page_size`]'s default.
     #[serde(default)]
-    max_rows: Option<usize>,
+    page_size: Option<usize>,
 }
 
-/// How many rows a query may send back before it is stopped.
+/// How many rows one page holds.
 ///
-/// Not a nicety. A single 2.5M-row parquet is 382 MB of JSON on the wire and
-/// roughly 800 MB of browser heap once parsed; a `select *` typed by reflex used
-/// to take the tab with it. Stopping early also *cancels* the query, because
-/// dropping the stream is what cancellation already means here.
-///
-/// The client sends its own value — the picker in the header — so this is only
-/// the floor for anything that does not.
-fn max_rows(request: &QueryRequest) -> Option<usize> {
-    let configured = request.max_rows.unwrap_or_else(|| {
-        std::env::var("ALKYON_MAX_ROWS")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(50_000)
-    });
-    (configured > 0).then_some(configured)
+/// Every result is paged, and this is the page. Nothing here is a preference:
+/// the whole of one taxi folder is 39.6M rows and **6.16 GB** of JSON — the
+/// server streams that in 106 seconds with flat memory, and a browser tab dies
+/// around 14M rows trying to hold it. A page is what keeps the browser's share
+/// of a result the same size whatever the result is.
+fn page_size(request: &QueryRequest) -> usize {
+    request
+        .page_size
+        .filter(|size| *size > 0)
+        .unwrap_or_else(|| {
+            std::env::var("ALKYON_PAGE_ROWS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .filter(|size| *size > 0)
+                .unwrap_or(50_000)
+        })
 }
 
 #[derive(Deserialize)]
@@ -67,11 +68,15 @@ enum ServerMessage {
     Affected {
         rows_affected: u64,
     },
+    /// End of a *page*, not of the result.
     End {
+        /// Rows in this page.
         rows: usize,
+        /// Which page this was, counting from one.
+        page: usize,
         elapsed_ms: u64,
-        /// The cap was hit and the query was stopped — there were more rows.
-        truncated: bool,
+        /// Whether asking again would bring anything back.
+        more: bool,
     },
     Cancelled,
     Error {
@@ -82,11 +87,16 @@ enum ServerMessage {
 type Sender = SplitSink<WebSocket, Message>;
 type Receiver = SplitStream<WebSocket>;
 
-/// One socket handles one query at a time, sequentially. Sending
-/// `{"type":"cancel"}` while a query is streaming drops the database stream,
-/// which is what actually cancels it.
+/// One socket runs one query at a time and keeps it open between pages.
+///
+/// A query message starts a fresh cursor; `{"type":"more"}` reads the next page
+/// from the one already running; `{"type":"cancel"}` drops it, which is what
+/// actually stops the engine.
 async fn session(socket: WebSocket, state: Arc<AppState>) {
     let (mut tx, mut rx) = socket.split();
+    let mut cursor: Option<Cursor> = None;
+    let mut page = 0usize;
+    let mut rows_per_page = 0usize;
 
     while let Some(Ok(message)) = rx.next().await {
         let text = match message {
@@ -94,6 +104,45 @@ async fn session(socket: WebSocket, state: Arc<AppState>) {
             Message::Close(_) => break,
             _ => continue,
         };
+
+        // `more` and `cancel` are the two controls; anything else is a query.
+        if let Ok(Control { kind }) = serde_json::from_str::<Control>(text.as_str()) {
+            match kind.as_str() {
+                "cancel" => {
+                    // Dropping the cursor drops the stream, and dropping the
+                    // stream is what cancellation has always meant here.
+                    cursor = None;
+                    if send(&mut tx, ServerMessage::Cancelled).await.is_err() {
+                        break;
+                    }
+                    continue;
+                }
+                "more" => {
+                    let Some(open) = cursor.as_mut() else {
+                        let _ = send(
+                            &mut tx,
+                            ServerMessage::Error {
+                                message: "no query is open — run one first".into(),
+                            },
+                        )
+                        .await;
+                        continue;
+                    };
+                    page += 1;
+                    match deliver(open, rows_per_page, page, &mut tx, &mut rx).await {
+                        Ok(true) => {}
+                        // Cancelled: the page number never happened.
+                        Ok(false) => {
+                            page -= 1;
+                            cursor = None;
+                        }
+                        Err(_) => break,
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+        }
 
         let request: QueryRequest = match serde_json::from_str(text.as_str()) {
             Ok(request) => request,
@@ -109,118 +158,123 @@ async fn session(socket: WebSocket, state: Arc<AppState>) {
             }
         };
 
-        let outcome = tokio::select! {
-            result = run(&state, &request, &mut tx) => Some(result),
-            () = wait_for_cancel(&mut rx) => None,
-        };
+        rows_per_page = page_size(&request);
+        page = 1;
+        let mut open = Cursor::open(
+            Arc::clone(&state),
+            request.source_id.clone(),
+            request.database.clone(),
+            request.sql.clone(),
+        );
+        match deliver(&mut open, rows_per_page, page, &mut tx, &mut rx).await {
+            Ok(true) => cursor = Some(open),
+            Ok(false) => cursor = None,
+            Err(_) => break,
+        }
+    }
+}
 
-        let closing = match outcome {
-            Some(Ok(())) => continue,
-            Some(Err(e)) => {
+/// Read one page off `cursor` and forward it. `Err` only when the socket died.
+///
+/// `rx` is watched throughout: a page can take a minute, and a cancel that only
+/// arrives once the page is finished is not a cancel. Returns `Ok(false)` when
+/// the client gave up on this one.
+async fn deliver(
+    cursor: &mut Cursor,
+    rows_per_page: usize,
+    page: usize,
+    tx: &mut Sender,
+    rx: &mut Receiver,
+) -> Result<bool> {
+    let started = Instant::now();
+
+    if !cursor.request(rows_per_page).await {
+        send(
+            tx,
+            ServerMessage::End {
+                rows: 0,
+                page,
+                elapsed_ms: 0,
+                more: false,
+            },
+        )
+        .await?;
+        return Ok(true);
+    }
+
+    let mut rows = 0usize;
+    loop {
+        let chunk = tokio::select! {
+            chunk = cursor.next_chunk() => chunk,
+            () = wait_for_cancel(rx) => {
+                cursor.exhaust();
+                send(tx, ServerMessage::Cancelled).await?;
+                return Ok(false);
+            }
+        };
+        let Some(chunk) = chunk else { break };
+
+        match chunk {
+            Chunk::Batch(RowBatch::Columns(columns)) => {
+                send(tx, ServerMessage::Columns { columns }).await?
+            }
+            Chunk::Batch(RowBatch::Rows(batch)) => {
+                rows += batch.len();
+                send(tx, ServerMessage::Rows { rows: batch }).await?;
+            }
+            Chunk::Batch(RowBatch::Affected(rows_affected)) => {
+                send(tx, ServerMessage::Affected { rows_affected }).await?
+            }
+            Chunk::Failed(e) => {
+                cursor.exhaust();
                 send(
-                    &mut tx,
+                    tx,
                     ServerMessage::Error {
                         message: e.to_string(),
                     },
                 )
-                .await
+                .await?;
+                return Ok(true);
             }
-            None => send(&mut tx, ServerMessage::Cancelled).await,
-        };
-        if closing.is_err() {
-            break;
+            Chunk::PageEnd { more } => {
+                if !more {
+                    cursor.exhaust();
+                }
+                send(
+                    tx,
+                    ServerMessage::End {
+                        rows,
+                        page,
+                        elapsed_ms: started.elapsed().as_millis() as u64,
+                        more,
+                    },
+                )
+                .await?;
+                return Ok(true);
+            }
         }
     }
-}
 
-async fn run(state: &AppState, request: &QueryRequest, tx: &mut Sender) -> Result<()> {
-    // A `-- @duckdb` preamble routes the buffer to the federator instead of to a
-    // single source. Checked here rather than in the client so that the buffer is
-    // the only source of truth about which engine runs it.
-    if crate::federation::program::is_federated(&request.sql) {
-        return run_federated(state, request, tx).await;
-    }
-
-    let started = Instant::now();
-    let connection = state
-        .open(&request.source_id, request.database.as_deref())
-        .await?;
-
-    let (rows, truncated) = pump(connection.execute(&request.sql), max_rows(request), tx).await?;
-
+    // The reader task went away without a verdict.
+    cursor.exhaust();
     send(
         tx,
         ServerMessage::End {
             rows,
+            page,
             elapsed_ms: started.elapsed().as_millis() as u64,
-            truncated,
+            more: false,
         },
     )
-    .await
-}
-
-/// Forward a result stream to the socket, stopping at `cap` rows.
-///
-/// Returns the row count and whether there were more. Breaking out of the loop
-/// drops the stream, and dropping the stream is what cancels the query — so a
-/// capped `select *` does not go on reading a 600 MB parquet in the background.
-async fn pump(
-    mut batches: futures::stream::BoxStream<'_, Result<RowBatch>>,
-    cap: Option<usize>,
-    tx: &mut Sender,
-) -> Result<(usize, bool)> {
-    let mut rows = 0usize;
-    let mut truncated = false;
-
-    while let Some(batch) = batches.next().await {
-        match batch? {
-            RowBatch::Columns(columns) => send(tx, ServerMessage::Columns { columns }).await?,
-            RowBatch::Affected(rows_affected) => {
-                send(tx, ServerMessage::Affected { rows_affected }).await?
-            }
-            RowBatch::Rows(mut batch) => {
-                // Strictly greater, so a result that lands exactly on the cap is
-                // reported whole rather than as "there is more" when there is not.
-                if cap.is_some_and(|cap| rows + batch.len() > cap) {
-                    batch.truncate(cap.unwrap_or(0) - rows);
-                    truncated = true;
-                }
-                rows += batch.len();
-                if !batch.is_empty() {
-                    send(tx, ServerMessage::Rows { rows: batch }).await?;
-                }
-                if truncated {
-                    break;
-                }
-            }
-        }
-    }
-    Ok((rows, truncated))
-}
-
-/// The federated path. Same messages out, so the client does not care which
-/// engine answered.
-async fn run_federated(state: &AppState, request: &QueryRequest, tx: &mut Sender) -> Result<()> {
-    let started = Instant::now();
-    let program = crate::federation::program::parse(&request.sql)?;
-    let imports = program.imports.len();
-
-    let batches = crate::federation::execute(state, program, crate::federation::Limits::from_env());
-    let (rows, truncated) = pump(batches, max_rows(request), tx).await?;
-
-    tracing::info!(imports, rows, truncated, "federated query finished");
-    send(
-        tx,
-        ServerMessage::End {
-            rows,
-            elapsed_ms: started.elapsed().as_millis() as u64,
-            truncated,
-        },
-    )
-    .await
+    .await?;
+    Ok(true)
 }
 
 /// Resolves when the client asks to cancel, or when the socket goes away.
+///
+/// Anything else that arrives mid-page is dropped: the socket runs one query at
+/// a time, and a second one sent before the first finished has no answer to go
+/// back to.
 async fn wait_for_cancel(rx: &mut Receiver) {
     while let Some(Ok(message)) = rx.next().await {
         match message {
