@@ -24,6 +24,29 @@ struct QueryRequest {
     #[serde(default)]
     database: Option<String>,
     sql: String,
+    /// Stop after this many rows. `0` means no cap, which is the client asking
+    /// for it explicitly. Absent means [`max_rows`]'s default.
+    #[serde(default)]
+    max_rows: Option<usize>,
+}
+
+/// How many rows a query may send back before it is stopped.
+///
+/// Not a nicety. A single 2.5M-row parquet is 382 MB of JSON on the wire and
+/// roughly 800 MB of browser heap once parsed; a `select *` typed by reflex used
+/// to take the tab with it. Stopping early also *cancels* the query, because
+/// dropping the stream is what cancellation already means here.
+///
+/// The client sends its own value — the picker in the header — so this is only
+/// the floor for anything that does not.
+fn max_rows(request: &QueryRequest) -> Option<usize> {
+    let configured = request.max_rows.unwrap_or_else(|| {
+        std::env::var("ALKYON_MAX_ROWS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(50_000)
+    });
+    (configured > 0).then_some(configured)
 }
 
 #[derive(Deserialize)]
@@ -35,12 +58,25 @@ struct Control {
 #[derive(Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ServerMessage {
-    Columns { columns: Arc<Vec<ColumnMeta>> },
-    Rows { rows: Vec<Vec<Value>> },
-    Affected { rows_affected: u64 },
-    End { rows: usize, elapsed_ms: u64 },
+    Columns {
+        columns: Arc<Vec<ColumnMeta>>,
+    },
+    Rows {
+        rows: Vec<Vec<Value>>,
+    },
+    Affected {
+        rows_affected: u64,
+    },
+    End {
+        rows: usize,
+        elapsed_ms: u64,
+        /// The cap was hit and the query was stopped — there were more rows.
+        truncated: bool,
+    },
     Cancelled,
-    Error { message: String },
+    Error {
+        message: String,
+    },
 }
 
 type Sender = SplitSink<WebSocket, Message>;
@@ -102,7 +138,7 @@ async fn run(state: &AppState, request: &QueryRequest, tx: &mut Sender) -> Resul
     // single source. Checked here rather than in the client so that the buffer is
     // the only source of truth about which engine runs it.
     if crate::federation::program::is_federated(&request.sql) {
-        return run_federated(state, &request.sql, tx).await;
+        return run_federated(state, request, tx).await;
     }
 
     let started = Instant::now();
@@ -110,60 +146,75 @@ async fn run(state: &AppState, request: &QueryRequest, tx: &mut Sender) -> Resul
         .open(&request.source_id, request.database.as_deref())
         .await?;
 
-    let mut batches = connection.execute(&request.sql);
-    let mut rows = 0usize;
-
-    while let Some(batch) = batches.next().await {
-        let message = match batch? {
-            RowBatch::Columns(columns) => ServerMessage::Columns { columns },
-            RowBatch::Rows(batch) => {
-                rows += batch.len();
-                ServerMessage::Rows { rows: batch }
-            }
-            RowBatch::Affected(rows_affected) => ServerMessage::Affected { rows_affected },
-        };
-        send(tx, message).await?;
-    }
+    let (rows, truncated) = pump(connection.execute(&request.sql), max_rows(request), tx).await?;
 
     send(
         tx,
         ServerMessage::End {
             rows,
             elapsed_ms: started.elapsed().as_millis() as u64,
+            truncated,
         },
     )
     .await
 }
 
-/// The federated path. Same messages out, so the client does not care which
-/// engine answered.
-async fn run_federated(state: &AppState, sql: &str, tx: &mut Sender) -> Result<()> {
-    let started = Instant::now();
-    let program = crate::federation::program::parse(sql)?;
-    let imports = program.imports.len();
-
-    let mut batches =
-        crate::federation::execute(state, program, crate::federation::Limits::from_env());
+/// Forward a result stream to the socket, stopping at `cap` rows.
+///
+/// Returns the row count and whether there were more. Breaking out of the loop
+/// drops the stream, and dropping the stream is what cancels the query — so a
+/// capped `select *` does not go on reading a 600 MB parquet in the background.
+async fn pump(
+    mut batches: futures::stream::BoxStream<'_, Result<RowBatch>>,
+    cap: Option<usize>,
+    tx: &mut Sender,
+) -> Result<(usize, bool)> {
     let mut rows = 0usize;
+    let mut truncated = false;
 
     while let Some(batch) = batches.next().await {
-        let message = match batch? {
-            RowBatch::Columns(columns) => ServerMessage::Columns { columns },
-            RowBatch::Rows(batch) => {
-                rows += batch.len();
-                ServerMessage::Rows { rows: batch }
+        match batch? {
+            RowBatch::Columns(columns) => send(tx, ServerMessage::Columns { columns }).await?,
+            RowBatch::Affected(rows_affected) => {
+                send(tx, ServerMessage::Affected { rows_affected }).await?
             }
-            RowBatch::Affected(rows_affected) => ServerMessage::Affected { rows_affected },
-        };
-        send(tx, message).await?;
+            RowBatch::Rows(mut batch) => {
+                // Strictly greater, so a result that lands exactly on the cap is
+                // reported whole rather than as "there is more" when there is not.
+                if cap.is_some_and(|cap| rows + batch.len() > cap) {
+                    batch.truncate(cap.unwrap_or(0) - rows);
+                    truncated = true;
+                }
+                rows += batch.len();
+                if !batch.is_empty() {
+                    send(tx, ServerMessage::Rows { rows: batch }).await?;
+                }
+                if truncated {
+                    break;
+                }
+            }
+        }
     }
+    Ok((rows, truncated))
+}
 
-    tracing::info!(imports, rows, "federated query finished");
+/// The federated path. Same messages out, so the client does not care which
+/// engine answered.
+async fn run_federated(state: &AppState, request: &QueryRequest, tx: &mut Sender) -> Result<()> {
+    let started = Instant::now();
+    let program = crate::federation::program::parse(&request.sql)?;
+    let imports = program.imports.len();
+
+    let batches = crate::federation::execute(state, program, crate::federation::Limits::from_env());
+    let (rows, truncated) = pump(batches, max_rows(request), tx).await?;
+
+    tracing::info!(imports, rows, truncated, "federated query finished");
     send(
         tx,
         ServerMessage::End {
             rows,
             elapsed_ms: started.elapsed().as_millis() as u64,
+            truncated,
         },
     )
     .await

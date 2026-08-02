@@ -52,12 +52,29 @@ select, input, button {
 button { cursor: pointer; }
 button:hover:not(:disabled) { border-color: var(--accent); }
 button:disabled { opacity: .45; cursor: default; }
+
+/* Transport controls. Fixed width so the pair never shifts as state changes. */
+button.icon {
+  width: 2rem;
+  padding: .2rem 0;
+  font-size: 12px;
+  line-height: 1.2;
+  text-align: center;
+}
+#run { color: var(--ok); }
+#cancel { color: var(--error); }
 button[aria-pressed="true"] { border-color: var(--accent); color: var(--accent); }
 
 /* In DuckDB mode the source pickers do not apply, so say so quietly rather than
    leaving them looking live. */
-body.federated #chrome label { opacity: .45; }
-body.federated #toggle-duckdb { background: var(--accent); color: var(--bg); }
+/* Only the query target dims in DuckDB mode — each @import names its own source.
+   The row limit still applies, so it stays lit. */
+body.federated #chrome label.target { opacity: .45; }
+/* The duck is dimmed until federation is on, so the button reads as a state and
+   not just as decoration. */
+#toggle-duckdb img { display: block; margin: 0 auto; opacity: .45; filter: grayscale(1); }
+body.federated #toggle-duckdb { background: var(--accent); border-color: var(--accent); }
+body.federated #toggle-duckdb img { opacity: 1; filter: none; }
 
 /* ------------------------------------------------------------ status dot */
 
@@ -361,6 +378,8 @@ main {
 #grid { height: 100%; }
 .tabulator .tabulator-cell, .tabulator .tabulator-col { font-family: var(--mono); }
 .cell-null { color: var(--fg-muted); font-style: italic; }
+/* The row number is scaffolding, not data — it should not compete with it. */
+.tabulator .tabulator-cell.rownum { color: var(--fg-muted); background: var(--bg-sunken); }
 
 /* ---------------------------------------------------------------- dialog */
 

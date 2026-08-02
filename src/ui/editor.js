@@ -1,6 +1,20 @@
 // The SQL editor: CodeMirror in whichever dialect the active source speaks,
 // with autocompletion fed from the schema the explorer has loaded so far.
 
+/**
+ * Teach every SQL mode that `SWAP` is a keyword.
+ *
+ * It is alkyon's own directive rather than any engine's, but it is the first
+ * word of the buffer and it *acts* like a statement, so leaving it in plain text
+ * made it read as a mistake. The mode keeps a reference to this object, so
+ * adding to it reaches modes already created.
+ */
+for (const mime of ['text/x-sql', 'text/x-pgsql', 'text/x-mssql', 'text/x-mysql']) {
+  // Tokens are lower-cased before the lookup, so the key is `swap`.
+  const keywords = CodeMirror.mimeModes[mime]?.keywords;
+  if (keywords) keywords.swap = true;
+}
+
 export function createEditor(element, { onRun, onOpen, onSave, onSaveAs, onNew, onClose, onChange }) {
   // `tables` is what CodeMirror's sql-hint completes from: qualified table name
   // to column names. Table names are registered as soon as a database is

@@ -1,5 +1,6 @@
 import { api, runQuery } from './api.js';
 import { createBuffers } from './buffers.js';
+import { previewSql, quoteFor } from './dialect.js';
 import { createEditor } from './editor.js';
 import { createExplorer } from './explorer.js';
 import { canSaveInPlace, download, openFiles, pickSaveTarget, writeFile } from './files.js';
@@ -230,10 +231,7 @@ const search = createSearch(
 
 /** Quote per the active dialect, the same way the explorer does. */
 function qualify(schema, table) {
-  const quote = (name) =>
-    state.source?.dialect === 'tsql'
-      ? `[${name.replaceAll(']', ']]')}]`
-      : `"${name.replaceAll('"', '""')}"`;
+  const quote = (name) => quoteFor(state.source?.dialect, name);
   return `${quote(schema)}.${quote(table)}`;
 }
 
@@ -372,6 +370,12 @@ const explorer = createExplorer($('explorer'), {
     selectDatabase(db);
   },
   onInsert: (qualified) => editor.insert(qualified),
+  // Clicking a table peeks at it. The buffer is left alone — this is a look, not
+  // an edit, so whatever you were writing survives.
+  onPreview: (source, qualified) => {
+    if (state.busy || state.running) return;
+    stream(previewSql(source.dialect, qualified));
+  },
   onTables: (source, db, tables) => {
     if (source.key !== state.source?.key) return;
     editor.addTables(tables.map((t) => `${t.schema}.${t.name}`));
@@ -546,6 +550,16 @@ async function execute() {
     else status('nothing to run', true);
     return;
   }
+  stream(sql);
+}
+
+/** The row cap the header picker is set to; `0` means the user asked for none. */
+function maxRows() {
+  return Number($('max-rows').value);
+}
+
+/** Send one statement to the active source and render what comes back. */
+function stream(sql) {
   if (!state.source) return status('no source selected', true);
 
   let rows = 0;
@@ -556,7 +570,12 @@ async function execute() {
   detail(`${state.source.key} · ${state.database ?? state.source.database}`);
 
   state.running = runQuery(
-    { sourceId: state.source.key, database: state.database, sql },
+    {
+      sourceId: state.source.key,
+      database: state.database,
+      sql,
+      maxRows: maxRows(),
+    },
     {
       columns: ({ columns }) => {
         sawColumns = true;
@@ -571,10 +590,16 @@ async function execute() {
         if (!sawColumns) grid.message(`${rows_affected} row(s) affected`);
         status(`${rows_affected} row(s) affected`);
       },
-      end: ({ rows: total, elapsed_ms }) => {
+      end: ({ rows: total, elapsed_ms, truncated }) => {
         if (!sawColumns && total === 0) grid.message('statement completed, no rows returned');
         else grid.finish();
-        status(`${total.toLocaleString()} row(s) in ${elapsed_ms} ms`);
+        // Say plainly that there was more, rather than letting a capped result
+        // read as the whole answer.
+        status(
+          truncated
+            ? `first ${total.toLocaleString()} row(s) in ${elapsed_ms} ms — stopped at the row limit, there are more`
+            : `${total.toLocaleString()} row(s) in ${elapsed_ms} ms`,
+        );
       },
       cancelled: () => status('cancelled'),
       error: ({ message }) => {
@@ -700,19 +725,30 @@ makeSplitter($('split-editor'), {
 const dialog = $('source-dialog');
 const form = $('source-form');
 
+/** What each engine connects to when the Database field is left empty. */
+const DEFAULT_DATABASE = {
+  ms_sql: 'master',
+  my_sql: 'information_schema',
+  postgres: 'postgres',
+};
+
 /** Show only the fields the selected engine and auth method actually use. */
 function syncDialogFields() {
   const kind = form.elements.kind.value;
   const method = form.elements.method.value;
+  // A folder or file is reached through the filesystem: no host, no port, no
+  // encryption and nothing to authenticate.
+  const server = kind !== 'files';
 
+  for (const element of form.querySelectorAll('.server-only')) element.hidden = !server;
+  for (const element of form.querySelectorAll('.files-only')) element.hidden = server;
   for (const label of form.querySelectorAll('.mssql-only')) {
     label.hidden = kind !== 'ms_sql';
   }
   // Say what leaving it empty will actually connect to.
-  $('database-field').placeholder =
-    kind === 'ms_sql' ? 'optional — defaults to master' : 'optional — defaults to postgres';
+  $('database-field').placeholder = `optional — defaults to ${DEFAULT_DATABASE[kind] ?? 'the engine default'}`;
   for (const label of form.querySelectorAll('[class^="auth-"]')) {
-    label.hidden = !label.classList.contains(`auth-${method}`);
+    label.hidden = !server || !label.classList.contains(`auth-${method}`);
   }
   // Windows integrated authentication is a SQL Server concept.
   const integrated = form.querySelector('option[value="integrated"]');
@@ -752,8 +788,21 @@ function note(text, kind) {
 /** Read the form into the `POST /sources` shape. */
 function readForm() {
   const data = new FormData(form);
-  const method = data.get('method');
+  const kind = data.get('kind');
 
+  // A folder source sends a path and nothing else; the fields the form still
+  // holds for the other engines would only be noise on the wire.
+  if (kind === 'files') {
+    return {
+      id: data.get('id').trim(),
+      scope: data.get('scope'),
+      kind,
+      path: data.get('path').trim(),
+      auth: { method: 'none' },
+    };
+  }
+
+  const method = data.get('method');
   const auth = { method };
   if (method === 'password') {
     auth.username = data.get('username');
@@ -765,19 +814,19 @@ function readForm() {
   const config = {
     id: data.get('id').trim(),
     scope: data.get('scope'),
-    kind: data.get('kind'),
+    kind,
     host: data.get('host').trim(),
     tls: data.get('tls'),
     auth,
   };
   // Omitted entirely rather than sent empty: the backend picks the engine's
-  // always-present database (`postgres`, `master`).
+  // always-present database (`postgres`, `master`, `information_schema`).
   const database = data.get('database').trim();
   if (database) config.database = database;
   const port = data.get('port');
   if (port) config.port = Number(port);
   const instance = data.get('instance');
-  if (instance && config.kind === 'ms_sql') config.instance = instance.trim();
+  if (instance && kind === 'ms_sql') config.instance = instance.trim();
 
   return config;
 }
@@ -799,11 +848,21 @@ async function withFeedback(button, busyLabel, action) {
 }
 
 $('source-test').addEventListener('click', () => {
-  // `host` is the only field a test genuinely needs; let the browser say so.
-  if (!form.elements.host.value.trim()) return form.elements.host.reportValidity();
+  const config = readForm();
+  // Neither field can carry `required`: whichever one the engine does not use is
+  // hidden, and a hidden required field makes the form unsubmittable outright.
+  // So the one that matters is checked here.
+  if (config.kind === 'files' && !config.path) return note('give a path to test', 'bad');
+  if (config.kind !== 'files' && !config.host) return note('give a host to test', 'bad');
+
   withFeedback($('source-test'), 'Testing…', async () => {
-    const result = await api.testConnection(readForm());
-    note(`Connected to ${result.database} in ${result.latency_ms} ms.`, 'good');
+    const result = await api.testConnection(config);
+    note(
+      config.kind === 'files'
+        ? `Readable in ${result.latency_ms} ms.`
+        : `Connected to ${result.database} in ${result.latency_ms} ms.`,
+      'good',
+    );
   });
 });
 

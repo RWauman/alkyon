@@ -79,12 +79,12 @@ export function socketUrl(path) {
  * Returns a handle whose `cancel()` asks the server to stop — the server drops
  * the database stream, which is what actually cancels the query.
  */
-export function runQuery({ sourceId, database, sql }, handlers) {
+export function runQuery({ sourceId, database, sql, maxRows }, handlers) {
   const socket = new WebSocket(socketUrl('/ws/query'));
   const terminal = new Set(['end', 'error', 'cancelled']);
 
   socket.addEventListener('open', () =>
-    socket.send(JSON.stringify({ source_id: sourceId, database, sql })));
+    socket.send(JSON.stringify({ source_id: sourceId, database, sql, max_rows: maxRows })));
 
   socket.addEventListener('message', ({ data }) => {
     const message = JSON.parse(data);

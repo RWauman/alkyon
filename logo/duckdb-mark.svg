@@ -1,0 +1,15 @@
+<!-- A duck, for the DuckDB mode button.
+     Drawn here rather than shipping DuckDB's own mark: that logo is their
+     trademark, and vendoring it would make its use a licensing question rather
+     than a design one. This is a plain duck head in DuckDB's yellow, which reads
+     the same at 18px and belongs to nobody. Swap the file if you decide the real
+     mark is warranted. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24"
+     role="img" aria-label="DuckDB">
+  <!-- Head -->
+  <circle cx="12.5" cy="10" r="7" fill="#FFF000"/>
+  <!-- Bill, tucked under the head so the join never shows -->
+  <path d="M6.6 9.2 H1.8 a1.6 1.6 0 0 0 0 3.2 H6.6 Z" fill="#FF9000"/>
+  <!-- Eye -->
+  <circle cx="11.4" cy="8.2" r="1.5" fill="#111111"/>
+</svg>

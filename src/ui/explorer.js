@@ -4,6 +4,7 @@
 // and browsing a large server never enumerates more than you look at.
 
 import { api } from './api.js';
+import { quoteFor } from './dialect.js';
 
 /**
  * Build one tree row.
@@ -145,16 +146,13 @@ function makeNode({ label, badge, pk, dot, scope, load, onSelect, onActivate, on
  * @param {(source: object) => void} hooks.onSelectSource
  * @param {(source: object, db: string) => void} hooks.onSelectDatabase
  * @param {(qualified: string) => void} hooks.onInsert   double-clicked a table
+ * @param {(source, qualified: string) => void} hooks.onPreview  clicked a table
  * @param {(source, db, tables) => void} hooks.onTables  autocomplete warm-up
  * @param {(source, db, table, columns) => void} hooks.onColumns
  * @param {(message: string, isError?: boolean) => void} hooks.onStatus
  */
 export function createExplorer(element, hooks) {
-  // SQL Server takes brackets, PostgreSQL takes double quotes.
-  const quote = (source, name) =>
-    source.dialect === 'tsql'
-      ? `[${name.replaceAll(']', ']]')}]`
-      : `"${name.replaceAll('"', '""')}"`;
+  const quote = (source, name) => quoteFor(source.dialect, name);
 
   const qualify = (source, schema, name) =>
     `${quote(source, schema)}.${quote(source, name)}`;
@@ -174,7 +172,12 @@ export function createExplorer(element, hooks) {
     return makeNode({
       label: table.name,
       badge: table.kind === 'view' ? 'view' : undefined,
-      onSelect: () => hooks.onSelectDatabase(source, db),
+      // Clicking a table shows what is in it. Double-click still inserts the
+      // name, so the two gestures stay distinct.
+      onSelect: async () => {
+        await hooks.onSelectDatabase(source, db);
+        hooks.onPreview(source, qualify(source, table.schema, table.name));
+      },
       onActivate: () => hooks.onInsert(qualify(source, table.schema, table.name)),
       load: async () => {
         // Expanding is as much a statement of intent as clicking, and the schema
@@ -244,7 +247,11 @@ export function createExplorer(element, hooks) {
       label: source.id,
       dot,
       scope: source.scope,
-      badge: `${source.dialect} · ${source.host}:${source.port}`,
+      // A folder source has no host to name, so it shows where it points. Only
+      // the tail: the last couple of directories are what identify it.
+      badge: source.path
+        ? `files · ${source.path.length > 30 ? `…${source.path.slice(-29)}` : source.path}`
+        : `${source.dialect} · ${source.host}:${source.port}`,
       onSelect: () => hooks.onSelectSource(source),
       onRemove: async () => {
         if (!confirm(`Remove ${source.key}? Its credential is deleted from the vault.`)) return;
