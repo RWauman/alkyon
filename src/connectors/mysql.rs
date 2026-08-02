@@ -409,10 +409,20 @@ fn value_at(row: &MySqlRow, i: usize) -> Value {
         }
         "DATE" => json!(chrono::NaiveDate),
         "TIME" => json!(chrono::NaiveTime),
-        // Naive for both, on purpose. A MySQL `timestamp` is returned in the
-        // *session* time zone, so stamping it UTC would be a confident lie; what
-        // is shown is the wall clock the server sent.
-        "DATETIME" | "TIMESTAMP" => json!(chrono::NaiveDateTime),
+        "DATETIME" => json!(chrono::NaiveDateTime),
+        // Shown naive, on purpose — but decoded through `DateTime<Utc>`, because
+        // sqlx only accepts `NaiveDateTime` for `DATETIME` and refuses it for
+        // `TIMESTAMP`.
+        //
+        // sqlx reads a `TIMESTAMP` *as if* the session were UTC, so `naive_utc`
+        // hands back exactly the wall clock the server sent — which is the
+        // honest answer, since the session time zone is the server's business
+        // and stamping the value UTC would be a confident lie.
+        "TIMESTAMP" => match row.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>(i) {
+            Ok(Some(v)) => serde_json::to_value(v.naive_utc()).unwrap_or(Value::Null),
+            Ok(None) => Value::Null,
+            Err(e) => Value::String(format!("<decode error: {e}>")),
+        },
         "JSON" => json!(Value),
         "BINARY" | "VARBINARY" | "BLOB" | "TINYBLOB" | "MEDIUMBLOB" | "LONGBLOB" => {
             match row.try_get::<Option<Vec<u8>>, _>(i) {

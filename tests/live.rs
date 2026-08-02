@@ -145,6 +145,49 @@ async fn queries_stream_in_batches() {
     }
 }
 
+/// Every column of the demo `customer` table decodes to something real.
+///
+/// The narrow version of this test — pick four columns and check them — is what
+/// let a `char(2)` render as `<decode error>` for months: sqlx names `char(n)`
+/// "CHAR" and Postgres's internal one-byte `"char"` "\"CHAR\"", and the two were
+/// mapped the wrong way round. Selecting `*` is the point.
+#[tokio::test]
+async fn every_column_of_the_demo_table_decodes() {
+    let Some(state) = seeded().await else {
+        eprintln!("skipped: ALKYON_SOURCES is not set");
+        return;
+    };
+
+    for source in state.summaries().await {
+        let id = &source.id;
+        let (columns, rows, _) = collect(&state, id, "SELECT * FROM sales.customer").await;
+        assert!(!rows.is_empty(), "{id}: the seed has customers");
+
+        for (index, name) in columns.iter().enumerate() {
+            for row in &rows {
+                let cell = &row[index];
+                let text = cell.as_str().unwrap_or_default();
+                assert!(
+                    !text.starts_with("<decode error") && !text.starts_with("<unsupported type"),
+                    "{id}: column `{name}` did not decode — {cell}"
+                );
+            }
+        }
+
+        // The one that was actually broken, spelled out so a regression names
+        // itself rather than hiding in the loop above.
+        let country = columns
+            .iter()
+            .position(|c| c == "country")
+            .expect("country");
+        assert!(
+            rows.iter()
+                .any(|row| row[country].as_str().is_some_and(|v| v.trim().len() == 2)),
+            "{id}: char(2) should come back as its two characters"
+        );
+    }
+}
+
 #[tokio::test]
 async fn unknown_source_is_reported() {
     let state = AppState::new();

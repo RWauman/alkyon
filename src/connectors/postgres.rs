@@ -342,7 +342,8 @@ fn logical_type(type_name: &str) -> LogicalType {
         "INT2" | "INT4" | "INT8" | "OID" => LogicalType::Int,
         "FLOAT4" | "FLOAT8" => LogicalType::Float,
         "NUMERIC" => LogicalType::Decimal,
-        "TEXT" | "VARCHAR" | "BPCHAR" | "NAME" | "CITEXT" | "XML" | "UNKNOWN" | "CHAR" => {
+        // See [`value_at`] for why `CHAR` and `"CHAR"` are two different types.
+        "TEXT" | "VARCHAR" | "CHAR" | "NAME" | "CITEXT" | "XML" | "UNKNOWN" | "\"CHAR\"" => {
             LogicalType::Text
         }
         "UUID" => LogicalType::Uuid,
@@ -404,9 +405,15 @@ fn value_at(row: &PgRow, i: usize) -> Value {
         "FLOAT4" => json!(f32),
         "FLOAT8" => json!(f64),
         "NUMERIC" => text!(rust_decimal::Decimal),
-        "TEXT" | "VARCHAR" | "BPCHAR" | "NAME" | "CITEXT" | "XML" | "UNKNOWN" => json!(String),
-        // Postgres `"char"` is a single byte, not `character(1)`.
-        "CHAR" => text!(i8),
+        "TEXT" | "VARCHAR" | "CHAR" | "NAME" | "CITEXT" | "XML" | "UNKNOWN" => json!(String),
+        // Two different types, and sqlx's names for them are a trap.
+        //
+        // `char(n)` — the ordinary blank-padded one — is `PgType::Bpchar`, which
+        // sqlx names **`CHAR`**. Postgres's internal one-byte `"char"` is
+        // `PgType::Char`, which sqlx names **`"CHAR"`**, quotes included. Reading
+        // the first as an `i8` failed on every value wider than a byte, so a
+        // `char(2)` country code came back as `<decode error>`.
+        "\"CHAR\"" => text!(i8),
         "UUID" => json!(uuid::Uuid),
         "DATE" => json!(chrono::NaiveDate),
         "TIME" => json!(chrono::NaiveTime),
