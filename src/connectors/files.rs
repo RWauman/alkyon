@@ -264,6 +264,53 @@ impl FilesConnection {
             .filter(|file| haystack.contains(&file.name.to_lowercase()))
             .collect()
     }
+
+    /// Add the missing sentence to a parser error, when this source has names
+    /// that explain it.
+    fn explain(&self, error: Error) -> Error {
+        let Error::Federated(message) = &error else {
+            return error;
+        };
+        if !message.contains("syntax error") && !message.contains("Parser Error") {
+            return error;
+        }
+        let awkward = self.awkward_schemas();
+        if awkward.is_empty() {
+            return error;
+        }
+        let quoted: Vec<String> = awkward.iter().map(|name| format!("\"{name}\"")).collect();
+        Error::Federated(format!(
+            "{message}\n\nThis source has folders whose names SQL reads as something \
+             other than a name, so they must be quoted: {}. Double-clicking in the \
+             explorer writes them for you.",
+            quoted.join(", ")
+        ))
+    }
+
+    /// Schemas this source exposes that SQL will not accept unquoted.
+    ///
+    /// A directory called `2022` is a perfectly good directory and a schema name
+    /// that reads as a number, so `select * from 2022.trips` is a syntax error
+    /// and DuckDB says only "syntax error". Alkyon knows exactly which of its own
+    /// names have that problem, so it can say.
+    fn awkward_schemas(&self) -> Vec<String> {
+        let mut names: Vec<String> = Vec::new();
+        for file in self.files() {
+            if !is_bare_identifier(&file.schema) && !names.contains(&file.schema) {
+                names.push(file.schema);
+            }
+        }
+        names
+    }
+}
+
+/// Whether SQL will read `name` as an identifier without quotes around it.
+fn is_bare_identifier(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with(|c: char| c.is_ascii_digit())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
 }
 
 /// Define `files` as views.
@@ -416,7 +463,8 @@ impl Connection for FilesConnection {
             }
             worker
                 .await
-                .map_err(|e| Error::Federated(format!("the query panicked: {e}")))??;
+                .map_err(|e| Error::Federated(format!("the query panicked: {e}")))?
+                .map_err(|e| self.explain(e))?;
         })
     }
 }

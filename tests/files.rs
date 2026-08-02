@@ -187,6 +187,47 @@ async fn the_explorer_sees_the_files_as_tables() {
     assert!(snapshot.iter().all(|table| !table.columns.is_empty()));
 }
 
+/// A subdirectory named `2022` becomes a schema named `2022`, and SQL reads that
+/// as a number unless it is quoted.
+///
+/// Nothing alkyon can fix — renaming it would make the tree lie about the
+/// folder. What alkyon owes you is that everything *it* writes is quoted, and
+/// that the error says so.
+#[tokio::test]
+async fn a_schema_that_is_not_a_bare_identifier_must_be_quoted() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("2022")).unwrap();
+    std::fs::write(dir.path().join("2022/trips.csv"), "id\n1\n2\n").unwrap();
+    std::fs::write(dir.path().join("zones.csv"), "id\n9\n").unwrap();
+
+    let state = AppState::new();
+    state
+        .register(folder_source("taxi", dir.path()))
+        .await
+        .unwrap();
+
+    // A schema that *is* a bare identifier needs nothing.
+    let (_, rows) = query(&state, "user:taxi", "select * from main.zones")
+        .await
+        .expect("main.zones");
+    assert_eq!(rows.len(), 1);
+
+    // Quoted, the digit-named one works too.
+    let (_, rows) = query(&state, "user:taxi", "select * from \"2022\".trips")
+        .await
+        .expect("\"2022\".trips");
+    assert_eq!(rows.len(), 2);
+
+    // Unquoted it cannot: `2022` is a number. The error has to say which schemas
+    // need the quotes, because DuckDB's own message is only "syntax error".
+    let Err(error) = query(&state, "user:taxi", "select * from 2022.trips").await else {
+        panic!("`2022.trips` is not valid SQL");
+    };
+    let error = error.to_string();
+    assert!(error.contains("\"2022\""), "name the schema: {error}");
+    assert!(error.contains("quote"), "say what to do about it: {error}");
+}
+
 /// A folder source is confined to its folder, the same way a federated session
 /// is confined to the open one.
 #[tokio::test]
