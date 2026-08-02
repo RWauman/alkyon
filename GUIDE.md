@@ -89,6 +89,10 @@ files' columns, and `SWAP` to switch to it.
 - Two files with the same stem both survive — `sales.csv` and `sales.parquet`
   become `sales` and `sales.parquet`.
 - Up to 200 files, 6 directories deep, skipping `.git`, `node_modules` and friends.
+- **A folder named `2022` is a schema named `2022`, and SQL reads that as a
+  number** — so it needs quotes: `select * from "2022".yellow_202212`. Alkyon
+  quotes everything it writes for you, and says which folders are affected when a
+  query fails to parse. Renaming them would make the tree lie about your disk.
 - Because it is an ordinary source, a federated buffer can join it to a database
   table — and `-- @import x = my-folder/*.parquet` does it without copying a row.
   See [importing files without copying them](#importing-files-without-copying-them).
@@ -105,22 +109,54 @@ Your SQL goes to the engine untouched: T-SQL to SQL Server, PL/pgSQL to Postgres
 No translation layer, so DDL, views, procedures and vendor syntax behave exactly as
 the server expects.
 
-**Cancel** stops a running query. Fixed-scale numbers (`numeric`, `decimal`) travel
+**Stop** ends a running query. Fixed-scale numbers (`numeric`, `decimal`) travel
 as text and keep every digit rather than being rounded through a float.
 
-### The row limit
+### The results grid
 
-**Rows** in the header caps how many rows come back — 50 000 by default. Hitting it
-*stops the query*, and the status line says so plainly rather than letting a partial
-answer read as the whole one.
+Drawn on a canvas, so it scrolls smoothly however many rows it holds. Rows are
+numbered down the left, and the numbers stay put as you scroll sideways.
 
-It is not a formality. A single 2.5 M-row parquet is 382 MB of JSON on the wire and
-roughly 800 MB of browser memory; an absent-minded `select *` used to take the tab
-with it. Raise it per query in the picker, set the floor with `ALKYON_MAX_ROWS`, or
-choose **no limit** if you know what you are asking for.
+- **Click a column header to sort**, again to reverse it. NULLs go last either
+  way. Sorting reorders the view, never the rows, so it costs nothing to undo.
+- **Drag a column edge to resize.** Widths start out measured against the first
+  couple of hundred rows and are clamped, so one long JSON blob cannot push every
+  other column off screen.
+- `NULL` is spelled out rather than shown as an empty cell, because empty and
+  absent are different answers.
 
-To work with more than fits, aggregate in SQL, or export with
-`copy (…) to '${folder}/out.parquet' (format parquet)`.
+### Pages
+
+**Every result arrives one page at a time.** *Rows per page* in the header sets how
+big a page is — 50 000 by default — and **Next ›** reads the following one.
+
+The query stays open between pages, positioned where the last one stopped, so the
+next page is *read on* rather than fetched again with an `OFFSET`. That matters for
+more than speed: a statement with no `ORDER BY` may come back in a different order
+on a second run, so an `OFFSET` page could quietly repeat or skip rows.
+
+A page replaces the one before it, which is what keeps the browser's share of a
+result the same size whatever the result is. One taxi folder is 39.6 M rows and
+**6.16 GB** of JSON: the server streams all of it in 106 seconds with flat memory,
+and a browser tab dies around 14 M rows trying to hold it. Pages are why you never
+find that out the hard way.
+
+**‹** goes back through the pages you have already seen, straight from memory —
+no re-reading, and it cannot disturb the cursor. There is no page *picker*, and
+there cannot be: for a CSV or a streamed query, nobody knows how many pages there
+are until the last one arrives.
+
+- Going back is bounded. Roughly 250 000 rows of history are kept; past that the
+  oldest pages are dropped and **‹** stops where they end. Run the query again to
+  start from the first page.
+- Reading a page holds a connection open on the source. Running another query, or
+  closing the tab, lets it go.
+- **Stop** during a long page abandons it and the query with it.
+- Sorting applies to the page on screen, and is cleared when you turn to another
+  one — carrying it over would silently re-sort a different set of rows under the
+  same arrow.
+- To work with more than a page, aggregate in SQL, or export with
+  `copy (…) to '${folder}/out.parquet' (format parquet)`.
 
 ### Peek at a table
 
@@ -137,8 +173,14 @@ SWAP pg-prod.warehouse;         -- …then carry on in the same buffer
 SELECT count(*) FROM orders;
 ```
 
+Completion after `SWAP` offers **your registered sources and nothing else** — the
+only words that mean anything there. Left to the SQL hint, `SWAP pg` was answered
+with `PG_CONTEXT` and friends, and since the list opens as you type, Enter
+accepted one and the directive quietly stopped being a directive.
+
 Handled by the editor; it never reaches a server. Only recognised as the **first
-token** of the buffer. It is `SWAP` and not `USE` because `USE` is a reserved
+statement** of the buffer — comments and blank lines above it are stepped over and
+left where they are, so a `.sql` file with a header still works. It is `SWAP` and not `USE` because `USE` is a reserved
 keyword in T-SQL and a real statement in MySQL, DuckDB and ClickHouse — `SWAP` is
 free in all of them. That mattered the moment MySQL was added, and it will again.
 
@@ -152,6 +194,11 @@ table to insert its quoted, qualified name.
 **Autocompletion is complete as soon as a source is selected** — `Ctrl+Space`, or it
 pops up as you type. You do not have to browse to a table before its columns are
 offered.
+
+What it inserts is always valid SQL, even when the name is not: a folder called
+`2022` is listed as `2022.yellow_202212` — the name you would recognise — and
+inserted as `"2022".yellow_202212`, which is the one that parses. Same for a table
+that collides with a keyword. Names that need nothing are left plain.
 
 **`Ctrl+K` searches every indexed schema at once** — table names, column names *and
 column types*, so `numeric` finds every column declared that way. Each hit says
@@ -329,7 +376,7 @@ The theme button cycles Auto → Light → Dark and remembers your choice.
 | `ALKYON_SOURCES` | — | JSON file of sources to *import* at startup |
 | `ALKYON_SHELL` | PowerShell / `$SHELL` | what the terminal spawns |
 | `ALKYON_TERMINAL` | loopback only | `always` to expose the terminal elsewhere |
-| `ALKYON_MAX_ROWS` | `50000` | rows a query may return before it is stopped |
+| `ALKYON_PAGE_ROWS` | `50000` | rows in one page of a result |
 | `ALKYON_IMPORT_MAX_ROWS` | `1000000` | cap on one federated `@import` |
 | `ALKYON_LOG` | `alkyon=info` | `tracing` filter |
 
@@ -360,5 +407,5 @@ The UI is only a client; everything is reachable directly.
 | GET / PUT / DELETE | `/workspace` | the open folder and its `.sql` files |
 | GET / PUT | `/workspace/file?path=` | read / write, confined to the folder |
 | GET | `/shells` | shells found on the machine |
-| WS | `/ws/query` | `{source_id, database?, sql, max_rows?}` → `columns` / `rows` / `affected` / `end` (carrying `truncated`); `{"type":"cancel"}` stops it |
+| WS | `/ws/query` | `{source_id, database?, sql, page_size?}` → `columns` / `rows` / `affected` / `end` (carrying `page` and `more`). `{"type":"more"}` reads the next page off the query still running; `{"type":"cancel"}` drops it. Closing the socket releases the connection. |
 | WS | `/ws/terminal?shell=` | PTY; binary frames are bytes, text frames are control |

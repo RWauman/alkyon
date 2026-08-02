@@ -60,8 +60,8 @@ DuckDB.
 
 - Credentials live in the OS keychain (Windows Credential Manager, Keychain, libsecret),
   never in a config file
-- Results stream over WebSocket in batches, capped at a row limit you set in the header —
-  hitting it stops the query and says so, rather than melting the tab
+- Results arrive a page at a time over WebSocket, the query staying open between pages so
+  the next one is read on rather than re-fetched with an `OFFSET`
 - Sources come from your own registry and, optionally, a committable one in the project
 - Night Owl and Light Owl themes, following the OS unless you say otherwise
 
@@ -76,6 +76,19 @@ in a debug build, deliberately: at `-O0` an aggregate over 39.7 M parquet rows t
 78 seconds instead of 270 ms, which reads as a broken tool rather than a debug one. See the
 [user guide](GUIDE.md) for everything else — adding a source, the keyboard, federation,
 settings and the HTTP API.
+
+### Changing the result grid
+
+The grid is [glide-data-grid](https://github.com/glideapps/glide-data-grid), which is React,
+which needs a bundler. That does **not** make npm part of building alkyon: the bundle is
+committed under `src/ui/vendor/`, exactly like CodeMirror and xterm, and React never escapes
+it — the rest of the UI stays plain ES modules talking to four methods on a handle.
+
+```sh
+cd tools/grid && npm install && npm run build   # rewrites src/ui/vendor/glide-data-grid.*
+```
+
+You only need this to change the grid. `cargo build` remains the whole build.
 
 ### Development databases
 
