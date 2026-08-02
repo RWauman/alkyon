@@ -88,3 +88,15 @@ tempfile = "3"
 strip = true
 lto = "thin"
 codegen-units = 1
+
+# Build the vendored DuckDB optimised even in a debug build.
+#
+# `cc` takes its `-O` level from the profile, so `cargo run` was compiling
+# DuckDB's C++ at `-O0`. Measured on 12 parquet files, 39.6M rows: `count(*)`
+# with a `sum()` took **95 ms** optimised and **over 78 seconds** unoptimised —
+# a workbench that felt broken until you shipped it.
+#
+# Your own code keeps its debug symbols and its fast rebuilds; only the vendored
+# C++ changes, and it is compiled once.
+[profile.dev.package.libduckdb-sys]
+opt-level = 3
