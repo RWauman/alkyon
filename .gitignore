@@ -8,6 +8,11 @@
 # Rust
 /target
 
+# Release artefacts. The Linux binary is built in a container whose target
+# directory is a Docker volume, so the only way back to the host is through the
+# bind mount of this repository — it lands here rather than under /target.
+/dist
+
 # The grid bundle's build dependencies. Its *output* is committed under
 # src/ui/vendor/, so building or running alkyon never needs npm — only changing
 # the grid does.
