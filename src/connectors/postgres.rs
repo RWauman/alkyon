@@ -34,11 +34,12 @@ fn fingerprint(cfg: &SourceConfig, db: &str) -> u64 {
             username.hash(&mut hasher);
             password.hash(&mut hasher);
         }
-        AuthConfig::Integrated => "integrated".hash(&mut hasher),
         AuthConfig::AadToken { token } => {
             "aad".hash(&mut hasher);
             token.hash(&mut hasher);
         }
+        // Neither carries a credential, so the method name is the whole identity.
+        other @ (AuthConfig::Integrated | AuthConfig::None) => other.method().hash(&mut hasher),
     }
     hasher.finish()
 }

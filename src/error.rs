@@ -31,8 +31,14 @@ pub enum Error {
     #[error("duckdb: {0}")]
     Federated(String),
 
-    #[error("postgres: {0}")]
-    Postgres(#[from] sqlx::Error),
+    /// Anything sqlx reports, which is now PostgreSQL *and* MySQL.
+    ///
+    /// Deliberately not named after an engine: sqlx's error carries no backend,
+    /// so the old `postgres:` prefix started labelling MySQL failures — a wrong
+    /// MySQL password came back as `postgres: Access denied for user 'root'`,
+    /// which is worse than saying nothing.
+    #[error("database: {0}")]
+    Sqlx(#[from] sqlx::Error),
 
     #[error("sql server: {0}")]
     MsSql(#[from] tiberius::error::Error),
@@ -54,7 +60,7 @@ impl Error {
             Error::DuplicateSource(_) => StatusCode::CONFLICT,
             Error::BadRequest(_) | Error::Unsupported(_) => StatusCode::BAD_REQUEST,
             Error::MissingSecret(_) => StatusCode::PRECONDITION_FAILED,
-            Error::Postgres(_) | Error::MsSql(_) => StatusCode::BAD_GATEWAY,
+            Error::Sqlx(_) | Error::MsSql(_) => StatusCode::BAD_GATEWAY,
             // A federated failure is usually the user's SQL, not a broken server.
             Error::Federated(_) => StatusCode::BAD_REQUEST,
             Error::Io(_)

@@ -53,6 +53,12 @@ fn config_for(cfg: &SourceConfig, db: &str) -> Result<Config> {
                 "Windows integrated authentication is only available on Windows hosts".into(),
             ))
         }
+        AuthConfig::None => {
+            return Err(crate::error::Error::Unsupported(
+                "SQL Server needs a login, Windows integrated authentication or an Entra ID token"
+                    .into(),
+            ))
+        }
     });
 
     Ok(c)

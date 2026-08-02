@@ -11,6 +11,7 @@ use serde_json::Value;
 pub enum Dialect {
     TSql,
     PgSql,
+    MySql,
     DuckDb,
 }
 
@@ -20,6 +21,7 @@ impl Dialect {
         match self {
             Dialect::TSql => "text/x-mssql",
             Dialect::PgSql => "text/x-pgsql",
+            Dialect::MySql => "text/x-mysql",
             Dialect::DuckDb => "text/x-sql",
         }
     }
@@ -30,13 +32,27 @@ impl Dialect {
 pub enum SourceKind {
     Postgres,
     MsSql,
+    MySql,
+    /// A folder or a single file on the machine running alkyon, read by DuckDB.
+    /// It has a `path` instead of a host, and no credential.
+    Files,
 }
 
 impl SourceKind {
+    /// Whether this kind is reached over the network. The false case is what
+    /// makes `host`, `port`, encryption and authentication meaningless.
+    pub fn is_server(self) -> bool {
+        !matches!(self, SourceKind::Files)
+    }
+
     pub fn default_port(self) -> u16 {
         match self {
             SourceKind::Postgres => 5432,
             SourceKind::MsSql => 1433,
+            SourceKind::MySql => 3306,
+            // Not a port at all. Reported as 0 and hidden by the UI, rather than
+            // making every summary carry an `Option` for one kind's sake.
+            SourceKind::Files => 0,
         }
     }
 
@@ -44,15 +60,26 @@ impl SourceKind {
         match self {
             SourceKind::Postgres => "public",
             SourceKind::MsSql => "dbo",
+            // MySQL has no schema layer: a schema *is* a database. There is
+            // therefore no default to give, and the connector reads an empty
+            // schema as "the database this call names".
+            SourceKind::MySql => "",
+            // Files at the root of the source; subdirectories become schemas.
+            SourceKind::Files => "main",
         }
     }
 
-    /// Where to connect when no database was given. Both engines have a database
-    /// that always exists and that every login can reach.
+    /// Where to connect when no database was given. Every engine has one that
+    /// always exists and that every login can reach.
     pub fn default_database(self) -> &'static str {
         match self {
             SourceKind::Postgres => "postgres",
             SourceKind::MsSql => "master",
+            // Readable by everyone and always present, and privilege-filtered by
+            // the server so it shows only what this login may see.
+            SourceKind::MySql => "information_schema",
+            // What DuckDB itself calls an in-memory catalogue.
+            SourceKind::Files => "memory",
         }
     }
 }
@@ -85,6 +112,9 @@ pub enum AuthConfig {
     /// Get one with:
     /// `az account get-access-token --resource https://database.windows.net/`
     AadToken { token: String },
+    /// Nothing to authenticate: a folder or file source is reached through the
+    /// filesystem, with whatever rights the alkyon process already has.
+    None,
 }
 
 impl AuthConfig {
@@ -93,6 +123,7 @@ impl AuthConfig {
             AuthConfig::Password { .. } => "password",
             AuthConfig::Integrated => "integrated",
             AuthConfig::AadToken { .. } => "aad_token",
+            AuthConfig::None => "none",
         }
     }
 }
@@ -110,6 +141,7 @@ impl fmt::Debug for AuthConfig {
                 .debug_struct("AadToken")
                 .field("token", &"<redacted>")
                 .finish(),
+            AuthConfig::None => f.write_str("None"),
         }
     }
 }
@@ -148,6 +180,7 @@ pub enum AuthKind {
     Password { username: String },
     Integrated,
     AadToken,
+    None,
 }
 
 impl AuthKind {
@@ -156,12 +189,13 @@ impl AuthKind {
             AuthKind::Password { .. } => "password",
             AuthKind::Integrated => "integrated",
             AuthKind::AadToken => "aad_token",
+            AuthKind::None => "none",
         }
     }
 
     /// Whether using this source needs a secret from the vault.
     pub fn needs_secret(&self) -> bool {
-        !matches!(self, AuthKind::Integrated)
+        !matches!(self, AuthKind::Integrated | AuthKind::None)
     }
 }
 
@@ -171,7 +205,14 @@ impl AuthKind {
 pub struct SourceRecord {
     pub id: String,
     pub kind: SourceKind,
+    /// Empty for a [`SourceKind::Files`] source, which has a `path` instead.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub host: String,
+    /// The folder or file a [`SourceKind::Files`] source points at, as typed —
+    /// `~` and all. Resolved when the connection opens, not when it is saved, so
+    /// a project registry stays portable between machines.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub port: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -213,6 +254,7 @@ impl SourceRecord {
             kind: self.kind,
             dialect,
             host: self.host.clone(),
+            path: self.path.clone(),
             port: self.port(),
             instance: self.instance.clone(),
             // The effective database, so the UI never has to know the defaults.
@@ -232,6 +274,7 @@ impl SourceRecord {
             },
             (AuthKind::AadToken, Some(token)) => AuthConfig::AadToken { token },
             (AuthKind::Integrated, _) => AuthConfig::Integrated,
+            (AuthKind::None, _) => AuthConfig::None,
             (AuthKind::Password { .. } | AuthKind::AadToken, None) => {
                 return Err(crate::error::Error::MissingSecret(self.id.clone()))
             }
@@ -241,6 +284,7 @@ impl SourceRecord {
             scope: self.scope,
             kind: self.kind,
             host: self.host.clone(),
+            path: self.path.clone(),
             port: self.port,
             instance: self.instance.clone(),
             database: self.database.clone(),
@@ -260,7 +304,11 @@ pub struct SourceConfig {
     #[serde(default)]
     pub scope: Scope,
     pub kind: SourceKind,
+    /// Not sent by a [`SourceKind::Files`] source, which sends `path` instead.
+    #[serde(default)]
     pub host: String,
+    #[serde(default)]
+    pub path: Option<String>,
     #[serde(default)]
     pub port: Option<u16>,
     /// SQL Server named instance, resolved through the SQL Browser service.
@@ -294,12 +342,14 @@ impl SourceConfig {
             }
             AuthConfig::Integrated => (AuthKind::Integrated, None),
             AuthConfig::AadToken { token } => (AuthKind::AadToken, Some(token)),
+            AuthConfig::None => (AuthKind::None, None),
         };
         let record = SourceRecord {
             id: self.id,
             scope: self.scope,
             kind: self.kind,
             host: self.host,
+            path: self.path,
             port: self.port,
             instance: self.instance,
             database: self.database,
@@ -320,6 +370,9 @@ pub struct SourceSummary {
     pub kind: SourceKind,
     pub dialect: Dialect,
     pub host: String,
+    /// Set only for a folder or file source; the UI shows it where the others
+    /// show `host:port`.
+    pub path: Option<String>,
     pub port: u16,
     pub instance: Option<String>,
     pub database: String,

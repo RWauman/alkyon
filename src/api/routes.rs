@@ -69,6 +69,13 @@ async fn add_source(
             "set either `port` or `instance`, not both".into(),
         ));
     }
+    // `host` is optional in the wire format so a folder source can omit it; for
+    // everything else, an absent one would be a connection attempt to nowhere.
+    // The mirror of this — a folder source without a path — is caught by its
+    // connector, which also covers records loaded from disk.
+    if config.kind.is_server() && config.host.trim().is_empty() {
+        return Err(Error::BadRequest("source needs a host".into()));
+    }
     // Reject bad credentials now rather than on the first query, and before the
     // secret goes anywhere near the vault.
     state.connector(config.kind).connect(&config).await?;

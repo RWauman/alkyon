@@ -17,8 +17,9 @@ use crate::error::{Error, Result};
 /// pointed at anything but loopback.
 const EXTENSION: &str = "sql";
 
-/// Directories never worth walking in a SQL project.
-const SKIP: &[&str] = &[
+/// Directories never worth walking in a SQL project. Shared with folder sources,
+/// which have no more reason to index `node_modules` than this does.
+pub(crate) const SKIP: &[&str] = &[
     ".git",
     ".svn",
     ".hg",
@@ -175,17 +176,27 @@ pub fn strip_bom(mut text: String) -> String {
     text
 }
 
+/// Turn a path a person typed into one the OS agrees exists: `~` expanded,
+/// symlinks followed, and readable as a plain path.
+///
+/// Shared with folder and file *sources*, which point at a path the same way the
+/// workspace does but may name a file rather than a directory.
+pub fn resolve_root(path: &str) -> Result<PathBuf> {
+    let expanded = expand_home(path);
+    let resolved = Path::new(&expanded)
+        .canonicalize()
+        .map_err(|e| Error::BadRequest(format!("cannot open `{path}`: {e}")))?;
+    Ok(simplify(resolved))
+}
+
 /// Accept a folder as the workspace root, rejecting anything that is not a
 /// readable directory.
 pub fn open(path: &str) -> Result<PathBuf> {
-    let expanded = expand_home(path);
-    let root = Path::new(&expanded)
-        .canonicalize()
-        .map_err(|e| Error::BadRequest(format!("cannot open `{path}`: {e}")))?;
+    let root = resolve_root(path)?;
     if !root.is_dir() {
         return Err(Error::BadRequest(format!("`{path}` is not a directory")));
     }
-    Ok(simplify(root))
+    Ok(root)
 }
 
 /// `canonicalize` hands back Windows verbatim paths (`\\?\C:\…`). They work for

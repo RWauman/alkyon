@@ -21,6 +21,26 @@ services:
       timeout: 3s
       retries: 20
 
+  # The demo schema lives in a database called `sales`, not a schema inside
+  # `alkyon_demo`. That is not a shortcut: MySQL has no schema layer, a schema
+  # *is* a database, so `sales.order_line` is the honest spelling here and the
+  # dialect-agnostic tests read the same against all three engines.
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_ROOT_PASSWORD: alkyon-dev
+      MYSQL_DATABASE: sales
+    ports:
+      - "53306:3306"
+    volumes:
+      - ./seed/mysql:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-palkyon-dev"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+      start_period: 15s
+
   mssql:
     image: mcr.microsoft.com/mssql/server:2022-latest
     environment:

@@ -9,6 +9,15 @@
     "auth": { "method": "password", "username": "postgres", "password": "alkyon-dev" }
   },
   {
+    "id": "mysql-dev",
+    "kind": "my_sql",
+    "host": "127.0.0.1",
+    "port": 53306,
+    "database": "sales",
+    "tls": "prefer",
+    "auth": { "method": "password", "username": "root", "password": "alkyon-dev" }
+  },
+  {
     "id": "mssql-dev",
     "kind": "ms_sql",
     "host": "127.0.0.1",

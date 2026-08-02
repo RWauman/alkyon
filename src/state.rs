@@ -4,7 +4,9 @@ use std::sync::Arc;
 
 use tokio::sync::RwLock;
 
+use crate::connectors::files::FilesConnector;
 use crate::connectors::mssql::MssqlConnector;
+use crate::connectors::mysql::MySqlConnector;
 use crate::connectors::postgres::PgConnector;
 use crate::connectors::{Connection, Connector};
 use crate::error::{Error, Result};
@@ -88,6 +90,8 @@ pub struct AppState {
     schema: SchemaCache,
     postgres: PgConnector,
     mssql: MssqlConnector,
+    mysql: MySqlConnector,
+    files: FilesConnector,
 }
 
 /// Whether to expose `/ws/terminal`. Alkyon has no authentication by design, so
@@ -114,6 +118,8 @@ impl AppState {
             schema: SchemaCache::default(),
             postgres: PgConnector::default(),
             mssql: MssqlConnector,
+            mysql: MySqlConnector::default(),
+            files: FilesConnector,
         })
     }
 
@@ -158,6 +164,8 @@ impl AppState {
             schema: SchemaCache::default(),
             postgres: PgConnector::default(),
             mssql: MssqlConnector,
+            mysql: MySqlConnector::default(),
+            files: FilesConnector,
         }))
     }
 
@@ -319,6 +327,8 @@ impl AppState {
         match kind {
             SourceKind::Postgres => &self.postgres,
             SourceKind::MsSql => &self.mssql,
+            SourceKind::MySql => &self.mysql,
+            SourceKind::Files => &self.files,
         }
     }
 

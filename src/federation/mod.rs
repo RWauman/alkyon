@@ -96,11 +96,30 @@ struct Materialised {
     rows: Vec<Vec<Option<String>>>,
 }
 
-fn quote_identifier(name: &str) -> String {
+/// An import, once it is ready for the DuckDB session.
+enum Prepared {
+    /// Rows pulled through Alkyon and rebuilt as a table.
+    Rows(Materialised),
+    /// A path DuckDB reads for itself.
+    ///
+    /// Worth the separate arm: a materialised import turns every cell into a
+    /// `String` in this process, which for a 2.5M-row parquet is minutes and
+    /// gigabytes. A scan is a view over the file, so DuckDB reads the columns it
+    /// needs and nothing crosses the process at all.
+    Scan {
+        alias: String,
+        /// e.g. `read_parquet('C:/data/2022/*.parquet')`
+        expression: String,
+        /// What the session must be allowed to touch for that to bind.
+        grant: Sandbox,
+    },
+}
+
+pub(crate) fn quote_identifier(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
-fn quote_literal(text: &str) -> String {
+pub(crate) fn quote_literal(text: &str) -> String {
     format!("'{}'", text.replace('\'', "''"))
 }
 
@@ -178,6 +197,68 @@ async fn materialise_query(
     })
 }
 
+/// Turn `<folder source>/<pattern>` into a scan DuckDB can bind.
+///
+/// The source must be a folder or file one: everything else has SQL to run, and
+/// an import without SQL is how you say you want the files themselves.
+async fn prepare_scan(
+    state: &AppState,
+    alias: &str,
+    source: &str,
+    pattern: &str,
+) -> Result<Prepared> {
+    let record = state.record(source).await?;
+    if record.kind != crate::model::SourceKind::Files {
+        return Err(Error::BadRequest(format!(
+            "@import {alias}: `{source}` is a {:?} source, so it needs SQL to run — \
+             write `@import {alias} = {source} : <sql>`. Only a folder or file source \
+             can be imported by path.",
+            record.kind
+        )));
+    }
+    let path = record.path.as_deref().unwrap_or_default();
+    let root = crate::workspace::resolve_root(path)?;
+
+    // An empty pattern means the source is the file. Otherwise the pattern is
+    // relative to the folder — `parse_files_import` already refused `..` and
+    // absolute paths, and `allowed_directories` refuses whatever slips past.
+    let target = if pattern.is_empty() {
+        if root.is_dir() {
+            return Err(Error::BadRequest(format!(
+                "@import {alias}: `{source}` is a folder, so say which files — \
+                 `{source}/*.parquet`"
+            )));
+        }
+        root.to_string_lossy().replace('\\', "/")
+    } else {
+        format!("{}/{pattern}", root.to_string_lossy().replace('\\', "/"))
+    };
+
+    // The reader comes from the pattern's own extension, so a glob picks the same
+    // one its files would. `*` has no extension of its own to go by.
+    let reader =
+        crate::connectors::files::reader_for(std::path::Path::new(&target)).ok_or_else(|| {
+            Error::BadRequest(format!(
+                "@import {alias}: `{pattern}` names no format alkyon reads ({}). \
+                 A spreadsheet goes through `@excel`.",
+                crate::connectors::files::readable_extensions()
+            ))
+        })?;
+
+    Ok(Prepared::Scan {
+        alias: alias.to_owned(),
+        expression: format!("{reader}({})", quote_literal(&target)),
+        // A folder source grants its folder — a glob has to be listed before it
+        // can be opened. A file source grants only that file, so importing it
+        // here is no wider than querying it directly.
+        grant: if root.is_dir() {
+            Sandbox::directory(root)
+        } else {
+            Sandbox::file(root)
+        },
+    })
+}
+
 fn materialise_excel(
     alias: &str,
     root: Option<&PathBuf>,
@@ -227,13 +308,55 @@ fn resolve_data_file(root: &std::path::Path, relative: &str) -> Result<PathBuf> 
     Ok(real)
 }
 
+/// What a DuckDB session is allowed to touch on the filesystem.
+///
+/// Both lists are *exceptions*: everything else is refused because external
+/// access is off. `files` exists so a source pointing at one spreadsheet does not
+/// have to be granted the directory it happens to sit in.
+#[derive(Debug, Default, Clone)]
+pub struct Sandbox {
+    pub directories: Vec<PathBuf>,
+    pub files: Vec<PathBuf>,
+}
+
+impl Sandbox {
+    pub fn directory(root: PathBuf) -> Self {
+        Self {
+            directories: vec![root],
+            files: Vec::new(),
+        }
+    }
+
+    pub fn file(path: PathBuf) -> Self {
+        Self {
+            directories: Vec::new(),
+            files: vec![path],
+        }
+    }
+
+    /// Take in another grant. A federated buffer may name several folder sources,
+    /// and the session needs every one of them.
+    pub fn absorb(&mut self, other: Sandbox) {
+        for directory in other.directories {
+            if !self.directories.contains(&directory) {
+                self.directories.push(directory);
+            }
+        }
+        for file in other.files {
+            if !self.files.contains(&file) {
+                self.files.push(file);
+            }
+        }
+    }
+}
+
 /// Open an in-memory DuckDB, confine it, then freeze the configuration.
 ///
 /// This matters more than it looks: DuckDB can read and write arbitrary files and
 /// load extensions, so an unconfined instance behind an HTTP endpoint is arbitrary
 /// file access and arbitrary code loading. `lock_configuration` is what stops a
 /// user query from undoing any of it.
-fn open_duckdb(roots: &[PathBuf]) -> Result<Connection> {
+pub fn open_duckdb(sandbox: &Sandbox) -> Result<Connection> {
     let connection = Connection::open_in_memory().map_err(federated)?;
 
     // Before anything is locked down, and best effort: the `parquet` and `json`
@@ -245,19 +368,33 @@ fn open_duckdb(roots: &[PathBuf]) -> Result<Connection> {
         }
     }
 
+    // Both lists have to be set *before* external access is turned off: DuckDB
+    // refuses to change them afterwards ("Cannot change allowed_paths when
+    // enable_external_access is disabled"), which is exactly the point.
     let mut setup = String::new();
-    if !roots.is_empty() {
-        let list = roots
+    let list = |paths: &[PathBuf]| {
+        paths
             .iter()
-            .map(|root| quote_literal(&root.to_string_lossy()))
+            .map(|path| quote_literal(&path.to_string_lossy()))
             .collect::<Vec<_>>()
-            .join(", ");
-        setup.push_str(&format!("SET allowed_directories = [{list}];\n"));
+            .join(", ")
+    };
+    if !sandbox.directories.is_empty() {
+        setup.push_str(&format!(
+            "SET allowed_directories = [{}];\n",
+            list(&sandbox.directories)
+        ));
         // No `file_search_path`: with external access disabled, the permission
         // check happens on the path as written, before any search path applies, so
         // a relative one is refused however the search path is set. Files are
         // addressed through the `${folder}` placeholder instead — one rule for
         // reads and writes alike. See [`substitute`].
+    }
+    if !sandbox.files.is_empty() {
+        setup.push_str(&format!(
+            "SET allowed_paths = [{}];\n",
+            list(&sandbox.files)
+        ));
     }
 
     // This is the line that actually enforces anything.
@@ -382,7 +519,7 @@ fn load(connection: &Connection, table: &Materialised) -> Result<()> {
 }
 
 /// Run `sql` in DuckDB, pushing batches down `sink`.
-fn run(
+pub(crate) fn run(
     connection: &Connection,
     sql: &str,
     sink: &tokio::sync::mpsc::Sender<Result<RowBatch>>,
@@ -400,10 +537,13 @@ fn run(
                 .column_names()
                 .iter()
                 .enumerate()
-                .map(|(index, name)| ColumnMeta {
-                    name: name.clone(),
-                    type_name: statement.column_type(index).to_string().to_lowercase(),
-                    logical: LogicalType::Unknown,
+                .map(|(index, name)| {
+                    let kind = statement.column_type(index);
+                    ColumnMeta {
+                        name: name.clone(),
+                        type_name: kind.to_string().to_lowercase(),
+                        logical: logical_of(&duckdb::types::Type::from(&kind)),
+                    }
                 })
                 .collect();
             let meta = std::sync::Arc::new(meta);
@@ -437,6 +577,40 @@ fn run(
     Ok(())
 }
 
+/// What a DuckDB result column holds, in the connector-independent vocabulary.
+///
+/// Not cosmetic: a folder source answers through this path, and importing one
+/// into a federated query re-types every column from what is reported here. Left
+/// as `Unknown` — as it was while DuckDB could only ever be the *last* engine in
+/// the chain — every imported column landed as VARCHAR and `sum()` stopped
+/// working on a perfectly good decimal.
+fn logical_of(kind: &duckdb::types::Type) -> LogicalType {
+    use duckdb::types::Type;
+    match kind {
+        Type::Boolean => LogicalType::Bool,
+        Type::TinyInt
+        | Type::SmallInt
+        | Type::Int
+        | Type::BigInt
+        | Type::UTinyInt
+        | Type::USmallInt
+        | Type::UInt
+        | Type::UBigInt => LogicalType::Int,
+        Type::Float | Type::Double => LogicalType::Float,
+        // HUGEINT is 128-bit: wider than i64, so it travels as exact digits
+        // rather than being rounded into a JSON number.
+        Type::Decimal | Type::HugeInt | Type::UHugeInt => LogicalType::Decimal,
+        Type::Date32 => LogicalType::Date,
+        Type::Time64 => LogicalType::Time,
+        Type::Timestamp => LogicalType::Timestamp,
+        Type::Text | Type::Enum => LogicalType::Text,
+        Type::Blob => LogicalType::Binary,
+        // Intervals, lists, structs, maps and unions are rendered by DuckDB's own
+        // formatter; there is no scalar type to promise here.
+        _ => LogicalType::Unknown,
+    }
+}
+
 /// DuckDB values as JSON, matching how the native connectors render theirs.
 fn cell_to_json(row: &duckdb::Row<'_>, index: usize) -> Value {
     use duckdb::types::ValueRef;
@@ -457,12 +631,29 @@ fn cell_to_json(row: &duckdb::Row<'_>, index: usize) -> Value {
         Ok(ValueRef::Double(v)) => Value::from(v),
         Ok(ValueRef::Text(bytes)) => Value::String(String::from_utf8_lossy(bytes).into_owned()),
         Ok(ValueRef::Blob(bytes)) => Value::String(format!("\\x{}", hex(bytes))),
+        // 128-bit, and the type `sum()` over any integer column returns — so this
+        // is not an exotic case, it is the most ordinary aggregate there is.
+        // Without these arms it fell through to the debug formatter and a total of
+        // sixty was displayed as `HugeInt(60)`.
+        Ok(ValueRef::HugeInt(v)) => hugeint(i64::try_from(v).ok(), v.to_string()),
+        Ok(ValueRef::UHugeInt(v)) => hugeint(i64::try_from(v).ok(), v.to_string()),
         // Decimals, dates, intervals, lists, structs: rendered by DuckDB itself so
         // the exact digits survive, exactly as `numeric` does on the native path.
         Ok(other) => match duckdb::types::Value::from(other) {
             duckdb::types::Value::Null => Value::Null,
             value => Value::String(format!("{value:?}")),
         },
+    }
+}
+
+/// A JSON number while the value fits one, exact digits as text beyond that.
+///
+/// JSON numbers stop at 64 bits, and silently rounding a 128-bit total through
+/// `f64` is the one thing this codebase refuses to do to a number.
+fn hugeint(fits: Option<i64>, digits: String) -> Value {
+    match fits {
+        Some(value) => Value::from(value),
+        None => Value::String(digits),
     }
 }
 
@@ -478,14 +669,17 @@ pub fn execute<'a>(
 ) -> BoxStream<'a, Result<RowBatch>> {
     Box::pin(try_stream! {
         let root = state.workspace().await;
-        let roots: Vec<PathBuf> = root.clone().into_iter().collect();
+        let mut sandbox = match &root {
+            Some(root) => Sandbox::directory(root.clone()),
+            None => Sandbox::default(),
+        };
 
         // Everything the sources have to give, gathered before DuckDB opens.
         let mut tables = Vec::new();
         for import in &program.imports {
-            let table = match import {
+            let prepared = match import {
                 Import::Query { alias, source, database, sql } => {
-                    materialise_query(
+                    Prepared::Rows(materialise_query(
                         state,
                         alias,
                         source,
@@ -493,14 +687,25 @@ pub fn execute<'a>(
                         sql,
                         limits.max_import_rows,
                     )
-                    .await?
+                    .await?)
+                }
+                Import::Files { alias, source, pattern } => {
+                    prepare_scan(state, alias, source, pattern).await?
                 }
                 Import::Excel { alias, path, sheet } => {
-                    materialise_excel(alias, root.as_ref(), path, sheet.as_deref())?
+                    Prepared::Rows(materialise_excel(alias, root.as_ref(), path, sheet.as_deref())?)
                 }
             };
-            tracing::info!(alias = %table.alias, rows = table.rows.len(), "materialised import");
-            tables.push(table);
+            match &prepared {
+                Prepared::Rows(table) => {
+                    tracing::info!(alias = %table.alias, rows = table.rows.len(), "materialised import")
+                }
+                Prepared::Scan { alias, expression, grant } => {
+                    tracing::info!(alias, expression, "scanned import");
+                    sandbox.absorb(grant.clone());
+                }
+            }
+            tables.push(prepared);
         }
 
         let sql = substitute(&program.sql, root.as_ref())?;
@@ -509,9 +714,23 @@ pub fn execute<'a>(
         // DuckDB is synchronous, so it gets its own thread rather than stalling
         // the runtime for the length of the query.
         let worker = tokio::task::spawn_blocking(move || -> Result<()> {
-            let connection = open_duckdb(&roots)?;
+            let connection = open_duckdb(&sandbox)?;
             for table in &tables {
-                load(&connection, table)?;
+                match table {
+                    Prepared::Rows(table) => load(&connection, table)?,
+                    Prepared::Scan { alias, expression, .. } => {
+                        // A view, not a table: binding it reads the file's header
+                        // and nothing else until the query asks for rows.
+                        connection
+                            .execute_batch(&format!(
+                                "CREATE VIEW {} AS SELECT * FROM {expression};",
+                                quote_identifier(alias)
+                            ))
+                            .map_err(|e| {
+                                Error::Federated(format!("@import {alias}: {e}"))
+                            })?;
+                    }
+                }
             }
             run(&connection, &sql, &sink)
         });

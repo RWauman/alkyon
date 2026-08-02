@@ -8,11 +8,15 @@
 //! ```text
 //! -- @duckdb
 //! -- @import customer = user:pg-dev/alkyon_demo : select id, name from sales.customer
+//! -- @import trips    = taxi/*.parquet
 //! -- @excel  budget   = budgets/2026.xlsx#Sheet1
 //!
 //! select c.name, b.target
 //! from customer c join budget b on b.id = c.id;
 //! ```
+//!
+//! The second form has no `:` because there is no SQL to run on a folder — and
+//! that is also what tells the two apart.
 
 use crate::error::{Error, Result};
 
@@ -28,6 +32,19 @@ pub enum Import {
         /// In that source's own dialect — nothing translates it.
         sql: String,
     },
+    /// Files inside a folder source, read by DuckDB itself.
+    ///
+    /// The one import that does **not** travel through Alkyon: there is no SQL to
+    /// run on a folder, so the federated session reads the parquet directly. No
+    /// row cap applies, because no row is ever converted to text on the way.
+    Files {
+        alias: String,
+        /// A `files` source. Any other kind has SQL to run and belongs above.
+        source: String,
+        /// Relative to that source's path; `*` and `**` are DuckDB's to expand.
+        /// Empty when the source is itself a single file.
+        pattern: String,
+    },
     /// A spreadsheet, read in-process rather than by DuckDB.
     Excel {
         alias: String,
@@ -39,7 +56,9 @@ pub enum Import {
 impl Import {
     pub fn alias(&self) -> &str {
         match self {
-            Import::Query { alias, .. } | Import::Excel { alias, .. } => alias,
+            Import::Query { alias, .. }
+            | Import::Files { alias, .. }
+            | Import::Excel { alias, .. } => alias,
         }
     }
 }
@@ -130,7 +149,8 @@ fn annotate(error: Error, at: &str) -> Error {
 /// legitimately appear before the SQL separator, so the parser steps over one.
 const SCOPES: &[&str] = &["user:", "project:"];
 
-/// `<alias> = <source>[/<database>] : <native sql>`
+/// `<alias> = <source>[/<database>] : <native sql>`, or, with no `:` at all,
+/// `<alias> = <folder-source>[/<path or glob>]`.
 fn parse_query_import(rest: &str) -> Result<Import> {
     let (alias, remainder) = split_once_trimmed(rest, '=').ok_or_else(|| {
         Error::BadRequest("@import needs `<alias> = <source>[/<database>] : <sql>`".to_owned())
@@ -144,14 +164,11 @@ fn parse_query_import(rest: &str) -> Result<Import> {
         .iter()
         .find(|scope| remainder.starts_with(**scope))
         .map_or(0, |scope| scope.len());
-    let separator = remainder[scope..]
-        .find(':')
-        .map(|index| index + scope)
-        .ok_or_else(|| {
-            Error::BadRequest(format!(
-                "@import {alias}: missing `:` before the SQL to run on the source"
-            ))
-        })?;
+    let Some(separator) = remainder[scope..].find(':').map(|index| index + scope) else {
+        // No SQL to run means the target is files, not a server. Which source
+        // kinds that is legal for is the registry's business, not the parser's.
+        return parse_files_import(alias, &remainder[..]);
+    };
 
     let target = remainder[..separator].trim().to_owned();
     let sql = remainder[separator + 1..].trim().to_owned();
@@ -177,6 +194,35 @@ fn parse_query_import(rest: &str) -> Result<Import> {
         source,
         database,
         sql,
+    })
+}
+
+/// `<alias> = <folder-source>[/<path or glob>]`
+///
+/// Split on the **first** `/`, not the last: an id cannot contain one, and the
+/// pattern very much can (`2022/*.parquet`). That is the opposite of the SQL form
+/// above, where the last `/` introduces a database.
+fn parse_files_import(alias: String, target: &str) -> Result<Import> {
+    let (source, pattern) = match target.split_once('/') {
+        Some((source, pattern)) => (source.trim().to_owned(), pattern.trim().to_owned()),
+        None => (target.trim().to_owned(), String::new()),
+    };
+    if source.is_empty() {
+        return Err(Error::BadRequest(format!(
+            "@import {alias}: no source given"
+        )));
+    }
+    // The pattern is resolved against the source's own directory, so anything
+    // that could climb out of it is refused before DuckDB ever sees it.
+    if pattern.starts_with('/') || pattern.starts_with('\\') || pattern.contains("..") {
+        return Err(Error::BadRequest(format!(
+            "@import {alias}: `{pattern}` must stay inside the source — no `..`, no absolute path"
+        )));
+    }
+    Ok(Import::Files {
+        alias,
+        source,
+        pattern,
     })
 }
 
@@ -321,6 +367,64 @@ mod tests {
         assert_eq!(sql, "select a::text as x from t where b = 1 and c = 2");
     }
 
+    /// No `:` means there is no SQL to run, which means the target is files.
+    #[test]
+    fn an_import_without_sql_is_a_file_import() {
+        let program = parse("-- @import taxi = nytc-parquet-test/*.parquet").unwrap();
+        assert_eq!(
+            program.imports,
+            [Import::Files {
+                alias: "taxi".into(),
+                source: "nytc-parquet-test".into(),
+                pattern: "*.parquet".into(),
+            }]
+        );
+    }
+
+    /// The pattern may contain `/`; the id may not. So the split is on the first
+    /// one — the opposite of the SQL form, where the last `/` names a database.
+    #[test]
+    fn the_pattern_keeps_its_own_slashes() {
+        for (target, source, pattern) in [
+            ("data/2022/*.parquet", "data", "2022/*.parquet"),
+            ("user:data/**/*.csv", "user:data", "**/*.csv"),
+            (
+                "project:exports/one.parquet",
+                "project:exports",
+                "one.parquet",
+            ),
+            // A single-file source has nothing to select inside it.
+            ("budget", "budget", ""),
+        ] {
+            let program = parse(&format!("-- @import x = {target}")).unwrap();
+            assert_eq!(
+                program.imports,
+                [Import::Files {
+                    alias: "x".into(),
+                    source: source.into(),
+                    pattern: pattern.into(),
+                }],
+                "{target}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_file_import_cannot_climb_out_of_its_source() {
+        for pattern in [
+            "../secrets/*.parquet",
+            "a/../../b.csv",
+            "/etc/passwd",
+            "\\\\host\\share",
+        ] {
+            let buffer = format!("-- @import x = data/{pattern}");
+            assert!(
+                parse(&buffer).is_err(),
+                "`{pattern}` should have been refused"
+            );
+        }
+    }
+
     #[test]
     fn parses_an_excel_import() {
         let program = parse("-- @excel budget = budgets/2026.xlsx#Forecast").unwrap();
@@ -360,9 +464,11 @@ mod tests {
     fn bad_directives_say_which_line() {
         for (buffer, expected) in [
             ("-- @duckdb\n-- @import oops", "line 2"),
-            ("-- @import c = pg-dev", "missing `:`"),
             ("-- @import c = : select 1", "no source"),
             ("-- @import c = pg-dev :", "no SQL"),
+            ("-- @import c = /x.parquet", "no source"),
+            ("-- @import c = data/../../etc/passwd", "must stay inside"),
+            ("-- @import c = data//absolute", "must stay inside"),
             ("-- @excel b =", "no path"),
         ] {
             let error = parse(buffer).expect_err(buffer).to_string();
