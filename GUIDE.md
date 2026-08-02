@@ -19,10 +19,21 @@ Click **+** in the *Sources* pane. Alkyon connects **before** it saves anything,
 a wrong password fails in the dialogue rather than at your first query. **Test**
 tries the connection without registering it.
 
-- **Database** is optional. Left empty you get `postgres` or `master`.
+| Engine | Dialect | Default port |
+|---|---|---|
+| PostgreSQL | PL/pgSQL | 5432 |
+| SQL Server | T-SQL | 1433 |
+| MySQL / MariaDB | MySQL | 3306 |
+| **Folder or file** | DuckDB | — |
+
+- **Database** is optional. Left empty you get `postgres`, `master` or
+  `information_schema`.
 - **Named instance** (SQL Server, on-prem): fill it in and leave **Port** empty.
 - **Entra ID**: paste a token from
   `az account get-access-token --resource https://database.windows.net/`.
+- **MySQL** has no schema layer — a schema *is* a database. The explorer shows the
+  database twice for that reason, and identifiers are quoted with backticks,
+  because `"orders"` in MySQL is the *text* `orders`, not the table.
 
 The password goes to the **OS keychain** (Credential Manager, Keychain, libsecret).
 Only the host, port, database and username are written to disk. Nothing that comes
@@ -43,6 +54,48 @@ project's `warehouse` can coexist. Where a name could mean either, write
 A green dot next to each source says whether it answered. It is checked when the
 list loads and on **↻**, not on a timer.
 
+## A folder, or one file, as a source
+
+Pick **Folder or file** and give a path on the machine running alkyon; `~` works.
+There is no host, no port and no credential — just the path.
+
+Every data file underneath becomes a **table**, named after itself, and every
+subdirectory becomes a **schema**:
+
+```text
+C:\data\exports\
+  customers.parquet        →  customers
+  sales\orders.csv         →  sales.orders
+```
+
+```sql
+select c.name, sum(o.total)
+from customers c join sales.orders o on o.customer_id = c.id
+group by c.name;
+```
+
+No `read_parquet(...)`, no path literals. It is DuckDB SQL, and the source behaves
+like any other: green dot, explorer tree, autocompletion, `Ctrl+K` search over the
+files' columns, and `SWAP` to switch to it.
+
+- **Formats**: `.csv`, `.tsv`, `.txt`, `.parquet`, `.json`, `.ndjson`, `.jsonl` —
+  all read in-process, nothing downloaded. **Excel is not one of them**: point a
+  file source at an `.xlsx` and it says so. Spreadsheets go through `-- @excel` in
+  a DuckDB buffer, below.
+- **Point it at one file** and only that file is reachable — not its neighbours in
+  the same directory.
+- **Confined** to the path you gave, for reading *and* writing. `copy … to` inside
+  it works, which is how you export; anywhere else is refused.
+- Two files with the same stem both survive — `sales.csv` and `sales.parquet`
+  become `sales` and `sales.parquet`.
+- Up to 200 files, 6 directories deep, skipping `.git`, `node_modules` and friends.
+- Because it is an ordinary source, a federated buffer can join it to a database
+  table — and `-- @import x = my-folder/*.parquet` does it without copying a row.
+  See [importing files without copying them](#importing-files-without-copying-them).
+
+A file DuckDB cannot parse — mixed line endings are the usual culprit — fails with
+the reason and the filename, and costs you only that file.
+
 ## Run a query
 
 `Ctrl+Enter` (or `F5`). **With text selected, only the selection runs** — the usual
@@ -52,9 +105,28 @@ Your SQL goes to the engine untouched: T-SQL to SQL Server, PL/pgSQL to Postgres
 No translation layer, so DDL, views, procedures and vendor syntax behave exactly as
 the server expects.
 
-Rows stream in as they arrive, so a large `SELECT` starts rendering immediately.
 **Cancel** stops a running query. Fixed-scale numbers (`numeric`, `decimal`) travel
 as text and keep every digit rather than being rounded through a float.
+
+### The row limit
+
+**Rows** in the header caps how many rows come back — 50 000 by default. Hitting it
+*stops the query*, and the status line says so plainly rather than letting a partial
+answer read as the whole one.
+
+It is not a formality. A single 2.5 M-row parquet is 382 MB of JSON on the wire and
+roughly 800 MB of browser memory; an absent-minded `select *` used to take the tab
+with it. Raise it per query in the picker, set the floor with `ALKYON_MAX_ROWS`, or
+choose **no limit** if you know what you are asking for.
+
+To work with more than fits, aggregate in SQL, or export with
+`copy (…) to '${folder}/out.parquet' (format parquet)`.
+
+### Peek at a table
+
+**Click a table in the explorer** and its first 100 rows appear, in that source's own
+dialect — `TOP 100` on SQL Server, `LIMIT 100` everywhere else. The buffer is left
+alone, so it costs you nothing you were writing. Double-click still inserts the name.
 
 ### Point the editor somewhere else
 
@@ -68,7 +140,7 @@ SELECT count(*) FROM orders;
 Handled by the editor; it never reaches a server. Only recognised as the **first
 token** of the buffer. It is `SWAP` and not `USE` because `USE` is a reserved
 keyword in T-SQL and a real statement in MySQL, DuckDB and ClickHouse — `SWAP` is
-free in all of them.
+free in all of them. That mattered the moment MySQL was added, and it will again.
 
 ## Find things
 
@@ -153,7 +225,43 @@ anywhere.
 
 ```text
 -- @import <alias> = <source>[/<database>] : <SQL in that source's dialect>
+-- @import <alias> = <folder source>/<path or glob>      -- no `:` — see below
 -- @excel  <alias> = <path>[#<sheet>]
+```
+
+### Importing files without copying them
+
+Drop the `:` and the SQL, and the import becomes a **path**:
+
+```sql
+-- @duckdb
+-- @import trips = taxi/*.parquet
+select count(*) as rides, round(sum(total_amount)) as revenue from trips;
+```
+
+The missing `:` is the whole distinction: there is no SQL to run on a folder. The
+pattern is relative to the source's own path, and `*` / `**` are DuckDB's to
+expand — so `taxi/2022/*.parquet` and `taxi/**/*.csv` both work, and a dozen files
+become one table.
+
+**This is the one import that does not travel through Alkyon.** A normal `@import`
+pulls every row into this process and turns each cell into text; a path import is
+a *view* over the files, so DuckDB reads only the columns your query touches. On
+39.7 M rows across twelve parquet files: **270 ms**, and no row cap, because no row
+is ever copied.
+
+It works on folder and file sources only — anything else has SQL to run, and says
+so. The pattern cannot leave the source: `..` and absolute paths are refused before
+a path is built, and the sandbox refuses whatever slips past.
+
+`@import` takes **any** registered source, folder sources included — so a parquet
+file joins a production table without either side knowing about the other:
+
+```sql
+-- @duckdb
+-- @import live  = pg-prod/warehouse : select id, name from sales.customer
+-- @import bench = exports           : select id, target from benchmarks
+select l.name, b.target from live l join bench b on b.id = l.id;
 ```
 
 **Exporting.** Straight DuckDB:
@@ -170,9 +278,10 @@ consulted.
 
 ### What to expect
 
-- **The rows travel through Alkyon.** No predicate pushdown, so a single import is
-  capped at 1,000,000 rows (`ALKYON_IMPORT_MAX_ROWS`). Exceeding it is an **error**,
-  never a silent truncation. Narrow the import instead.
+- **The rows travel through Alkyon** — for `@import … : <sql>` and `@excel`, not for
+  a path import. No predicate pushdown, so a single one is capped at 1,000,000 rows
+  (`ALKYON_IMPORT_MAX_ROWS`). Exceeding it is an **error**, never a silent
+  truncation. Narrow the import, or point at the files by path instead.
 - **Formats**: CSV, Parquet and JSON, all built in — nothing is ever downloaded.
   Excel is read in-process, with each column's type inferred from its cells.
   **Delta and Iceberg are not available**; they would require fetching an extension.
@@ -220,6 +329,7 @@ The theme button cycles Auto → Light → Dark and remembers your choice.
 | `ALKYON_SOURCES` | — | JSON file of sources to *import* at startup |
 | `ALKYON_SHELL` | PowerShell / `$SHELL` | what the terminal spawns |
 | `ALKYON_TERMINAL` | loopback only | `always` to expose the terminal elsewhere |
+| `ALKYON_MAX_ROWS` | `50000` | rows a query may return before it is stopped |
 | `ALKYON_IMPORT_MAX_ROWS` | `1000000` | cap on one federated `@import` |
 | `ALKYON_LOG` | `alkyon=info` | `tracing` filter |
 
@@ -238,7 +348,7 @@ The UI is only a client; everything is reachable directly.
 | Method | Route | |
 |---|---|---|
 | GET | `/health` | status, version, vault, whether the terminal is available |
-| GET / POST | `/sources` | list (no credentials) / register (connects first) |
+| GET / POST | `/sources` | list (no credentials) / register (connects first); a folder source posts `{"kind":"files","path":…,"auth":{"method":"none"}}` |
 | DELETE | `/sources/{key}` | also deletes the keychain entry |
 | POST | `/connection-test` | try credentials without registering |
 | GET | `/sources/{key}/status` | reachable now? always 200; the answer is in the body |
@@ -250,5 +360,5 @@ The UI is only a client; everything is reachable directly.
 | GET / PUT / DELETE | `/workspace` | the open folder and its `.sql` files |
 | GET / PUT | `/workspace/file?path=` | read / write, confined to the folder |
 | GET | `/shells` | shells found on the machine |
-| WS | `/ws/query` | `{source_id, database?, sql}` → `columns` / `rows` / `affected` / `end`; `{"type":"cancel"}` stops it |
+| WS | `/ws/query` | `{source_id, database?, sql, max_rows?}` → `columns` / `rows` / `affected` / `end` (carrying `truncated`); `{"type":"cancel"}` stops it |
 | WS | `/ws/terminal?shell=` | PTY; binary frames are bytes, text frames are control |
