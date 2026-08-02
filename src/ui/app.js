@@ -5,7 +5,8 @@ import { createEditor } from './editor.js';
 import { createExplorer } from './explorer.js';
 import { canSaveInPlace, download, openFiles, pickSaveTarget, writeFile } from './files.js';
 import { ResultGrid } from './grid.js';
-import { parseSwap } from './swap.js';
+import { findCrossSource, unresolvedHeads } from './qualified.js';
+import { parseTarget } from './target.js';
 import { createTerminal } from './terminal.js';
 import { createSearch } from './search.js';
 import { createTheme } from './theme.js';
@@ -19,6 +20,8 @@ const state = {
   database: null,
   /** The open result, kept for as long as its pages may still be read. */
   running: null,
+  /** The on-screen result's columns, or null when there is no result. */
+  columns: null,
   /** True while a page is on its way; what stops two queries overlapping. */
   inFlight: false,
   /** id → { ok, detail }, filled in by the explorer's probes. */
@@ -59,13 +62,40 @@ const terminal = createTerminal($('terminal'), { onStatus: status });
 
 // ------------------------------------------------------------------ buffers
 
+/**
+ * The tab whose result is on screen.
+ *
+ * A result belongs to the tab that asked for it. Without that, looking at a
+ * table wipes whatever you had just run — which is what made the preview
+ * annoying enough to fix.
+ */
+let showing = null;
+
 const buffers = createBuffers($('tab-bar'), {
   onActivate: (buffer) => {
+    stashResult();
+    showing = buffer;
+    paintStart();
+
+    // `null` means every tab is closed: the start screen has the pane.
+    if (!buffer) {
+      grid.destroy();
+      state.running = null;
+      state.columns = null;
+      resetPaging();
+      paintPaging();
+      status('idle');
+      detail('');
+      return;
+    }
+
     editor.setDoc(buffer.doc);
     editor.setDialect(state.source?.editor_mime);
     // A tab remembers what it was last run against. Captured first, because
     // `selectSource` will rewrite `buffer.target` as it goes.
     paintMode();
+    restoreResult(buffer);
+
     const target = buffer.target;
     if (target) {
       selectSource(target.sourceKey).then(() => {
@@ -74,6 +104,97 @@ const buffers = createBuffers($('tab-bar'), {
     }
   },
 });
+
+/** The start screen owns the editor pane whenever no tab is open. */
+function paintStart() {
+  const open = buffers.all.length > 0;
+  $('editor-pane').hidden = !open;
+  $('start').hidden = open;
+  for (const id of ['run', 'save-file', 'save-as-file']) $(id).disabled = !open;
+  editor.refresh();
+}
+
+/** Fill the start screen's list of folders opened before. */
+function paintRecent(recent) {
+  const list = $('start-recent');
+  list.replaceChildren();
+  if (!recent?.length) return;
+
+  const heading = document.createElement('div');
+  heading.className = 'heading';
+  heading.textContent = 'Recent folders';
+  list.append(heading);
+
+  for (const path of recent) {
+    const item = document.createElement('button');
+    item.className = 'recent';
+    // `direction: rtl` keeps the tail visible; the marks stop the browser from
+    // reordering the leading drive letter along with it.
+    item.textContent = `‪${path}‬`;
+    item.title = path;
+    item.addEventListener('click', () => openFolder(path));
+    list.append(item);
+  }
+}
+
+/** Park the on-screen result on the tab that owns it. */
+function stashResult() {
+  if (!showing) return;
+
+  // A page still on its way belongs to a tab that is about to leave the screen.
+  // Rather than let its rows arrive into someone else's grid, give it up — and
+  // say so, instead of leaving a spinner parked on a tab nobody is watching.
+  if (state.inFlight) {
+    state.running?.cancel();
+    setRunning(false);
+    status('cancelled — the tab changed while it was loading');
+  }
+  showing.result = state.columns
+    ? {
+        columns: state.columns,
+        pages: paging.pages,
+        at: paging.at,
+        first: paging.first,
+        more: paging.more,
+        // The open cursor travels with its tab, so turning a page still works
+        // after you have been somewhere else and come back.
+        running: state.running,
+        status: $('status-text').textContent,
+        detail: $('status-detail').textContent,
+        error: $('status').classList.contains('error'),
+      }
+    : null;
+}
+
+/** Put a tab's own result back on screen, or clear the pane if it has none. */
+function restoreResult(buffer) {
+  const saved = buffer.result;
+  state.running = saved?.running ?? null;
+  state.columns = saved?.columns ?? null;
+  resetPaging();
+
+  if (!saved) {
+    grid.destroy();
+    status('idle');
+    detail('');
+    paintPaging();
+    setRunning(false);
+    return;
+  }
+
+  Object.assign(paging, {
+    pages: saved.pages,
+    at: saved.at,
+    first: saved.first,
+    more: saved.more,
+  });
+  grid.reset(saved.columns);
+  grid.replace(saved.pages[saved.at] ?? []);
+  status(saved.status, saved.error);
+  detail(saved.detail);
+  setRunning(false);
+  paintPaging();
+}
 
 /** Record the active target on the active tab, so switching back restores it. */
 function rememberTarget() {
@@ -318,26 +439,40 @@ $('open-folder').addEventListener('click', () => {
 });
 $('folder-cancel').addEventListener('click', () => folderDialog.close());
 
+/**
+ * Open `path` as the workspace. Shared by the dialogue and the start screen's
+ * recent list, so both do the same three follow-ups.
+ */
+async function openFolder(path) {
+  const opened = await workspace.open(path);
+  // The folder brings its own sources with it.
+  await loadSources();
+  paintRecent(opened.recent);
+  status(`opened ${opened.root} — ${opened.files.length} .sql file(s)`);
+  // The working directory is fixed when the shell is spawned, so an open
+  // terminal has to be restarted to land in the new folder.
+  terminal.restart();
+  return opened;
+}
+
 folderForm.addEventListener('submit', async (event) => {
   event.preventDefault();
   const button = $('folder-open');
   button.disabled = true;
   folderNote();
   try {
-    const state = await workspace.open(folderForm.elements.path.value.trim());
+    await openFolder(folderForm.elements.path.value.trim());
     folderDialog.close();
-    // The folder brings its own sources with it.
-    await loadSources();
-    status(`opened ${state.root} — ${state.files.length} .sql file(s)`);
-    // The working directory is fixed when the shell is spawned, so an open
-    // terminal has to be restarted to land in the new folder.
-    terminal.restart();
   } catch (e) {
     folderNote(e.message, 'bad');
   } finally {
     button.disabled = false;
   }
 });
+
+$('start-open-folder').addEventListener('click', () => $('open-folder').click());
+$('start-new-query').addEventListener('click', () => buffers.open());
+$('start-add-source').addEventListener('click', () => $('add-source').click());
 
 $('close-folder').addEventListener('click', async () => {
   try {
@@ -375,11 +510,15 @@ const explorer = createExplorer($('explorer'), {
     selectDatabase(db);
   },
   onInsert: (qualified) => editor.insert(qualified),
-  // Clicking a table peeks at it. The buffer is left alone — this is a look, not
-  // an edit, so whatever you were writing survives.
-  onPreview: (source, qualified) => {
+  // Clicking a table peeks at it — in a tab of its own, so it neither touches
+  // what you were writing nor throws away the result you were looking at.
+  onPreview: (source, table, qualified) => {
     if (state.busy || state.inFlight) return;
-    stream(previewSql(source.dialect, qualified));
+    buffers.openPreview({
+      name: `${table} (preview)`,
+      text: previewSql(source.dialect, qualified),
+    });
+    run();
   },
   onTables: (source, db, tables) => {
     if (source.key !== state.source?.key) return;
@@ -416,7 +555,7 @@ function selectDatabase(db) {
   if (state.database === db) return;
   state.database = db;
   const select = $('database-select');
-  // A database named by SWAP may not be in the fetched list — if the server
+  // A database named by TARGET may not be in the fetched list — if the server
   // never listed it, let the engine be the one to complain.
   if (db && ![...select.options].some((option) => option.value === db)) {
     const option = document.createElement('option');
@@ -485,7 +624,7 @@ async function loadSources({ keep = true } = {}) {
     return option;
   }));
 
-  // What a SWAP may name: the bare id, and the qualified key when telling two
+  // What a TARGET may name: the bare id, and the qualified key when telling two
   // scopes apart is the only way to be unambiguous.
   editor.setSources([
     ...new Set(
@@ -508,15 +647,11 @@ async function loadSources({ keep = true } = {}) {
   }
 }
 
-// --------------------------------------------------------------------- swap
+// ------------------------------------------------------------------- target
 
 /**
- * Apply any leading `SWAP <source>[.<database>]` directives. Returns the SQL left
- * to run, or `null` when a directive named something unknown.
- */
-/**
- * A SWAP token may be a qualified `scope:id` or a bare id, when only one scope
- * defines it. Returns the key, or `null`.
+ * A `TARGET` token may be a qualified `scope:id` or a bare id, when only one
+ * scope defines it. Returns the key, or `null`.
  */
 function resolveSourceKey(token) {
   if (state.sources.some((source) => source.key === token)) return token;
@@ -524,25 +659,29 @@ function resolveSourceKey(token) {
   return matches.length === 1 ? matches[0].key : null;
 }
 
-async function applySwaps(sql) {
-  const parsed = parseSwap(sql, (token) => resolveSourceKey(token) !== null);
+/**
+ * Apply any leading `TARGET <source>[.<database>]` directives. Returns the SQL
+ * left to run, or `null` when a directive named something unknown.
+ */
+async function applyTargets(sql) {
+  const parsed = parseTarget(sql, (token) => resolveSourceKey(token) !== null);
 
   if (parsed.unknown) {
     const known = state.sources.map((source) => source.key).join(', ') || 'none registered';
-    status(`SWAP: cannot resolve \`${parsed.unknown}\` — known: ${known}`, true);
+    status(`TARGET: cannot resolve \`${parsed.unknown}\` — known: ${known}`, true);
     return null;
   }
 
-  let swapped = null;
+  let retargeted = null;
   for (const target of parsed.targets) {
     const key = resolveSourceKey(target.id);
     await selectSource(key);
     if (target.database) selectDatabase(target.database);
-    swapped = `${key} · ${state.database ?? ''}`;
+    retargeted = `${key} · ${state.database ?? ''}`;
   }
 
-  if (swapped) detail(swapped);
-  return { sql: parsed.sql, swapped };
+  if (retargeted) detail(retargeted);
+  return { sql: parsed.sql, retargeted };
 }
 
 // -------------------------------------------------------------------- query
@@ -561,16 +700,86 @@ async function run() {
 }
 
 async function execute() {
-  const applied = await applySwaps(editor.sql().trim());
+  const applied = await applyTargets(editor.sql().trim());
   if (!applied) return;
 
-  const { sql, swapped } = applied;
+  const { retargeted } = applied;
+  const qualified = await applyQualified(applied.sql);
+  if (!qualified) return;
+
+  const sql = qualified.sql;
   if (!sql) {
-    if (swapped) status(`swapped to ${swapped}`);
+    if (retargeted) status(`now targeting ${retargeted}`);
     else status('nothing to run', true);
     return;
   }
   stream(sql);
+}
+
+/**
+ * `source-name` and `source_name` are the same word to a person and different
+ * ones to a lookup, and so are `Sales` and `sales`.
+ */
+const normalise = (name) => name.toLowerCase().replaceAll('-', '_');
+
+/**
+ * A sentence to add to a failed query when it looks like it meant to name a
+ * source and got the name slightly wrong.
+ *
+ * Nothing can be said *before* running it — `alkyon_demo.sales.customer` is both
+ * a plausible typo and ordinary three-part T-SQL. After the engine has refused,
+ * a near miss is worth pointing at.
+ */
+function nearMissHint(sql) {
+  const heads = unresolvedHeads(sql, (id) => resolveSourceKey(id) !== null);
+  const matches = heads.flatMap((head) => {
+    const near = state.sources.find((source) => normalise(source.id) === normalise(head));
+    return near ? [`\`${head}\` → \`${near.id}\``] : [];
+  });
+  return matches.length
+    ? `\n\nNo source is called ${matches.join(', ')}. Did you mean it? A source id with a ` +
+        'dash needs quoting in SQL: `"my-source".…`'
+    : '';
+}
+
+/**
+ * Apply a `source.database.table` name, if the statement carries one.
+ *
+ * The second way to change target, and it does not replace `TARGET`: the
+ * directive says where the *editor* points and stays pointed; this says where
+ * one statement goes. Returns the SQL to run with the prefix removed, or `null` when the
+ * statement cannot be run as written.
+ */
+async function applyQualified(sql) {
+  // In DuckDB mode each `@import` names its own source and there is no single
+  // target to retarget to. Retargeting there would also rewrite names the
+  // federated query means literally.
+  if (looksFederated(sql)) return { sql };
+
+  const found = findCrossSource(sql, (id) => {
+    const key = resolveSourceKey(id);
+    if (!key) return null;
+    const source = state.sources.find((s) => s.key === key);
+    // A folder or file source has one catalogue and no databases, so nothing
+    // between it and the name it is holding.
+    return { database: source?.kind !== 'files' };
+  });
+  if (!found) return { sql };
+
+  if (found.conflict) {
+    status(
+      `this statement names ${found.conflict.join(' and ')} — one query goes to one ` +
+        'source. To join across them, put `-- @duckdb` at the top and import each.',
+      true,
+    );
+    return null;
+  }
+
+  const key = resolveSourceKey(found.source);
+  await selectSource(key);
+  if (found.database) selectDatabase(found.database);
+  detail(`${key} · ${found.database ?? state.database ?? ''}`);
+  return { sql: found.sql };
 }
 
 /** Rows per page, from the header picker. */
@@ -694,6 +903,7 @@ function stream(sql) {
   let rows = 0;
   let sawColumns = false;
   let seen = 0;
+  state.columns = null;
   resetPaging();
   setRunning(true);
   status('running…');
@@ -716,6 +926,7 @@ function stream(sql) {
     {
       columns: ({ columns }) => {
         sawColumns = true;
+        state.columns = columns;
         grid.reset(columns);
       },
       rows: (message) => {
@@ -758,8 +969,9 @@ function stream(sql) {
       },
       error: ({ message }) => {
         if (!current()) return;
-        grid.message(message);
-        status(message, true);
+        const full = message + nearMissHint(sql);
+        grid.message(full);
+        status(full, true);
       },
       closed: () => {
         if (!current()) return;
@@ -1064,7 +1276,11 @@ theme.apply();
 
 // The first tab adopts whatever the editor was seeded with, so the hint text in
 // it survives.
-buffers.open({ text: editor.text() });
+// No tab is opened here on purpose: alkyon comes up on the start screen, where
+// the first thing to decide is where you are working rather than what to type.
+// `Alt+N`, the `+` in the tab bar, opening a `.sql` file or clicking a table all
+// open one.
+paintStart();
 paintMode();
 if (!canSaveInPlace) {
   $('save-file').title = 'This browser cannot save in place — Save downloads the file';
@@ -1077,5 +1293,5 @@ try {
   status('cannot reach the alkyon backend', true);
 }
 
-await Promise.all([loadSources(), loadShells(), workspace.refresh()]);
-editor.focus();
+const [, , opened] = await Promise.all([loadSources(), loadShells(), workspace.refresh()]);
+paintRecent(opened?.recent);

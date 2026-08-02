@@ -126,8 +126,10 @@ export function createWorkspace(element, { onOpenFile, onRootChange, onStatus })
         root = state.root;
         onRootChange(root);
         paint(state);
+        return state;
       } catch (e) {
         onStatus(e.message, true);
+        return null;
       }
     },
 

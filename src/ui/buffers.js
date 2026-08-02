@@ -17,7 +17,14 @@ export function createBuffers(bar, { onActivate, onDirtyChange }) {
     bar.replaceChildren(
       ...buffers.map((buffer) => {
         const tab = document.createElement('div');
-        tab.className = buffer === active ? 'tab active' : 'tab';
+        tab.className = [
+          'tab',
+          buffer === active ? 'active' : '',
+          // Italic, the way an editor marks a tab you are only passing through.
+          buffer.preview ? 'preview' : '',
+        ]
+          .filter(Boolean)
+          .join(' ');
         tab.title =
           buffer.workspacePath ??
           (buffer.handle ? buffer.name : `${buffer.name} — not saved to a file yet`);
@@ -86,9 +93,34 @@ export function createBuffers(bar, { onActivate, onDirtyChange }) {
         workspacePath,
         generation: doc.changeGeneration(),
         target: null,
+        /** The tab's own result, parked here while another tab is on screen. */
+        result: null,
       };
       buffers.push(buffer);
       api.activate(buffer);
+      return buffer;
+    },
+
+    /**
+     * The one reusable tab for looking at a table.
+     *
+     * Reused rather than opened afresh each time: clicking through ten tables
+     * should leave you with one tab, not ten. It is also never dirty, because
+     * nobody typed it — closing it must not ask whether to save.
+     */
+    openPreview({ name, text }) {
+      const existing = buffers.find((buffer) => buffer.preview);
+      const buffer = existing ?? api.open({ name, text });
+      buffer.preview = true;
+
+      if (existing) {
+        existing.name = name;
+        existing.doc.setValue(text);
+        existing.result = null;
+        api.activate(existing);
+      }
+      buffer.generation = buffer.doc.changeGeneration();
+      render();
       return buffer;
     },
 
@@ -106,10 +138,13 @@ export function createBuffers(bar, { onActivate, onDirtyChange }) {
       const index = buffers.indexOf(buffer);
       buffers.splice(index, 1);
 
-      // Never leave the workbench with no buffer at all.
+      // Closing the last tab is allowed, and lands you back on the start screen
+      // — the same place alkyon opens on. Forcing an empty query tab instead
+      // would be answering a question you did not ask.
       if (buffers.length === 0) {
         active = null;
-        api.open();
+        render();
+        onActivate(null);
         return;
       }
       if (active === buffer) {

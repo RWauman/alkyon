@@ -2,22 +2,22 @@
 // with autocompletion fed from the schema the explorer has loaded so far.
 
 import { dialectForMime, qualifyLoosely } from './dialect.js';
-import { swapTargetAt } from './swap.js';
+import { targetAt } from './target.js';
 
 /**
- * Completions for the target of a `SWAP`, or null when that is not what is being
- * typed.
+ * Completions for the target of a `TARGET`, or null when that is not what is
+ * being typed.
  *
- * Without this the SQL hint answers `SWAP pg` with `PG_CONTEXT`,
+ * Without this the SQL hint answers `TARGET pg` with `PG_CONTEXT`,
  * `PG_DATATYPE_NAME` and the rest of PL/pgSQL's `PG_*` keywords — and since the
  * list pops up as you type, pressing Enter to move on accepts one. The directive
- * silently becomes `SWAP PG_CONTEXT` and stops working. After `SWAP` the only
+ * silently becomes `TARGET PG_CONTEXT` and stops working. After `TARGET` the only
  * words that mean anything are the sources you have registered, so those are the
  * only ones offered.
  */
-function swapCompletions(cm, sources) {
+function targetCompletions(cm, sources) {
   const cursor = cm.getCursor();
-  const at = swapTargetAt(cm.getValue().split('\n'), cursor.line, cursor.ch);
+  const at = targetAt(cm.getValue().split('\n'), cursor.line, cursor.ch);
   if (!at) return null;
 
   const typed = at.token.toLowerCase();
@@ -29,6 +29,62 @@ function swapCompletions(cm, sources) {
     // completing halfway through a name does not leave its tail behind.
     to: CodeMirror.Pos(cursor.line, at.end),
   };
+}
+
+/**
+ * Candidates the SQL hint will not offer: schemas, and tables found by their own
+ * name rather than by the schema in front of it.
+ *
+ * The addon matches a candidate from its first character, and its candidates are
+ * the *qualified* names — so `customer` matches nothing at all, and you have to
+ * remember `sales` before it will help you find `sales.customer`. That is
+ * backwards: the table name is the part you know.
+ *
+ * Two additions, both only while the word being typed has no dot in it (after a
+ * dot the addon already knows what to do):
+ *
+ *   - every `schema.table` whose **table** starts with what you typed;
+ *   - every **schema**, which is what you want right after `FROM`.
+ */
+function byBareName(cm, result, tables) {
+  const typed = cm.getRange(result.from, result.to);
+  if (typed.includes('.') || typed.includes('"') || typed.includes('`')) return [];
+
+  const prefix = typed.toLowerCase();
+  const already = new Set(
+    result.list.map((item) => (typeof item === 'string' ? item : item.text)),
+  );
+
+  const schemas = new Set();
+  const matched = [];
+  for (const qualified of Object.keys(tables)) {
+    const cut = qualified.indexOf('.');
+    if (cut === -1) continue;
+    const schema = qualified.slice(0, cut);
+    const table = qualified.slice(cut + 1);
+
+    if (schema.toLowerCase().startsWith(prefix)) schemas.add(schema);
+    if (table.toLowerCase().startsWith(prefix) && !already.has(qualified)) {
+      matched.push({
+        text: qualified,
+        // The table first, since that is what you were looking for.
+        displayText: `${table} — ${schema}`,
+        className: 'CodeMirror-hint-table',
+      });
+    }
+  }
+
+  const schemaItems = [...schemas]
+    .filter((schema) => !already.has(schema))
+    .sort()
+    .map((schema) => ({
+      text: schema,
+      displayText: `${schema} — schema`,
+      className: 'CodeMirror-hint-table',
+    }));
+
+  matched.sort((a, b) => a.text.localeCompare(b.text));
+  return [...schemaItems, ...matched];
 }
 
 /**
@@ -44,14 +100,16 @@ function swapCompletions(cm, sources) {
  * bare name too, because that is the one you recognise.
  */
 function quotingSqlHint(cm, options) {
-  const swap = swapCompletions(cm, options.sources ?? []);
-  if (swap) return swap;
+  const target = targetCompletions(cm, options.sources ?? []);
+  if (target) return target;
 
   const result = CodeMirror.hint.sql(cm, options);
   if (!result?.list) return result;
 
   const dialect = dialectForMime(cm.getOption('mode'));
   const reserved = CodeMirror.resolveMode(cm.getOption('mode'))?.keywords;
+
+  result.list = [...byBareName(cm, result, options.tables ?? {}), ...result.list];
 
   result.list = result.list.map((item) => {
     const bare = typeof item === 'string' ? item : item.text;
@@ -70,17 +128,21 @@ function quotingSqlHint(cm, options) {
 }
 
 /**
- * Teach every SQL mode that `SWAP` is a keyword.
+ * Teach every SQL mode that `TARGET` is a keyword.
  *
  * It is alkyon's own directive rather than any engine's, but it is the first
  * word of the buffer and it *acts* like a statement, so leaving it in plain text
  * made it read as a mistake. The mode keeps a reference to this object, so
- * adding to it reaches modes already created.
+ * adding to it reaches modes already created. `swap`, the former spelling, is
+ * still highlighted because it is still accepted.
  */
 for (const mime of ['text/x-sql', 'text/x-pgsql', 'text/x-mssql', 'text/x-mysql']) {
-  // Tokens are lower-cased before the lookup, so the key is `swap`.
+  // Tokens are lower-cased before the lookup, so the keys are lower-case.
   const keywords = CodeMirror.mimeModes[mime]?.keywords;
-  if (keywords) keywords.swap = true;
+  if (keywords) {
+    keywords.target = true;
+    keywords.swap = true;
+  }
 }
 
 export function createEditor(element, { onRun, onOpen, onSave, onSaveAs, onNew, onClose, onChange }) {
@@ -88,13 +150,13 @@ export function createEditor(element, { onRun, onOpen, onSave, onSaveAs, onNew, 
   // to column names. Table names are registered as soon as a database is
   // expanded; the columns fill in when a table is.
   let tables = {};
-  // Registered source names, for completing a SWAP target.
+  // Registered source names, for completing a TARGET directive.
   let sources = [];
 
   const editor = CodeMirror(element, {
     value: [
       '-- Ctrl+Enter to run. With text selected, only the selection runs.',
-      '-- SWAP <source> or SWAP <source>.<database> retargets the editor.',
+      '-- TARGET <source> or TARGET <source>.<database> retargets the editor.',
       'select 1 as answer;',
       '',
     ].join('\n'),
@@ -216,7 +278,7 @@ export function createEditor(element, { onRun, onOpen, onSave, onSaveAs, onNew, 
       return editor.getValue();
     },
 
-    /** What a SWAP may name. Bare ids, plus the qualified key when it differs. */
+    /** What a TARGET may name. Bare ids, plus the qualified key when it differs. */
     setSources(names) {
       sources = names;
       refreshHints();

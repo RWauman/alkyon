@@ -13,6 +13,20 @@ cargo run          # http://127.0.0.1:8787
 
 That is the whole thing: one binary serving an API and the UI that consumes it.
 
+Alkyon opens on a **start screen**, not on an empty query. The first thing to
+settle is usually *where* you are working, so it offers that: open a folder, pick
+one you opened before, add a source, or start a query anyway.
+
+| | |
+|---|---|
+| **Open a folder…** | a path on this machine; the `.sql` tree and the terminal follow it |
+| **Recent folders** | the last eight, most recent first; ones that have gone are not offered |
+| **New query** | `Alt+N`, or the **+** in the tab bar |
+| **Add a source…** | the same dialogue as **+** in the *Sources* pane |
+
+Closing the last tab brings the start screen back rather than conjuring an empty
+one. Opening a folder does not open a tab — it just puts you somewhere.
+
 ## Add a source
 
 Click **+** in the *Sources* pane. Alkyon connects **before** it saves anything, so
@@ -28,6 +42,11 @@ tries the connection without registering it.
 
 - **Database** is optional. Left empty you get `postgres`, `master` or
   `information_schema`.
+- **A database that is not there** reads as a login failure on SQL Server — its
+  error 4060 says *Cannot open database "x" requested by the login. The login
+  failed.* Alkyon rewrites that one, because the server genuinely cannot tell
+  "no such database" from "you may not open it", and the tail of the sentence is
+  what everyone reads.
 - **Named instance** (SQL Server, on-prem): fill it in and leave **Port** empty.
 - **Entra ID**: paste a token from
   `az account get-access-token --resource https://database.windows.net/`.
@@ -76,7 +95,7 @@ group by c.name;
 
 No `read_parquet(...)`, no path literals. It is DuckDB SQL, and the source behaves
 like any other: green dot, explorer tree, autocompletion, `Ctrl+K` search over the
-files' columns, and `SWAP` to switch to it.
+files' columns, and `TARGET` to switch to it.
 
 - **Formats**: `.csv`, `.tsv`, `.txt`, `.parquet`, `.json`, `.ndjson`, `.jsonl` —
   all read in-process, nothing downloaded. **Excel is not one of them**: point a
@@ -160,29 +179,143 @@ are until the last one arrives.
 
 ### Peek at a table
 
-**Click a table in the explorer** and its first 100 rows appear, in that source's own
-dialect — `TOP 100` on SQL Server, `LIMIT 100` everywhere else. The buffer is left
-alone, so it costs you nothing you were writing. Double-click still inserts the name.
+**Click a table in the explorer** and its first 100 rows appear in a **preview tab**
+— italic in the tab bar, reused for the next table you click, so working through a
+schema leaves you with one tab and not thirty. Double-click still inserts the name.
+
+The preview lives in its own tab because **a result belongs to the tab that asked
+for it**. Looking at a table used to throw away whatever you had just run; now your
+tab keeps its query *and* its result, and you get both back by switching to it.
+
+One consequence worth knowing: each tab holding a result also holds the connection
+its pages are read from. Closing the tab lets it go.
 
 ### Point the editor somewhere else
 
 ```sql
-SWAP pg-prod                    -- change source
-SWAP pg-prod.warehouse          -- change source and database
-SWAP pg-prod.warehouse;         -- …then carry on in the same buffer
+TARGET pg-prod                    -- change source
+TARGET pg-prod.warehouse          -- change source and database
+TARGET pg-prod.warehouse;         -- …then carry on in the same buffer
 SELECT count(*) FROM orders;
 ```
 
-Completion after `SWAP` offers **your registered sources and nothing else** — the
-only words that mean anything there. Left to the SQL hint, `SWAP pg` was answered
-with `PG_CONTEXT` and friends, and since the list opens as you type, Enter
-accepted one and the directive quietly stopped being a directive.
+The source is written **bare** here — no quotes. This line never reaches an
+engine, so there is no SQL to quote for, and a quote is not part of a name.
+(A qualified name in a query is the opposite case; see just below.)
+
+### Or name the source in the query
+
+```sql
+select * from "sales_db".warehouse.public.customer
+--          └─ source ──┘└─ db ──┘└ sent as written ┘
+```
+
+The first part is the source, the second is the database, and **everything after
+that goes to the engine exactly as you typed it** — that part is the engine's
+business, not alkyon's. The editor retargets, runs, and stays there.
+
+**Double-quote the source name, always** — `"pg".…`, `"mssql".…`, not `pg.…`.
+Alkyon reads that first part and removes it before anything is sent, so the
+quotes cost nothing and are never seen by the engine — not even by MySQL, where
+`"x"` would otherwise be the *text* `x`. Quoting is the only spelling that works
+for every id, since a name with a `-` in it is not a bare SQL identifier at all;
+making it the habit means never having to think about which case you are in.
+
+This does not replace `TARGET`. `TARGET` says where the *editor* points and it
+stays pointed; a qualified name says where *one statement* goes.
+
+**How many parts, by kind of source.** A folder or file source has no databases —
+DuckDB gives it one catalogue and that is that — so nothing sits between it and
+the name. Everything else has databases, so the second part is one.
+
+| source | write | goes to |
+|---|---|---|
+| PostgreSQL | `"pg".warehouse.sales.customer` | db `warehouse`, then `sales.customer` |
+| PostgreSQL, default schema | `"pg".warehouse.customer` | db `warehouse`, then `customer` |
+| SQL Server | `"mssql".alkyon_demo.sales.customer` | db `alkyon_demo`, then `sales.customer` |
+| MySQL | `"mysql".sales.customer` | db `sales`, then `customer` — a MySQL schema *is* a database |
+| folder, subdirectory | `"taxi-data"."2022".yellow_202212` | the folder, then `"2022".yellow_202212` |
+| folder, at the root | `"taxi-data".zones` | the folder, then `zones` |
+
+Rules worth knowing:
+
+- Only when the first part names a **registered source**. Without that,
+  `alkyon_demo.sales.customer` — perfectly good three-part T-SQL — would be
+  hijacked the day someone registers a source called `alkyon_demo`.
+- **Quote the source name every time**, whatever it is called:
+  `"pg".warehouse.sales.customer`, `"taxi-data"."2022".yellow_202212`. An id with
+  a `-` in it has no other spelling, and the rest read the same either way.
+- A folder called `2022` is a schema called `2022`, which SQL reads as a number,
+  so it needs quotes of its own — see
+  [folder sources](#a-folder-or-one-file-as-a-source).
+- Names inside strings and comments are left alone.
+- **A source name spelled almost right is not a source name.** `"taxi_data".…`
+  when the source is `taxi-data` retargets nothing: the statement goes wherever the
+  editor was pointed and fails there. Nothing can be said in advance —
+  `alkyon_demo.sales.customer` is both a plausible typo and ordinary T-SQL — but
+  once the engine has refused, the error names the source you probably meant.
+- **One statement, one source.** Naming two is an error that says to use
+  `-- @duckdb` and import each — joining across sources is what federation is
+  for, and it cannot be done by pointing somewhere.
+- A `-- @duckdb` buffer is left alone entirely: there, each `@import` names its
+  own source and there is no single target to point at.
+
+Completion after `TARGET` offers **your registered sources and nothing else** —
+the only words that mean anything there. Left to the SQL hint, `TARGET pg` was
+answered with `PG_CONTEXT` and friends, and since the list opens as you type,
+Enter accepted one and the directive quietly stopped being a directive.
 
 Handled by the editor; it never reaches a server. Only recognised as the **first
 statement** of the buffer — comments and blank lines above it are stepped over and
-left where they are, so a `.sql` file with a header still works. It is `SWAP` and not `USE` because `USE` is a reserved
-keyword in T-SQL and a real statement in MySQL, DuckDB and ClickHouse — `SWAP` is
-free in all of them. That mattered the moment MySQL was added, and it will again.
+left where they are, so a `.sql` file with a header still works.
+
+The word is `TARGET` because the alternatives are all taken. `USE` is a reserved
+keyword in T-SQL and a real statement in MySQL, DuckDB and ClickHouse. `SOURCE` is
+the MySQL client's own include command — `SOURCE file.sql`, written at the start
+of a line, exactly where this directive lives — and it reads backwards besides: a
+*source* is the thing you registered, so `SOURCE pg-prod` sounds like declaring
+one rather than pointing at it. `TARGET` begins no statement in any dialect.
+It used to be spelled `SWAP`, and **`SWAP` is still accepted**, so files you saved
+before the rename keep working.
+
+### Which one to reach for
+
+Four ways to say where a query goes. They do different jobs, and the differences
+matter more than the syntax.
+
+| you want to | use | it changes |
+|---|---|---|
+| work in one place for a while | the **Source** picker | the editor, until you change it |
+| switch mid-file, in the file | `TARGET pg-prod.warehouse` | the editor, from that line on |
+| send *one* statement elsewhere | `"pg-prod".warehouse.sales.customer` | the editor, as a side effect |
+| **join across sources** | `-- @duckdb` and `@import` | nothing — every import names its own |
+
+The first three all end with the editor pointed somewhere, and only ever at **one**
+source: a statement goes to one engine. The fourth is the only one that reads from
+several at once, because that needs a fourth engine — DuckDB — to join them.
+
+Some worked examples, in the order you would meet them:
+
+```sql
+-- Look at a table on the source the editor is already on.
+select * from sales.customer limit 100;
+
+-- The same, on a source you are not on, without leaving this tab.
+select * from "pg-prod".warehouse.sales.customer limit 100;
+
+-- Point the whole file somewhere and stay there. No quotes on this line.
+TARGET mysql-prod.orders
+select count(*) from order_line;
+
+-- A parquet folder is a source like any other. No database part.
+select passenger_count, count(*) from "taxi-data"."2022".yellow_202212 group by 1;
+
+-- Two sources at once: this needs federation.
+-- @duckdb
+-- @import live  = pg-prod/warehouse : select id, name from sales.customer
+-- @import trips = taxi-data/**/*.parquet
+select l.name, count(*) from live l join trips t on t.customer_id = l.id group by 1;
+```
 
 ## Find things
 
@@ -194,6 +327,13 @@ table to insert its quoted, qualified name.
 **Autocompletion is complete as soon as a source is selected** — `Ctrl+Space`, or it
 pops up as you type. You do not have to browse to a table before its columns are
 offered.
+
+**Type the part you know.** `custo` finds `sales.customer` and inserts it whole —
+you do not have to remember the schema first. The list shows `customer — sales`,
+table before schema, because the table is what you were looking for.
+
+**After `FROM`, the schemas come first**, then the tables. Typing `sal` offers the
+`sales` schema and everything in it.
 
 What it inserts is always valid SQL, even when the name is not: a folder called
 `2022` is listed as `2022.yellow_202212` — the name you would recognise — and
@@ -213,7 +353,7 @@ source at a time, so indexing never means hitting every server at once.
 
 Tabs are independent buffers with their own undo history, and **each remembers the
 source and database it was last pointed at** — switching tabs switches target. One
-tab per environment works well with `SWAP`.
+tab per environment works well with `TARGET`.
 
 | Key | Does |
 |---|---|
@@ -240,6 +380,11 @@ files sit next to the server rather than next to the browser.
 Only `.sql` files are listed, grouped by directory, skipping `.git`,
 `node_modules`, `target` and friends. The choice is remembered between runs; if the
 folder has since gone, Alkyon starts with none open rather than refusing to start.
+
+The last eight folders are remembered too, and offered on the start screen. That
+list outlives closing a folder — closing one is not forgetting it — and a folder
+that is no longer there is simply not offered, rather than dropped: a path on a
+drive that happens to be unplugged today should come back tomorrow.
 
 The file API is confined to that folder and to `.sql`, checked path component by
 path component and then confirmed through the filesystem so a symlink cannot point
@@ -404,7 +549,7 @@ The UI is only a client; everything is reachable directly.
 | GET | `/sources/{key}/columns?db=&schema=&table=` | types, nullability, keys, defaults |
 | GET | `/sources/{key}/schema?db=&refresh=` | the whole schema in one round trip |
 | GET | `/search?q=&limit=` | across every indexed schema |
-| GET / PUT / DELETE | `/workspace` | the open folder and its `.sql` files |
+| GET / PUT / DELETE | `/workspace` | the open folder, its `.sql` files, and the folders opened before (`recent`) |
 | GET / PUT | `/workspace/file?path=` | read / write, confined to the folder |
 | GET | `/shells` | shells found on the machine |
 | WS | `/ws/query` | `{source_id, database?, sql, page_size?}` → `columns` / `rows` / `affected` / `end` (carrying `page` and `more`). `{"type":"more"}` reads the next page off the query still running; `{"type":"cancel"}` drops it. Closing the socket releases the connection. |

@@ -146,7 +146,7 @@ function makeNode({ label, badge, pk, dot, scope, load, onSelect, onActivate, on
  * @param {(source: object) => void} hooks.onSelectSource
  * @param {(source: object, db: string) => void} hooks.onSelectDatabase
  * @param {(qualified: string) => void} hooks.onInsert   double-clicked a table
- * @param {(source, qualified: string) => void} hooks.onPreview  clicked a table
+ * @param {(source, table: string, qualified: string) => void} hooks.onPreview
  * @param {(source, db, tables) => void} hooks.onTables  autocomplete warm-up
  * @param {(source, db, table, columns) => void} hooks.onColumns
  * @param {(message: string, isError?: boolean) => void} hooks.onStatus
@@ -176,7 +176,7 @@ export function createExplorer(element, hooks) {
       // name, so the two gestures stay distinct.
       onSelect: async () => {
         await hooks.onSelectDatabase(source, db);
-        hooks.onPreview(source, qualify(source, table.schema, table.name));
+        hooks.onPreview(source, table.name, qualify(source, table.schema, table.name));
       },
       onActivate: () => hooks.onInsert(qualify(source, table.schema, table.name)),
       load: async () => {

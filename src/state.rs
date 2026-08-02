@@ -50,10 +50,19 @@ fn read_sources(file: &Path, scope: Scope) -> Vec<SourceRecord> {
     }
 }
 
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Default, serde::Serialize, serde::Deserialize)]
 struct StoredWorkspace {
-    root: PathBuf,
+    /// The folder open when alkyon last shut down, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    root: Option<PathBuf>,
+    /// Folders opened before, most recent first. What the start screen offers.
+    #[serde(default)]
+    recent: Vec<PathBuf>,
 }
+
+/// How many folders the start screen remembers. Long enough to cover the
+/// projects anyone is actually moving between, short enough to read at a glance.
+const RECENT_FOLDERS: usize = 8;
 
 /// Where `sources.json` lives: `ALKYON_CONFIG_DIR` if set, otherwise the
 /// platform config directory (`%APPDATA%\alkyon`, `~/.config/alkyon`,
@@ -83,6 +92,8 @@ pub struct AppState {
     workspace: RwLock<Option<PathBuf>>,
     /// Where the workspace root is remembered between runs.
     workspace_file: Option<PathBuf>,
+    /// Folders opened before, most recent first — what the start screen offers.
+    recent: RwLock<Vec<PathBuf>>,
     /// A shell over HTTP is a different risk class from a query endpoint, so it
     /// is off unless the server is bound to loopback. See [`terminal_allowed`].
     pub terminal_enabled: bool,
@@ -114,6 +125,7 @@ impl AppState {
             file: None,
             workspace: RwLock::new(None),
             workspace_file: None,
+            recent: RwLock::new(Vec::new()),
             terminal_enabled: true,
             schema: SchemaCache::default(),
             postgres: PgConnector::default(),
@@ -130,19 +142,20 @@ impl AppState {
         // A folder that has since been deleted or unmounted should not stop the
         // workbench from starting; it just comes back closed.
         let workspace_file = dir.join(WORKSPACE_FILE);
-        let workspace = std::fs::read_to_string(&workspace_file)
+        let stored: StoredWorkspace = std::fs::read_to_string(&workspace_file)
             .ok()
-            .and_then(|raw| serde_json::from_str::<StoredWorkspace>(&raw).ok())
-            .map(|stored| stored.root)
-            .filter(|root| {
-                if root.is_dir() {
-                    tracing::info!(root = %root.display(), "reopened workspace");
-                    true
-                } else {
-                    tracing::warn!(root = %root.display(), "workspace is gone, starting closed");
-                    false
-                }
-            });
+            .and_then(|raw| serde_json::from_str(&raw).ok())
+            .unwrap_or_default();
+
+        let workspace = stored.root.filter(|root| {
+            if root.is_dir() {
+                tracing::info!(root = %root.display(), "reopened workspace");
+                true
+            } else {
+                tracing::warn!(root = %root.display(), "workspace is gone, starting closed");
+                false
+            }
+        });
 
         let mut sources = BTreeMap::new();
         for record in read_sources(&file, Scope::User) {
@@ -160,6 +173,7 @@ impl AppState {
             file: Some(file),
             workspace: RwLock::new(workspace),
             workspace_file: Some(workspace_file),
+            recent: RwLock::new(stored.recent),
             terminal_enabled,
             schema: SchemaCache::default(),
             postgres: PgConnector::default(),
@@ -239,7 +253,8 @@ impl AppState {
     pub async fn open_workspace(&self, path: &str) -> Result<PathBuf> {
         let root = crate::workspace::open(path)?;
         *self.workspace.write().await = Some(root.clone());
-        self.persist_workspace(Some(&root))?;
+        self.remember(&root).await;
+        self.persist_workspace(Some(&root)).await?;
         // The project registry belongs to the folder, so it follows it.
         self.reload_project_sources(Some(&root)).await;
         tracing::info!(root = %root.display(), "opened workspace");
@@ -249,29 +264,47 @@ impl AppState {
     pub async fn close_workspace(&self) -> Result<()> {
         *self.workspace.write().await = None;
         self.reload_project_sources(None).await;
-        self.persist_workspace(None)
+        self.persist_workspace(None).await
     }
 
-    fn persist_workspace(&self, root: Option<&Path>) -> Result<()> {
+    /// Folders opened before, most recent first, minus any that have gone.
+    ///
+    /// Filtered on the way out rather than on the way in: a path on a drive that
+    /// happens to be unplugged today should come back tomorrow, not be forgotten.
+    pub async fn recent_folders(&self) -> Vec<PathBuf> {
+        self.recent
+            .read()
+            .await
+            .iter()
+            .filter(|path| path.is_dir())
+            .cloned()
+            .collect()
+    }
+
+    /// Move `root` to the front of the recent list.
+    async fn remember(&self, root: &Path) {
+        let mut recent = self.recent.write().await;
+        recent.retain(|path| path != root);
+        recent.insert(0, root.to_path_buf());
+        recent.truncate(RECENT_FOLDERS);
+    }
+
+    /// Write down the open folder and the recent list.
+    ///
+    /// Closing a folder leaves the file in place, because the recent list has to
+    /// outlive it — that is the whole point of a recent list.
+    async fn persist_workspace(&self, root: Option<&Path>) -> Result<()> {
         let Some(file) = &self.workspace_file else {
             return Ok(());
         };
-        match root {
-            Some(root) => {
-                if let Some(parent) = file.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-                let stored = StoredWorkspace {
-                    root: root.to_path_buf(),
-                };
-                std::fs::write(file, serde_json::to_string_pretty(&stored)?)?;
-            }
-            None => match std::fs::remove_file(file) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e.into()),
-            },
+        if let Some(parent) = file.parent() {
+            std::fs::create_dir_all(parent)?;
         }
+        let stored = StoredWorkspace {
+            root: root.map(Path::to_path_buf),
+            recent: self.recent.read().await.clone(),
+        };
+        std::fs::write(file, serde_json::to_string_pretty(&stored)?)?;
         Ok(())
     }
 
@@ -346,7 +379,7 @@ impl AppState {
     }
 
     /// `key` is `user:<id>` or `project:<id>`. A bare `<id>` is accepted too when
-    /// exactly one scope defines it, so URLs and `SWAP` stay pleasant to type.
+    /// exactly one scope defines it, so URLs and `TARGET` stay pleasant to type.
     pub async fn record(&self, key: &str) -> Result<SourceRecord> {
         let sources = self.sources.read().await;
         if let Some(record) = sources.get(key) {

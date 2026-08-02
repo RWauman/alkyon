@@ -76,7 +76,29 @@ async fn open(cfg: &SourceConfig, db: &str) -> Result<Session> {
         TcpStream::connect(config.get_addr()).await?
     };
     tcp.set_nodelay(true)?;
-    Ok(Client::connect(config, tcp.compat_write()).await?)
+    Client::connect(config, tcp.compat_write())
+        .await
+        .map_err(|e| explain(e, db))
+}
+
+/// Turn SQL Server's most misread error into what it means.
+///
+/// Asked for a database that is not there, SQL Server answers 4060: *Cannot open
+/// database "x" requested by the login. The login failed.* It says the database
+/// first and the login last, and the login is what people read — so a typo in a
+/// database name is spent looking at credentials. The server genuinely does not
+/// distinguish "no such database" from "you may not open it", and the message
+/// should not pretend otherwise.
+fn explain(error: tiberius::error::Error, db: &str) -> crate::error::Error {
+    if let tiberius::error::Error::Server(token) = &error {
+        if token.code() == 4060 {
+            return crate::error::Error::BadRequest(format!(
+                "cannot open database `{db}` — it does not exist on this server, or this login \
+                 may not open it. SQL Server reports both the same way, as a login failure."
+            ));
+        }
+    }
+    error.into()
 }
 
 #[derive(Default)]

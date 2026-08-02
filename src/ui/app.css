@@ -197,6 +197,7 @@ main {
   background: var(--bg);
   border-bottom-color: var(--accent);
 }
+.tab.preview .tab-name { font-style: italic; }
 .tab-dirty { color: var(--accent); font-size: 9px; }
 .tab-close {
   border: 0;
@@ -210,6 +211,59 @@ main {
 .tab-close:hover { color: var(--error); }
 
 #editor-pane, #grid-pane { min-height: 0; overflow: hidden; }
+
+/* ----------------------------------------------------------- start screen */
+
+/* Occupies the editor's row, so nothing below it moves when a tab opens. */
+#start {
+  grid-row: 2;
+  min-height: 0;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: .5rem;
+  padding: 1.5rem;
+  text-align: center;
+}
+#start[hidden] { display: none; }
+#start img { opacity: .8; }
+#start h1 { margin: 0; font-size: 18px; font-weight: 600; letter-spacing: .1em; }
+
+.start-actions { display: flex; flex-wrap: wrap; gap: .5rem; margin-top: .6rem; }
+.start-actions button { padding: .35rem .8rem; }
+.start-actions kbd {
+  font: 11px var(--mono);
+  color: var(--fg-muted);
+  margin-left: .35rem;
+}
+
+#start-recent { margin-top: 1.2rem; display: grid; gap: .1rem; justify-items: stretch; }
+#start-recent .heading {
+  color: var(--fg-muted);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: .08em;
+  margin-bottom: .3rem;
+}
+.recent {
+  display: block;
+  border: 0;
+  background: none;
+  color: var(--accent);
+  font: inherit;
+  text-align: left;
+  padding: .2rem .5rem;
+  border-radius: 4px;
+  cursor: pointer;
+  max-width: 60ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  direction: rtl; /* keep the tail, which is what identifies a project */
+}
+.recent:hover { background: var(--accent-soft); }
 
 #grid-pane { position: relative; }
 

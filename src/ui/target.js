@@ -1,24 +1,32 @@
-// Parsing for the `SWAP` directive. Pure — no DOM — so the dialect-safety rules
-// can be tested on their own; see tests/ui/swap.test.mjs.
+// Parsing for the `TARGET` directive. Pure — no DOM — so the dialect-safety
+// rules can be tested on their own; see tests/ui/target.test.mjs.
 
 /**
  * Matched only as the *first* token of what is left of the buffer.
  *
- * `SWAP` is not a keyword in PostgreSQL, SQL Server, MySQL or MariaDB. Snowflake
- * is the one dialect that uses the word — `ALTER TABLE a SWAP WITH b` — and never
- * puts it first, so anchoring here cannot shadow real SQL as engines are added.
- * `USE` was the obvious candidate and is unusable: reserved in T-SQL, and a real
- * statement in MySQL, DuckDB and ClickHouse.
+ * Three words were considered and two rejected:
+ *
+ *   - `USE` is reserved in T-SQL and a real statement in MySQL, DuckDB and
+ *     ClickHouse.
+ *   - `SOURCE` is the MySQL client's own include command — `SOURCE file.sql`,
+ *     written at the start of a line, exactly where this directive lives. It
+ *     also reads wrongly here: a *source* is the registered thing, so
+ *     `SOURCE pg-dev` sounds like declaring one rather than pointing at it.
+ *   - `TARGET` appears in no dialect's keyword list, begins no statement
+ *     anywhere, and says what the line does. `MERGE … MATCHED BY TARGET` uses
+ *     the word mid-statement, which this rule cannot reach.
+ *
+ * `SWAP` is still accepted so that files written before the rename keep working.
  */
-const DIRECTIVE = /^\s*SWAP\s+([A-Za-z0-9._:-]+)\s*(?:;|$|\n)/i;
+const DIRECTIVE = /^\s*(?:TARGET|SWAP)\s+([A-Za-z0-9._:-]+)\s*(?:;|$|\n)/i;
 
 /**
  * Blank lines and `--` comments ahead of a directive.
  *
- * "First token" cannot mean "first character": the editor opens on two lines of
- * instructions, one of which explains SWAP, and every `.sql` file anyone keeps
- * starts with a header. Requiring SWAP at character zero meant the directive did
- * not work in the buffer that documents it.
+ * "First token" cannot mean "first character": the editor opens on lines of
+ * instructions, one of which explains this very directive, and every `.sql` file
+ * anyone keeps starts with a header. Requiring it at character zero meant the
+ * directive did not work in the buffer that documents it.
  *
  * The server already reads `-- @duckdb` this way, so the two rules now agree.
  */
@@ -40,10 +48,10 @@ function resolve(token, isKnownSource) {
 }
 
 /**
- * Is the cursor typing the *target* of a SWAP directive?
+ * Is the cursor typing the *target* of a `TARGET` directive?
  *
  * A directive is only a directive as the first token of what is left of the
- * buffer, so this walks the leading lines the same way [`parseSwap`] does and
+ * buffer, so this walks the leading lines the same way [`parseTarget`] does and
  * stops at the first that is not one. Returns the partial token and where it
  * starts, or `null`.
  *
@@ -51,7 +59,7 @@ function resolve(token, isKnownSource) {
  * @param {number} line     the cursor's line
  * @param {number} ch       the cursor's column
  */
-export function swapTargetAt(lines, line, ch) {
+export function targetAt(lines, line, ch) {
   // Every line above must be a directive, a comment or blank, or this one is
   // ordinary SQL that merely looks like a directive.
   for (let above = 0; above < line; above += 1) {
@@ -61,7 +69,7 @@ export function swapTargetAt(lines, line, ch) {
   }
 
   const text = lines[line] ?? '';
-  const opening = /^(\s*SWAP\s+)([A-Za-z0-9._:-]*)/i.exec(text);
+  const opening = /^(\s*(?:TARGET|SWAP)\s+)([A-Za-z0-9._:-]*)/i.exec(text);
   if (!opening) return null;
 
   const start = opening[1].length;
@@ -72,7 +80,7 @@ export function swapTargetAt(lines, line, ch) {
 }
 
 /**
- * Peel every leading SWAP directive off `sql`.
+ * Peel every leading TARGET directive off `sql`.
  *
  * @param {string} sql
  * @param {(id: string) => boolean} isKnownSource
@@ -80,7 +88,7 @@ export function swapTargetAt(lines, line, ch) {
  *          | {unknown: string}} the directives and the SQL left to run, or the
  *          token that named nothing.
  */
-export function parseSwap(sql, isKnownSource) {
+export function parseTarget(sql, isKnownSource) {
   const targets = [];
   let rest = sql;
   // Comments stepped over on the way to a directive. Put back afterwards: they

@@ -198,9 +198,10 @@ async fn search(
 
 /// The open folder and its `.sql` files. `root: null` when nothing is open.
 async fn workspace(State(state): State<Arc<AppState>>) -> Result<Json<Value>> {
+    let recent = recent(&state).await;
     let Some(root) = state.workspace().await else {
         return Ok(Json(
-            json!({ "root": null, "files": [], "truncated": false }),
+            json!({ "root": null, "files": [], "truncated": false, "recent": recent }),
         ));
     };
     let (files, truncated) = crate::workspace::list(&root)?;
@@ -208,7 +209,18 @@ async fn workspace(State(state): State<Arc<AppState>>) -> Result<Json<Value>> {
         "root": root.to_string_lossy(),
         "files": files,
         "truncated": truncated,
+        "recent": recent,
     })))
+}
+
+/// Folders opened before, for the start screen to offer.
+async fn recent(state: &AppState) -> Vec<String> {
+    state
+        .recent_folders()
+        .await
+        .iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect()
 }
 
 #[derive(Deserialize)]
@@ -227,6 +239,7 @@ async fn open_workspace(
         "root": root.to_string_lossy(),
         "files": files,
         "truncated": truncated,
+        "recent": recent(&state).await,
     })))
 }
 
