@@ -55,9 +55,9 @@ test('quoting survives a name containing the quote character', () => {
 
 test('the preview limits rows the way each engine spells it', () => {
   // T-SQL has no LIMIT, and TOP goes before the projection rather than at the end.
-  assert.equal(previewSql('tsql', '[sales].[customer]'), 'SELECT TOP 100 * FROM [sales].[customer];');
-  assert.equal(previewSql('pgsql', '"sales"."customer"'), 'SELECT * FROM "sales"."customer" LIMIT 100;');
-  assert.equal(previewSql('mysql', '`sales`.`customer`'), 'SELECT * FROM `sales`.`customer` LIMIT 100;');
-  assert.equal(previewSql('duckdb', '"main"."trips"'), 'SELECT * FROM "main"."trips" LIMIT 100;');
+  assert.equal(previewSql('tsql', '[sales].[customer]'), 'SELECT TOP 10000 * FROM [sales].[customer];');
+  assert.equal(previewSql('pgsql', '"sales"."customer"'), 'SELECT * FROM "sales"."customer" LIMIT 10000;');
+  assert.equal(previewSql('mysql', '`sales`.`customer`'), 'SELECT * FROM `sales`.`customer` LIMIT 10000;');
+  assert.equal(previewSql('duckdb', '"main"."trips"'), 'SELECT * FROM "main"."trips" LIMIT 10000;');
   assert.equal(previewSql('tsql', '[t]', 5), 'SELECT TOP 5 * FROM [t];');
 });

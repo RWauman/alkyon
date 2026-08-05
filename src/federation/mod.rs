@@ -89,11 +89,14 @@ fn duckdb_type(logical: LogicalType) -> String {
 }
 
 /// One import, already pulled into memory and ready to be handed to DuckDB.
-struct Materialised {
-    alias: String,
-    columns: Vec<ColumnMeta>,
+///
+/// Shared with the folder connector, which materialises a spreadsheet the same way
+/// a federated `@excel` does — calamine reads it, DuckDB types it.
+pub(crate) struct Materialised {
+    pub(crate) alias: String,
+    pub(crate) columns: Vec<ColumnMeta>,
     /// Every cell as text; DuckDB does the casting.
-    rows: Vec<Vec<Option<String>>>,
+    pub(crate) rows: Vec<Vec<Option<String>>>,
 }
 
 /// An import, once it is ready for the DuckDB session.
@@ -208,7 +211,7 @@ async fn prepare_scan(
     pattern: &str,
 ) -> Result<Prepared> {
     let record = state.record(source).await?;
-    if record.kind != crate::model::SourceKind::Files {
+    if !record.kind.is_files() {
         return Err(Error::BadRequest(format!(
             "@import {alias}: `{source}` is a {:?} source, so it needs SQL to run — \
              write `@import {alias} = {source} : <sql>`. Only a folder or file source \
@@ -357,6 +360,15 @@ impl Sandbox {
 /// file access and arbitrary code loading. `lock_configuration` is what stops a
 /// user query from undoing any of it.
 pub fn open_duckdb(sandbox: &Sandbox) -> Result<Connection> {
+    open_duckdb_in(sandbox, None)
+}
+
+/// [`open_duckdb`], with `schema` created and made the default one.
+///
+/// It has to happen here rather than at the call site: `search_path` is a
+/// configuration option, so setting it after `lock_configuration` is refused, and
+/// the schema has to exist before the search path may name it.
+pub fn open_duckdb_in(sandbox: &Sandbox, schema: Option<&str>) -> Result<Connection> {
     let connection = Connection::open_in_memory().map_err(federated)?;
 
     // Before anything is locked down, and best effort: the `parquet` and `json`
@@ -372,6 +384,13 @@ pub fn open_duckdb(sandbox: &Sandbox) -> Result<Connection> {
     // refuses to change them afterwards ("Cannot change allowed_paths when
     // enable_external_access is disabled"), which is exactly the point.
     let mut setup = String::new();
+    if let Some(schema) = schema {
+        setup.push_str(&format!(
+            "CREATE SCHEMA IF NOT EXISTS {};\nSET search_path = {};\n",
+            quote_identifier(schema),
+            quote_literal(schema)
+        ));
+    }
     let list = |paths: &[PathBuf]| {
         paths
             .iter()
@@ -460,16 +479,18 @@ fn substitute(sql: &str, root: Option<&PathBuf>) -> Result<String> {
 /// Two steps on purpose: an all-VARCHAR staging table, then a `CAST` into the real
 /// one. DuckDB parses the text, so decimals keep their digits and dates parse
 /// without a hand-written converter per dialect.
-fn load(connection: &Connection, table: &Materialised) -> Result<()> {
+pub(crate) fn load(connection: &Connection, table: &Materialised) -> Result<()> {
     let staging = format!("{}__alkyon_raw", table.alias);
     let placeholders = (0..table.columns.len())
         .map(|index| format!("c{index} VARCHAR"))
         .collect::<Vec<_>>()
         .join(", ");
 
+    // Explicitly in `main`: the appender resolves a bare table name there whatever
+    // the search path says, and a folder source sets the search path to `public`.
     connection
         .execute_batch(&format!(
-            "CREATE TABLE {} ({placeholders});",
+            "CREATE TABLE main.{} ({placeholders});",
             quote_identifier(&staging)
         ))
         .map_err(federated)?;
@@ -505,7 +526,8 @@ fn load(connection: &Connection, table: &Materialised) -> Result<()> {
 
     connection
         .execute_batch(&format!(
-            "CREATE TABLE {alias} AS SELECT {projection} FROM {staging};\nDROP TABLE {staging};",
+            "CREATE TABLE {alias} AS SELECT {projection} FROM main.{staging};\n\
+             DROP TABLE main.{staging};",
             alias = quote_identifier(&table.alias),
             staging = quote_identifier(&staging),
         ))

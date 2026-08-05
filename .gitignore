@@ -1,9 +1,12 @@
 # Credentials
 .env
+.env-github/
+
 # An ALKYON_SOURCES import file, which does carry passwords. Anchored to the root
 # on purpose: a project's `.alkyon/sources.json` holds no credential and is meant
 # to be committed.
 /sources.json
+.alkyon/
 
 # Rust
 /target
@@ -20,3 +23,8 @@
 
 # Scratch notes on what is left to do
 /idea
+
+# Sample CSV/JSON/parquet/Excel to click around in, written by
+# `python docker/seed/make-sample-files.py`. Regenerated on demand, so the script
+# is the artefact worth committing and its output is not.
+/sample-data

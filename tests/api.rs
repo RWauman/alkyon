@@ -88,6 +88,50 @@ async fn health_and_embedded_ui_are_served() {
     assert_eq!(body, r#"{"error":"unknown source `nope`"}"#);
 }
 
+/// The source dialog's file list: registering a folder is where you say "just this
+/// one file, actually", and nothing else can say what there is to choose from.
+#[tokio::test]
+async fn the_file_list_reports_what_a_folder_holds() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("sales")).unwrap();
+    std::fs::write(dir.path().join("a.csv"), "x\n1\n").unwrap();
+    std::fs::write(dir.path().join("notes.md"), "not data").unwrap();
+    std::fs::write(dir.path().join("old.parquet"), "not really parquet").unwrap();
+    std::fs::write(dir.path().join("sales/b.csv"), "x\n2\n").unwrap();
+
+    // A Windows path is not a URI: the separators have to be escaped by hand.
+    let path = dir.path().to_string_lossy().replace('\\', "%5C");
+    let state = AppState::new();
+
+    let listed = get_json(
+        Arc::clone(&state),
+        &format!("/files?path={path}&format=csv"),
+    )
+    .await;
+    assert_eq!(
+        listed["files"],
+        json!(["a.csv", "sales/b.csv"]),
+        "relative, forward-slashed, and only the declared format"
+    );
+
+    // Without a format, every readable file — which is what the dialog shows
+    // before one has been chosen.
+    let listed = get_json(Arc::clone(&state), &format!("/files?path={path}")).await;
+    assert_eq!(
+        listed["files"],
+        json!(["a.csv", "old.parquet", "sales/b.csv"])
+    );
+
+    let file = dir
+        .path()
+        .join("a.csv")
+        .to_string_lossy()
+        .replace('\\', "%5C");
+    let (status, body) = get(state, &format!("/files?path={file}")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains("is not a folder"), "{body}");
+}
+
 #[tokio::test]
 async fn metadata_routes_answer_without_leaking_credentials() {
     let Some(state) = seeded().await else {
@@ -405,7 +449,7 @@ async fn websocket_cancels_a_running_query() {
             // DuckDB has no sleep, and anything slow enough to race here would
             // keep burning a thread for the rest of the suite: the blocking
             // worker only learns of the cancel when it next tries to send.
-            alkyon::model::SourceKind::Files => continue,
+            alkyon::model::SourceKind::Folder | alkyon::model::SourceKind::File => continue,
         };
 
         let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws/query"))

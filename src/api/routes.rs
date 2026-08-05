@@ -29,6 +29,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/sources/{id}/columns", get(columns))
         .route("/sources/{id}/schema", get(schema))
         .route("/search", get(search))
+        .route("/files", get(data_files))
         .route(
             "/workspace",
             get(workspace).put(open_workspace).delete(close_workspace),
@@ -75,6 +76,13 @@ async fn add_source(
     // connector, which also covers records loaded from disk.
     if config.kind.is_server() && config.host.trim().is_empty() {
         return Err(Error::BadRequest("source needs a host".into()));
+    }
+    // Format options describe files. Accepting them on a server source would
+    // record something that can never be read back out.
+    if config.kind.is_server() && config.options != crate::model::FileOptions::default() {
+        return Err(Error::BadRequest(
+            "format options only apply to a folder or file source".into(),
+        ));
     }
     // Reject bad credentials now rather than on the first query, and before the
     // secret goes anywhere near the vault.
@@ -194,6 +202,35 @@ async fn search(
     Ok(Json(json!({ "hits": hits, "indexed": indexed })))
 }
 
+#[derive(Deserialize)]
+struct DataFilesQuery {
+    /// A folder on the machine running alkyon, `~` allowed.
+    path: String,
+    /// Which file type the source will read. Absent lists every readable file.
+    format: Option<crate::model::FileFormat>,
+}
+
+/// The files a folder source at `path` would read, relative to it.
+///
+/// The source dialog's file list: registering a folder is where you say "just this
+/// one file, actually", and nothing else can tell you what there is to choose from.
+async fn data_files(Query(params): Query<DataFilesQuery>) -> Result<Json<Value>> {
+    let root = crate::workspace::resolve_root(&params.path)?;
+    if !root.is_dir() {
+        return Err(Error::BadRequest(format!(
+            "`{}` is not a folder",
+            params.path
+        )));
+    }
+    let options = crate::model::FileOptions {
+        format: params.format,
+        ..Default::default()
+    };
+    Ok(Json(json!({
+        "files": crate::connectors::files::candidates(&root, &options),
+    })))
+}
+
 // ------------------------------------------------------------------ workspace
 
 /// The open folder and its `.sql` files. `root: null` when nothing is open.
@@ -287,7 +324,7 @@ async fn tables(
     Query(params): Query<TablesQuery>,
 ) -> Result<Json<Vec<TableInfo>>> {
     let record = state.record(&id).await?;
-    let db = params.db.unwrap_or_else(|| record.database().to_owned());
+    let db = params.db.unwrap_or_else(|| record.database());
     let connection = state.open(&id, Some(&db)).await?;
     Ok(Json(connection.list_tables(&db).await?))
 }
@@ -308,7 +345,7 @@ async fn columns(
     let schema = params
         .schema
         .unwrap_or_else(|| record.kind.default_schema().to_owned());
-    let db = params.db.unwrap_or_else(|| record.database().to_owned());
+    let db = params.db.unwrap_or_else(|| record.database());
     let connection = state.open(&id, Some(&db)).await?;
     Ok(Json(
         connection.list_columns(&db, &schema, &params.table).await?,

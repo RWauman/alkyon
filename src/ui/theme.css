@@ -9,6 +9,8 @@
 :root[data-theme='light'] {
   --bg: #fbfbfb;
   --bg-sunken: #f0f0f0;
+  /* Behind the panels, so the gaps between them read as gaps. */
+  --gutter: #e2e4e7;
   --bg-raised: #ffffff;
   --fg: #403f53;
   --fg-muted: #90a7b2;
@@ -26,6 +28,8 @@
   :root:not([data-theme='light']) {
     --bg: #011627;
     --bg-sunken: #01111d;
+  /* Behind the panels, so the gaps between them read as gaps. */
+  --gutter: #000a12;
     --bg-raised: #0b2942;
     --fg: #d6deeb;
     --fg-muted: #637777;
@@ -43,6 +47,8 @@
 :root[data-theme='dark'] {
   --bg: #011627;
   --bg-sunken: #01111d;
+  /* Behind the panels, so the gaps between them read as gaps. */
+  --gutter: #000a12;
   --bg-raised: #0b2942;
   --fg: #d6deeb;
   --fg-muted: #637777;
@@ -148,6 +154,28 @@ li.CodeMirror-hint-active {
   background: var(--accent);
   color: var(--bg);
 }
+
+/* Tables, schemas and CTEs on one hand, columns on the other. Both are offered
+   whatever the clause, so the list has to say which is which — the name in the
+   left lane, where it came from in the right. */
+.CodeMirror-hint-table, .CodeMirror-hint-column {
+  display: flex;
+  align-items: baseline;
+  gap: .75rem;
+}
+.hint-name { flex: none; }
+.hint-where {
+  margin-left: auto;
+  font-size: 11px;
+  color: var(--fg-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* A table is a place, a column is a value; the accent marks the place. */
+.CodeMirror-hint-table .hint-name { color: var(--accent); }
+li.CodeMirror-hint-active .hint-name,
+li.CodeMirror-hint-active .hint-where { color: var(--bg); }
 
 /* ------------------------------------------ search dialog and match marks */
 

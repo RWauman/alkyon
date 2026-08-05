@@ -33,16 +33,25 @@ pub enum SourceKind {
     Postgres,
     MsSql,
     MySql,
-    /// A folder or a single file on the machine running alkyon, read by DuckDB.
-    /// It has a `path` instead of a host, and no credential.
-    Files,
+    /// A folder of data files on the machine running alkyon, read by DuckDB. It
+    /// has a `path` instead of a host, and no credential.
+    Folder,
+    /// One data file. The same reader as [`SourceKind::Folder`], but the sandbox
+    /// is granted that file alone rather than the directory around it, and the
+    /// format options describe *this* file rather than a folder's worth.
+    File,
 }
 
 impl SourceKind {
     /// Whether this kind is reached over the network. The false case is what
     /// makes `host`, `port`, encryption and authentication meaningless.
     pub fn is_server(self) -> bool {
-        !matches!(self, SourceKind::Files)
+        !matches!(self, SourceKind::Folder | SourceKind::File)
+    }
+
+    /// Whether this kind is read off the local filesystem.
+    pub fn is_files(self) -> bool {
+        !self.is_server()
     }
 
     pub fn default_port(self) -> u16 {
@@ -52,7 +61,7 @@ impl SourceKind {
             SourceKind::MySql => 3306,
             // Not a port at all. Reported as 0 and hidden by the UI, rather than
             // making every summary carry an `Option` for one kind's sake.
-            SourceKind::Files => 0,
+            SourceKind::Folder | SourceKind::File => 0,
         }
     }
 
@@ -64,8 +73,9 @@ impl SourceKind {
             // therefore no default to give, and the connector reads an empty
             // schema as "the database this call names".
             SourceKind::MySql => "",
-            // Files at the root of the source; subdirectories become schemas.
-            SourceKind::Files => "main",
+            // Every table a folder or file source exposes. `public` rather than
+            // DuckDB's own `main`, because that is the name a SQL user expects.
+            SourceKind::Folder | SourceKind::File => "public",
         }
     }
 
@@ -78,9 +88,176 @@ impl SourceKind {
             // Readable by everyone and always present, and privilege-filtered by
             // the server so it shows only what this login may see.
             SourceKind::MySql => "information_schema",
-            // What DuckDB itself calls an in-memory catalogue.
-            SourceKind::Files => "memory",
+            // What DuckDB itself calls an in-memory catalogue. Only the fallback
+            // for a path with no name of its own — see [`catalogue_name`].
+            SourceKind::Folder | SourceKind::File => "memory",
         }
+    }
+}
+
+/// The catalogue a folder or file source shows where a server shows a database.
+///
+/// DuckDB's own in-memory catalogue is called `memory`, which says nothing about
+/// what you are looking at, so the folder standing behind the source lends its
+/// name: `parquet` → `public` → `customers`. A file source shows the directory it
+/// sits in, since its own name is already the table's.
+pub fn catalogue_name(kind: SourceKind, path: &std::path::Path) -> String {
+    let directory = if kind == SourceKind::File {
+        path.parent()
+    } else {
+        Some(path)
+    };
+    directory
+        .and_then(|directory| directory.file_name())
+        .map(|name| name.to_string_lossy().into_owned())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| kind.default_database().to_owned())
+}
+
+/// What a data file holds, and therefore which reader opens it.
+///
+/// Every one of these is available without fetching anything: CSV is core DuckDB,
+/// parquet and JSON are linked in by Cargo features, and Excel is read in-process
+/// by calamine rather than by DuckDB's `excel` extension.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileFormat {
+    Csv,
+    Parquet,
+    /// A JSON document, or an array of them.
+    Json,
+    /// One JSON document per line — `.jsonl`, `.ndjson`.
+    JsonLines,
+    /// A spreadsheet. One table per sheet.
+    Excel,
+}
+
+impl FileFormat {
+    /// The extensions that mean this format when nothing was declared.
+    pub fn extensions(self) -> &'static [&'static str] {
+        match self {
+            FileFormat::Csv => &["csv", "tsv", "txt"],
+            FileFormat::Parquet => &["parquet"],
+            FileFormat::Json => &["json"],
+            FileFormat::JsonLines => &["jsonl", "ndjson"],
+            FileFormat::Excel => &["xlsx", "xlsm", "xlsb", "xls"],
+        }
+    }
+
+    pub const ALL: &'static [FileFormat] = &[
+        FileFormat::Csv,
+        FileFormat::Parquet,
+        FileFormat::Json,
+        FileFormat::JsonLines,
+        FileFormat::Excel,
+    ];
+
+    /// The format an extension implies, or `None` for one alkyon does not read.
+    pub fn from_extension(extension: &str) -> Option<Self> {
+        let lower = extension.to_ascii_lowercase();
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|format| format.extensions().contains(&lower.as_str()))
+    }
+
+    /// Whether the format is read by calamine rather than by DuckDB.
+    pub fn is_excel(self) -> bool {
+        matches!(self, FileFormat::Excel)
+    }
+}
+
+/// How to read a CSV, for the times its shape is not what a sniffer would guess.
+///
+/// Every field is optional and every absent field means "let DuckDB work it out" —
+/// its sniffer is good, and overriding it wholesale would make a European CSV work
+/// at the cost of making every other one worse. What these exist for is the file
+/// the sniffer gets wrong: `;` delimited with `,` decimals, or Latin-1, or three
+/// lines of preamble above the header.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CsvOptions {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delimiter: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quote: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub escape: Option<String>,
+    /// `false` names the columns `column0`, `column1`, …
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub header: Option<bool>,
+    /// `,` for `1 234,56`. DuckDB calls this `decimal_separator`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decimal: Option<String>,
+    /// `utf-8`, `utf-16` or `latin-1` — what DuckDB itself accepts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoding: Option<String>,
+    /// The text that means NULL, beyond an empty field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub null_string: Option<String>,
+    /// Lines to drop before the header.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skip: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub date_format: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamp_format: Option<String>,
+    /// Keep going past a row that will not parse, instead of failing the query.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ignore_errors: Option<bool>,
+    /// How many rows the sniffer reads before deciding the types. `-1` is all of
+    /// them, which is the cure for a column that is integers for 20 000 rows and
+    /// then a word.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sample_size: Option<i64>,
+    /// Read every column as text. The escape hatch when nothing else works.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub all_varchar: Option<bool>,
+}
+
+/// How to read a spreadsheet.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExcelOptions {
+    /// Only this sheet, rather than one table per sheet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sheet: Option<String>,
+}
+
+/// The format half of a folder or file source.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileOptions {
+    /// What the files hold. A folder source must declare it — that is what lets a
+    /// directory's files be read as one table — and a file source may, which is
+    /// how `export.dat` gets read as CSV.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format: Option<FileFormat>,
+    /// Files to leave out, relative to the folder and with forward slashes.
+    /// Empty — the default — reads every file of the declared format.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exclude: Vec<String>,
+    #[serde(default, skip_serializing_if = "is_default_csv")]
+    pub csv: CsvOptions,
+    #[serde(default, skip_serializing_if = "is_default_excel")]
+    pub excel: ExcelOptions,
+}
+
+fn is_default_csv(options: &CsvOptions) -> bool {
+    options == &CsvOptions::default()
+}
+
+fn is_default_excel(options: &ExcelOptions) -> bool {
+    options == &ExcelOptions::default()
+}
+
+fn is_default_options(options: &FileOptions) -> bool {
+    options == &FileOptions::default()
+}
+
+impl FileOptions {
+    /// The format for a file with this extension: what was declared, or what the
+    /// extension says.
+    pub fn format_for(&self, extension: Option<&str>) -> Option<FileFormat> {
+        self.format
+            .or_else(|| extension.and_then(FileFormat::from_extension))
     }
 }
 
@@ -205,14 +382,17 @@ impl AuthKind {
 pub struct SourceRecord {
     pub id: String,
     pub kind: SourceKind,
-    /// Empty for a [`SourceKind::Files`] source, which has a `path` instead.
+    /// Empty for a folder or file source, which has a `path` instead.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub host: String,
-    /// The folder or file a [`SourceKind::Files`] source points at, as typed —
-    /// `~` and all. Resolved when the connection opens, not when it is saved, so
-    /// a project registry stays portable between machines.
+    /// The folder or file a [`SourceKind::Folder`] / [`SourceKind::File`] source
+    /// points at, as typed — `~` and all. Resolved when the connection opens, not
+    /// when it is saved, so a project registry stays portable between machines.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+    /// How to read those files. Empty for a server source.
+    #[serde(default, skip_serializing_if = "is_default_options")]
+    pub options: FileOptions,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub port: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -240,10 +420,18 @@ impl SourceRecord {
         format!("{}:{}", self.scope.prefix(), self.id)
     }
 
-    pub fn database(&self) -> &str {
-        self.database
-            .as_deref()
-            .unwrap_or_else(|| self.kind.default_database())
+    /// The database this source answers about — derived rather than static for a
+    /// folder or file source, whose catalogue is named after its folder.
+    pub fn database(&self) -> String {
+        if let Some(database) = self.database.as_deref().filter(|db| !db.is_empty()) {
+            return database.to_owned();
+        }
+        match self.path.as_deref() {
+            Some(path) if self.kind.is_files() => {
+                catalogue_name(self.kind, std::path::Path::new(path))
+            }
+            _ => self.kind.default_database().to_owned(),
+        }
     }
 
     pub fn summary(&self, dialect: Dialect) -> SourceSummary {
@@ -255,10 +443,11 @@ impl SourceRecord {
             dialect,
             host: self.host.clone(),
             path: self.path.clone(),
+            options: self.options.clone(),
             port: self.port(),
             instance: self.instance.clone(),
             // The effective database, so the UI never has to know the defaults.
-            database: self.database().to_owned(),
+            database: self.database(),
             auth_method: self.auth.method(),
             tls: self.tls,
             editor_mime: dialect.mime(),
@@ -285,6 +474,7 @@ impl SourceRecord {
             kind: self.kind,
             host: self.host.clone(),
             path: self.path.clone(),
+            options: self.options.clone(),
             port: self.port,
             instance: self.instance.clone(),
             database: self.database.clone(),
@@ -304,11 +494,13 @@ pub struct SourceConfig {
     #[serde(default)]
     pub scope: Scope,
     pub kind: SourceKind,
-    /// Not sent by a [`SourceKind::Files`] source, which sends `path` instead.
+    /// Not sent by a folder or file source, which sends `path` instead.
     #[serde(default)]
     pub host: String,
     #[serde(default)]
     pub path: Option<String>,
+    #[serde(default)]
+    pub options: FileOptions,
     #[serde(default)]
     pub port: Option<u16>,
     /// SQL Server named instance, resolved through the SQL Browser service.
@@ -350,6 +542,7 @@ impl SourceConfig {
             kind: self.kind,
             host: self.host,
             path: self.path,
+            options: self.options,
             port: self.port,
             instance: self.instance,
             database: self.database,
@@ -373,6 +566,7 @@ pub struct SourceSummary {
     /// Set only for a folder or file source; the UI shows it where the others
     /// show `host:port`.
     pub path: Option<String>,
+    pub options: FileOptions,
     pub port: u16,
     pub instance: Option<String>,
     pub database: String,

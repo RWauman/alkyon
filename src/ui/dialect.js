@@ -1,7 +1,12 @@
 // Per-dialect spelling: quoting identifiers, and writing a row-limited query.
 
-/** How many rows the explorer shows when you click a table. */
-export const PREVIEW_ROWS = 100;
+/**
+ * How many rows the explorer shows when you click a table.
+ *
+ * A page holds 50 000 by default, so this stays one page: the preview is meant to
+ * answer "what is in here" in one round trip, not to start a paging session.
+ */
+export const PREVIEW_ROWS = 10_000;
 
 /**
  * `SELECT * FROM <table>` limited to the first rows, in the dialect's own words.

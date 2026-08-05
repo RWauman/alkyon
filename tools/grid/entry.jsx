@@ -30,13 +30,15 @@ function Controller({ bind }) {
   // calls it thousands of times a second, so it must not be a render trigger.
   const source = React.useRef(() => BLANK);
   const header = React.useRef(() => {});
+  const menu = React.useRef(() => {});
   const editor = React.useRef(null);
 
   React.useEffect(() => {
     bind({
-      set({ columns, rows, getCell, theme, onHeaderClicked }) {
+      set({ columns, rows, getCell, theme, onHeaderClicked, onHeaderMenuClick }) {
         if (getCell) source.current = getCell;
         if (onHeaderClicked) header.current = onHeaderClicked;
+        if (onHeaderMenuClick) menu.current = onHeaderMenuClick;
         setState((previous) => ({
           columns: columns ?? previous.columns,
           rows: rows ?? previous.rows,
@@ -58,6 +60,14 @@ function Controller({ bind }) {
   }, []);
 
   const onHeaderClicked = React.useCallback((index) => header.current(index), []);
+
+  // glide draws the indicator for a column marked `hasMenu` and reports where it
+  // ended up, in viewport coordinates. The host anchors its own popover there —
+  // the menu itself is not glide's business, only its position.
+  const onHeaderMenuClick = React.useCallback(
+    (index, bounds) => menu.current(index, bounds),
+    [],
+  );
 
   const onColumnResize = React.useCallback((column, width) => {
     setState((previous) => ({
@@ -115,6 +125,7 @@ function Controller({ bind }) {
         getCellContent,
         onColumnResize,
         onHeaderClicked,
+        onHeaderMenuClick,
         // The row number, drawn by glide and frozen for free.
         rowMarkers: 'number',
         rowMarkerWidth: 68,

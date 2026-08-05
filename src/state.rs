@@ -330,7 +330,7 @@ impl AppState {
         let record = self.record(key).await?;
         let database = database
             .map(str::to_owned)
-            .unwrap_or_else(|| record.database().to_owned());
+            .unwrap_or_else(|| record.database());
 
         if !refresh {
             if let Some(cached) = self.schema.get(&record.key(), &database).await {
@@ -361,7 +361,7 @@ impl AppState {
             SourceKind::Postgres => &self.postgres,
             SourceKind::MsSql => &self.mssql,
             SourceKind::MySql => &self.mysql,
-            SourceKind::Files => &self.files,
+            SourceKind::Folder | SourceKind::File => &self.files,
         }
     }
 
@@ -451,7 +451,43 @@ impl AppState {
         if let Some(db) = database {
             config.database = Some(db.to_owned());
         }
+        config.path = self.anchor_path(&record, config.path).await?;
         self.connector(config.kind).connect(&config).await
+    }
+
+    /// Make a folder or file source's path absolute.
+    ///
+    /// A **project** source's relative path is relative to the project — that is
+    /// what makes `./sample-data/csv` in a committed `.alkyon/sources.json` mean
+    /// the same thing on every machine. Resolved here rather than in the connector
+    /// because this is the only place that knows which folder is open.
+    ///
+    /// A **user** source has no project to be relative to, so a relative path
+    /// there is refused outright: resolving it against whatever directory the
+    /// server happened to start in is the kind of answer that works once.
+    async fn anchor_path(
+        &self,
+        record: &SourceRecord,
+        path: Option<String>,
+    ) -> Result<Option<String>> {
+        let Some(path) = path else { return Ok(None) };
+        let trimmed = path.trim();
+        if trimmed.is_empty() || !crate::workspace::is_relative(trimmed) {
+            return Ok(Some(path));
+        }
+
+        if record.scope != Scope::Project {
+            return Err(Error::BadRequest(format!(
+                "`{trimmed}` is a relative path, and only a project source has a folder to be \
+                 relative to. Give an absolute path, or `~/…`."
+            )));
+        }
+        let root = self.workspace().await.ok_or_else(|| {
+            Error::BadRequest(format!(
+                "`{trimmed}` is relative to the project, but no folder is open"
+            ))
+        })?;
+        Ok(Some(root.join(trimmed).to_string_lossy().into_owned()))
     }
 
     /// Bulk import from a credentials file, overwriting sources of the same id.

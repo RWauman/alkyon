@@ -8,6 +8,8 @@ import { api } from './api.js';
 
 export function createWorkspace(element, { onOpenFile, onRootChange, onStatus }) {
   let root = null;
+  /** How many files the tree currently shows, so a refresh can say what changed. */
+  let count = 0;
 
   /** Group `a/b/c.sql` paths into one collapsible node per directory. */
   function group(files) {
@@ -90,6 +92,7 @@ export function createWorkspace(element, { onOpenFile, onRootChange, onStatus })
   }
 
   function paint({ files, truncated }) {
+    count = files.length;
     if (!root) {
       const empty = document.createElement('div');
       empty.className = 'empty muted';
@@ -118,6 +121,10 @@ export function createWorkspace(element, { onOpenFile, onRootChange, onStatus })
   return {
     get root() {
       return root;
+    },
+
+    get count() {
+      return count;
     },
 
     async refresh() {

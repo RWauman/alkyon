@@ -43,6 +43,7 @@
       <option value="50000" selected>50 000</option>
       <option value="200000">200 000</option>
       <option value="1000000">1 000 000</option>
+      <option value="all" title="One page holding the whole result — the browser has to fit all of it">No limit</option>
     </select>
   </label>
   <button id="prev-page" class="icon" hidden title="Back to the previous page">&#x2039;</button>
@@ -61,40 +62,66 @@
 </header>
 
 <main>
-  <aside id="explorer-pane">
-    <div id="search-box">
-      <input id="search-input" type="search" placeholder="Search schemas… (Ctrl+K)"
-             autocomplete="off" spellcheck="false">
-    </div>
-    <div id="search-results"></div>
-    <div id="search-foot">
-      <span class="muted" id="search-coverage">nothing indexed yet</span>
-      <span class="spacer"></span>
-      <button id="index-all" title="Load the schema of every registered source">Index all</button>
-    </div>
+  <!-- Three collapsible sections, each with a chevron, and a draggable line
+       between them. `aria-expanded` on the section is the state; the CSS and
+       panes.js both read it, so there is one place it lives. -->
+  <aside id="explorer-pane" class="panel">
+    <section class="pane" id="pane-search" aria-expanded="true">
+      <div class="pane-head" data-toggle role="button" tabindex="0">
+        <span class="chevron" aria-hidden="true"></span>
+        <span>Search</span>
+        <span class="spacer"></span>
+        <button id="index-all" title="Load the schema of every registered source">Index all</button>
+      </div>
+      <div class="pane-body">
+        <div id="search-box">
+          <input id="search-input" type="search" placeholder="Search schemas… (Ctrl+K)"
+                 autocomplete="off" spellcheck="false">
+        </div>
+        <div id="search-results"></div>
+        <div id="search-foot">
+          <span class="muted" id="search-coverage">nothing indexed yet</span>
+        </div>
+      </div>
+    </section>
 
-    <div class="pane-head divider">
-      <span>Sources</span>
-      <span class="spacer"></span>
-      <button id="add-source" title="Register a source">+</button>
-      <button id="refresh-explorer" title="Reload and re-check connections">&#x21bb;</button>
-    </div>
-    <div id="explorer" class="tree" role="tree"></div>
+    <div class="pane-split" role="separator" aria-orientation="horizontal"></div>
 
-    <div class="pane-head divider">
-      <span>Folder</span>
-      <span class="spacer"></span>
-      <button id="open-folder" title="Open a folder on the machine running alkyon">Open…</button>
-      <button id="close-folder" title="Close the folder" hidden>&#x2715;</button>
-    </div>
-    <div id="workspace-root" hidden></div>
-    <div id="workspace" class="tree"></div>
+    <section class="pane" id="pane-sources" aria-expanded="true">
+      <div class="pane-head" data-toggle role="button" tabindex="0">
+        <span class="chevron" aria-hidden="true"></span>
+        <span>Sources</span>
+        <span class="spacer"></span>
+        <button id="add-source" title="Register a source">+</button>
+        <button id="refresh-explorer" title="Reload and re-check connections">&#x21bb;</button>
+      </div>
+      <div class="pane-body">
+        <div id="explorer" class="tree" role="tree"></div>
+      </div>
+    </section>
+
+    <div class="pane-split" role="separator" aria-orientation="horizontal"></div>
+
+    <section class="pane" id="pane-folder" aria-expanded="true">
+      <div class="pane-head" data-toggle role="button" tabindex="0">
+        <span class="chevron" aria-hidden="true"></span>
+        <span>Folder</span>
+        <span class="spacer"></span>
+        <button id="open-folder" title="Open a folder on the machine running alkyon">Open…</button>
+        <button id="refresh-folder" title="Re-list the .sql files in this folder" hidden>&#x21bb;</button>
+        <button id="close-folder" title="Close the folder" hidden>&#x2715;</button>
+      </div>
+      <div class="pane-body">
+        <div id="workspace-root" hidden></div>
+        <div id="workspace" class="tree"></div>
+      </div>
+    </section>
   </aside>
 
   <div class="splitter" id="split-sidebar" role="separator" aria-orientation="vertical"></div>
 
   <section id="work">
-    <div id="tab-bar-row">
+    <div id="tab-bar-row" class="panel panel-top">
       <div id="tab-bar" role="tablist"></div>
       <button id="new-tab" title="New tab (Alt+N)">+</button>
       <span class="spacer"></span>
@@ -102,12 +129,12 @@
       <button id="save-file" title="Save (Ctrl+S)">Save</button>
       <button id="save-as-file" title="Save as (Ctrl+Shift+S)">Save as</button>
     </div>
-    <div id="editor-pane"></div>
+    <div id="editor-pane" class="panel panel-bottom"></div>
 
     <!-- Shown instead of the editor when no tab is open. Alkyon opens on this
          rather than on an empty query, because the first thing to decide is
          where you are working, not what to type. -->
-    <div id="start" hidden>
+    <div id="start" class="panel panel-bottom" hidden>
       <img src="/logo/alkyon-mark.svg" alt="" width="56" height="56">
       <h1>Alkyon</h1>
       <div class="start-actions">
@@ -118,12 +145,12 @@
       <div id="start-recent"></div>
     </div>
     <div class="splitter horizontal" id="split-editor" role="separator" aria-orientation="horizontal"></div>
-    <div id="grid-pane">
+    <div id="grid-pane" class="panel">
       <div id="grid"></div>
     </div>
     <div class="splitter horizontal" id="split-terminal" role="separator" aria-orientation="horizontal" hidden></div>
 
-    <div id="terminal-pane" hidden>
+    <div id="terminal-pane" class="panel" hidden>
       <div class="pane-head">
         <span>Terminal</span>
         <span class="gear" title="Shell">&#x2699;</span>
@@ -170,9 +197,25 @@
         <option value="postgres">PostgreSQL</option>
         <option value="ms_sql">SQL Server</option>
         <option value="my_sql">MySQL / MariaDB</option>
-        <option value="files">Folder or file</option>
+        <option value="folder">Folder of data files</option>
+        <option value="file">One data file</option>
       </select>
     </label>
+    <!-- Then the file type, before anything else: it decides which options below
+         mean anything, and a folder's files cannot be read as one table until it is
+         known. There is no "work it out per file" — files of two formats cannot be
+         unioned. -->
+    <label class="files-only">File type
+      <select name="format">
+        <option value="">Choose one…</option>
+        <option value="csv">CSV / delimited text</option>
+        <option value="parquet">Parquet</option>
+        <option value="json">JSON</option>
+        <option value="json_lines">JSON lines (one per line)</option>
+        <option value="excel">Excel</option>
+      </select>
+    </label>
+
     <label>Id <input name="id" required placeholder="pg-prod" pattern="[A-Za-z0-9._-]+"></label>
     <label>Registry
       <select name="scope">
@@ -181,7 +224,63 @@
       </select>
     </label>
 
-    <label class="files-only">Path <input name="path" placeholder="C:\data\exports — or one .csv/.parquet file"></label>
+    <label class="folder-only">Path <input name="path" id="folder-path" placeholder="C:\data\exports"></label>
+    <label class="file-only">Path <input name="file-path" placeholder="C:\data\exports\sales.csv"></label>
+
+    <!-- Filled from the folder itself once the path and the type are in. Every
+         file is read unless it is ticked here. -->
+    <fieldset class="folder-only files" id="folder-files">
+      <legend>Leave out</legend>
+      <p class="hint" id="folder-files-empty">Give a path and a type to list what is in the folder.</p>
+    </fieldset>
+
+    <!-- Only the ones a CSV actually needs. Every box left empty means "let DuckDB
+         work it out", which its sniffer is good at — these are for the file it gets
+         wrong. -->
+    <fieldset class="csv-only">
+      <legend>CSV</legend>
+      <label>Delimiter <input name="csv-delimiter" maxlength="4" placeholder="sniffed — try ; or |"></label>
+      <label>Decimal <input name="csv-decimal" maxlength="1" placeholder="sniffed — , for 1234,56"></label>
+      <label>Encoding
+        <select name="csv-encoding">
+          <option value="">Sniffed</option>
+          <option value="utf-8">UTF-8</option>
+          <option value="utf-16">UTF-16</option>
+          <option value="latin-1">Latin-1 / Windows-1252</option>
+        </select>
+      </label>
+      <label>Quote <input name="csv-quote" maxlength="1" placeholder="&quot;"></label>
+      <label>Escape <input name="csv-escape" maxlength="1" placeholder="&quot;"></label>
+      <label>Null text <input name="csv-null" placeholder="empty field only"></label>
+      <label>Skip lines <input name="csv-skip" type="number" min="0" placeholder="0"></label>
+      <label>Header row
+        <select name="csv-header">
+          <option value="">Sniffed</option>
+          <option value="true">Yes</option>
+          <option value="false">No — name them column0, column1…</option>
+        </select>
+      </label>
+      <label>Date format <input name="csv-date" placeholder="%d/%m/%Y"></label>
+      <label>Timestamp format <input name="csv-timestamp" placeholder="%d/%m/%Y %H:%M:%S"></label>
+      <label>Type sample <input name="csv-sample" type="number" placeholder="20480 rows — -1 reads all"></label>
+      <label>All text
+        <select name="csv-all-varchar">
+          <option value="">No</option>
+          <option value="true">Yes — every column as text</option>
+        </select>
+      </label>
+      <label>On a bad row
+        <select name="csv-ignore-errors">
+          <option value="">Fail the query</option>
+          <option value="true">Skip the row</option>
+        </select>
+      </label>
+    </fieldset>
+
+    <fieldset class="excel-only">
+      <legend>Excel</legend>
+      <label>Sheet <input name="excel-sheet" placeholder="all of them, one table each"></label>
+    </fieldset>
 
     <label class="server-only">Host <input name="host" placeholder="127.0.0.1"></label>
     <label class="server-only">Port <input name="port" type="number" min="1" max="65535" placeholder="default"></label>
@@ -211,9 +310,16 @@
 
     <p class="hint server-only">The credential is verified against the server, then stored in the
       OS keychain. Only the connection details are written to disk.</p>
-    <p class="hint files-only">A path on the machine running alkyon; <code>~</code> works. Each
-      <code>.csv</code>, <code>.parquet</code> or <code>.json</code> file becomes a table, and
-      subdirectories become schemas. The source can read nothing outside this path.</p>
+    <p class="hint folder-only">A path on the machine running alkyon; <code>~</code> works. The
+      catalogue takes the folder's name, and inside <code>public</code>: each file at the root is
+      a table of its own, and each subdirectory is one table over its files — unioned, with a
+      <code>source_file</code> column naming the file each row came from. The files in one
+      subdirectory must have exactly the same columns. The source can read nothing outside this
+      path.</p>
+    <p class="hint file-only">One file on the machine running alkyon; <code>~</code> works. It
+      becomes a single table, and the source can read nothing else — not even the files beside
+      it. The type you choose overrides the extension, which is how <code>export.dat</code>
+      gets read as CSV.</p>
     <p class="note" id="source-note" hidden></p>
 
     <div class="actions">
@@ -222,6 +328,18 @@
       <button type="submit" id="source-save">Connect and save</button>
     </div>
   </form>
+</dialog>
+
+<!-- Anything that cannot be undone asks first. Its own dialogue rather than the
+     browser's `confirm`, which Chrome lets you silence for the rest of the session
+     — and a silenced confirmation is a source deleted without being asked. -->
+<dialog id="confirm-dialog">
+  <h2 id="confirm-title">Are you sure?</h2>
+  <p class="hint" id="confirm-detail"></p>
+  <div class="actions">
+    <button type="button" id="confirm-cancel">Cancel</button>
+    <button type="button" id="confirm-ok">Remove</button>
+  </div>
 </dialog>
 
 <!-- Vendored, MIT, see vendor/LICENSE-*.txt. Classic scripts: they publish

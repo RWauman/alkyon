@@ -4,9 +4,35 @@
 :root {
   --font: 13px/1.5 ui-sans-serif, system-ui, "Segoe UI", sans-serif;
   --mono: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  /* The space between panels, which is also the splitter's grab width. Below
+     about 6px a pointer misses it. */
+  --gap: 6px;
+  --radius: 8px;
 }
 
 * { box-sizing: border-box; }
+
+/* Narrow scrollbars, everywhere.
+   The platform default is as thick as a tree row is tall, which in a 260px
+   sidebar is a visible slice of the pane spent on chrome. Both spellings are
+   here on purpose: `scrollbar-width` is what Firefox reads, the pseudo-elements
+   are what Chrome reads, and Chrome prefers the pseudo-elements when both apply. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in srgb, var(--fg-muted) 45%, transparent) transparent;
+}
+::-webkit-scrollbar { width: 9px; height: 9px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: color-mix(in srgb, var(--fg-muted) 40%, transparent);
+  border-radius: 5px;
+  /* Inset the thumb so it does not touch the panel's rounded edge. */
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+::-webkit-scrollbar-thumb:hover { background: color-mix(in srgb, var(--fg-muted) 70%, transparent); background-clip: padding-box; }
+/* Where a vertical and a horizontal bar meet. Left unpainted it is a grey block. */
+::-webkit-scrollbar-corner { background: transparent; }
 
 body {
   margin: 0;
@@ -132,10 +158,38 @@ body.federated #toggle-duckdb img { opacity: 1; filter: none; }
 
 /* ---------------------------------------------------------------- layout */
 
+/* Panels float on the gutter with a gap between them, the way VS Code's do.
+   The gaps are the splitter tracks themselves — they are transparent and carry
+   the grip — so nothing here needs `gap`, which would add a second space that
+   could not be dragged. */
 main {
   display: grid;
   grid-template-columns: var(--sidebar, 260px) auto 1fr;
   min-height: 0;
+  padding: var(--gap);
+  background: var(--gutter);
+}
+
+.panel {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  /* Rounded corners only clip what the box is told to clip, and every panel here
+     holds something that would otherwise paint over them: a canvas, a
+     CodeMirror, a scrolling tree. */
+  overflow: hidden;
+  min-width: 0;
+  min-height: 0;
+}
+
+/* The tab strip and the editor under it are one panel in two grid rows, so the
+   radius is split between them and the seam in the middle is left square. */
+.panel-top {
+  border-radius: var(--radius) var(--radius) 0 0;
+  border-bottom: 0;
+}
+.panel-bottom {
+  border-radius: 0 0 var(--radius) var(--radius);
+  border-top: 0;
 }
 
 #work {
@@ -209,6 +263,12 @@ main {
 }
 .tab:hover .tab-close, .tab.active .tab-close { visibility: visible; }
 .tab-close:hover { color: var(--error); }
+
+/* Where a dragged tab would land. An inset shadow rather than a border, so the
+   strip does not reflow by a pixel as the mark moves from tab to tab. */
+.tab.drop-before { box-shadow: inset 2px 0 0 var(--accent); }
+.tab.drop-after { box-shadow: inset -2px 0 0 var(--accent); }
+.tab[draggable='true'] { cursor: grab; }
 
 #editor-pane, #grid-pane { min-height: 0; overflow: hidden; }
 
@@ -291,44 +351,132 @@ main {
 #shell-select { font-size: 11px; padding: 0 .2rem; }
 #terminal { min-height: 0; padding: .25rem .35rem; overflow: hidden; }
 
-.splitter { background: var(--line); }
-.splitter:not(.horizontal) { width: 4px; cursor: col-resize; }
-.splitter.horizontal { height: 4px; cursor: row-resize; }
-.splitter:hover, .splitter.dragging { background: var(--accent); }
+/* The splitter *is* the gap: transparent, so what shows through is the gutter,
+   with three dots in the middle to say it can be dragged. A visible bar would
+   read as a border between panels rather than as a handle. */
+.splitter {
+  position: relative;
+  background: transparent;
+}
+.splitter:not(.horizontal) { width: var(--gap); cursor: col-resize; }
+.splitter.horizontal { height: var(--gap); cursor: row-resize; }
 .splitter[hidden] { display: none; }
+
+/* Three dots from one repeated radial gradient — three elements would be three
+   more nodes to keep in step for no gain. */
+.splitter::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  margin: auto;
+  background-image: radial-gradient(circle at center, var(--fg-muted) 1px, transparent 1.3px);
+  opacity: .55;
+  transition: opacity .12s ease;
+}
+.splitter:not(.horizontal)::after {
+  width: 3px;
+  height: 15px;
+  background-size: 3px 5px;
+}
+.splitter.horizontal::after {
+  width: 15px;
+  height: 3px;
+  background-size: 5px 3px;
+}
+.splitter:hover::after, .splitter.dragging::after { opacity: 1; }
+/* Dragging is a pointer gesture; a fade under the cursor is noise. */
+.splitter.dragging::after { transition: none; }
+
+@media (prefers-reduced-motion: reduce) {
+  .splitter::after { transition: none; }
+}
 
 /* -------------------------------------------------------------- explorer */
 
-/* Folder above, sources below, each scrolling independently. `minmax(0, …)` is
-   what stops a long list from pushing the other section off the pane. */
+/* A column of collapsible sections, each scrolling independently.
+   Sizing, by default: search and sources take the height of their content, and
+   the folder takes what is left — so leftover space ends up at the bottom of the
+   pane rather than in the middle of it. Dragging a divider pins the section above
+   to an explicit height, and from then on that one no longer follows its content. */
 #explorer-pane {
-  display: grid;
-  /* `minmax(0, 1fr)` pins the single column to the pane's width. Without it the
-     implicit `auto` column sizes to the widest tree row — which is `max-content`
-     by design — and every header stretches past the pane with it. */
-  grid-template-columns: minmax(0, 1fr);
-  /* search box, hits, coverage, sources head, sources tree,
-     folder head, folder path, folder tree */
-  grid-template-rows:
-    auto minmax(0, auto) auto
-    auto minmax(0, 1fr)
-    auto auto minmax(0, var(--folder, 0.9fr));
+  display: flex;
+  flex-direction: column;
   min-height: 0;
   background: var(--bg-sunken);
 }
 
-.pane-head.divider { border-top: 1px solid var(--line); }
+.pane {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  /* Content height, shrinkable. `flex-basis: auto` is what makes a section with
+     one source one source tall. */
+  flex: 0 1 auto;
+}
+/* Capped so a long list cannot push the sections below it off the pane. */
+#pane-search > .pane-body { max-height: 45vh; }
+#pane-sources { max-height: 50%; }
+/* The one that absorbs the slack, unless a drag has pinned it. */
+#pane-folder { flex: 1 1 0; }
+
+/* Collapsed is the header and nothing else — never a share of the space. */
+.pane[aria-expanded='false'] {
+  flex: 0 0 auto;
+  max-height: none;
+}
+.pane[aria-expanded='false'] > .pane-body { display: none; }
+
+.pane-body {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.chevron {
+  width: .8em;
+  flex: none;
+  color: var(--fg-muted);
+  transition: transform .12s ease;
+}
+.chevron::before { content: '\25B8'; }
+.pane[aria-expanded='true'] > .pane-head > .chevron { transform: rotate(90deg); }
+@media (prefers-reduced-motion: reduce) {
+  .chevron { transition: none; }
+}
+
+.pane-head[data-toggle] { cursor: pointer; }
+.pane-head[data-toggle]:hover { color: var(--fg); }
+.pane-head[data-toggle]:focus-visible { outline: 1px solid var(--accent); outline-offset: -1px; }
+
+/* The line between two sections is also the handle that resizes them. */
+.pane-split {
+  position: relative;
+  height: 5px;
+  flex: none;
+  cursor: row-resize;
+}
+.pane-split::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 2px;
+  height: 1px;
+  background: var(--line);
+}
+.pane-split:hover::before, .pane-split.dragging::before { background: var(--accent); }
+/* Nothing to drag against when the section above it is shut. */
+.pane-split.inert { cursor: default; }
 
 /* ----------------------------------------------------------------- search */
 
-#search-box { padding: .4rem .5rem .3rem; }
+#search-box { padding: .4rem .5rem .3rem; flex: none; }
 #search-input { width: 100%; font-size: 12px; }
 
-#search-results {
-  overflow: auto;
-  /* Never let the hits crowd out the trees below — they scroll instead. */
-  max-height: 40vh;
-}
+/* The hits scroll inside the section rather than growing it, so a long list
+   cannot crowd out the sections below. */
+#search-results { overflow: auto; min-height: 0; }
 #search-results:empty { display: none; }
 
 #search-foot {
@@ -338,9 +486,13 @@ main {
   padding: 0 .5rem .35rem;
   font-size: 10px;
   font-family: var(--mono);
+  flex: none;
 }
 #search-foot button { padding: 0 .3rem; font-size: 10px; }
 #search-foot button[hidden] { display: none; }
+/* `Index all` moved into the section header, where the rest of the view's
+   actions live; it keeps its id, so nothing that talks to it had to change. */
+#index-all { font-size: 10px; }
 
 /* Two lines: the name, then where it lives. One line cannot hold a name, a type
    and a source in a 260px pane without ellipsising all three. */
@@ -450,7 +602,10 @@ main {
 .scope-project { color: var(--accent); border-color: var(--accent); }
 .row .drop { visibility: hidden; padding: 0 .3rem; border: 0; background: none; color: var(--fg-muted); }
 .row:hover .drop { visibility: visible; }
+/* Removing is the destructive one, so only it turns red; re-reading is ordinary. */
 .row .drop:hover { color: var(--error); }
+.row .drop:first-of-type:hover { color: var(--accent); }
+.row .drop:last-of-type:hover { color: var(--error); }
 .tree .empty, .tree .failed { padding: .2rem .5rem .2rem 1.8rem; font-size: 12px; }
 .tree .failed { color: var(--error); }
 
@@ -471,6 +626,106 @@ main {
 /* The overlay glide opens for a copied selection is portalled to <body>. */
 #portal { position: fixed; left: 0; top: 0; z-index: 40; }
 
+/* The per-column filter, anchored under the header indicator glide draws.
+   Fixed to the viewport, because the coordinates glide reports are viewport
+   coordinates and the canvas it came from cannot hold a text input. */
+.filter-pop {
+  position: fixed;
+  z-index: 50;
+  display: grid;
+  gap: .35rem;
+  min-width: 15rem;
+  padding: .5rem;
+  background: var(--bg-raised);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  box-shadow: 0 6px 18px rgb(0 0 0 / .3);
+}
+/* The text box only. Left as `.filter-pop input` this also stretched every
+   checkbox in the list below to the full width of the popover. */
+.filter-pop > input[type='search'] { width: 100%; font-family: var(--mono); font-size: 12px; }
+.filter-title {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--fg-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.filter-hint { font-size: 10px; color: var(--fg-muted); }
+.filter-actions { display: flex; justify-content: flex-end; }
+.filter-actions button { font-size: 11px; padding: .1rem .4rem; }
+
+/* The tickable values, or the year/month/day tree. Scrolls rather than growing:
+   a few hundred values must not push the buttons below off the screen. */
+.filter-list {
+  max-height: 15rem;
+  overflow: auto;
+  border-top: 1px solid var(--line);
+  padding-top: .3rem;
+}
+.filter-list:empty { display: none; }
+
+.filter-bulk { display: flex; gap: .3rem; padding: 0 .1rem .25rem; }
+.filter-bulk button { font-size: 10px; padding: 0 .3rem; }
+
+.filter-choice {
+  display: flex;
+  align-items: center;
+  gap: .35rem;
+  padding: .05rem .1rem;
+  cursor: pointer;
+  font-size: 12px;
+  /* Without this the long value below sizes the row to its content and the list
+     scrolls sideways instead of ellipsising. */
+  min-width: 0;
+}
+.filter-choice:hover { background: var(--accent-soft); }
+.filter-choice input {
+  width: auto;
+  margin: 0;
+  padding: 0;
+  flex: none;
+  accent-color: var(--accent);
+}
+.filter-value {
+  font-family: var(--mono);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1 1 0;
+  min-width: 0;
+}
+.filter-count { color: var(--fg-muted); font-size: 10px; font-family: var(--mono); flex: none; }
+.filter-note { font-size: 10px; color: var(--fg-muted); padding: .2rem .1rem; }
+
+/* A numeric column gets two ends instead of a list of values. */
+.filter-range {
+  display: flex;
+  align-items: center;
+  gap: .4rem;
+  padding: .1rem;
+}
+.filter-range-label { font-size: 10px; color: var(--fg-muted); width: 2.2rem; flex: none; }
+.filter-range input[type='range'] {
+  flex: 1 1 0;
+  min-width: 0;
+  width: auto;
+  padding: 0;
+  border: 0;
+  background: none;
+  accent-color: var(--accent);
+}
+.filter-range-box {
+  width: 6.5rem;
+  flex: none;
+  font-family: var(--mono);
+  font-size: 11px;
+  padding: .1rem .2rem;
+}
+/* The tree's own twisty is narrower than the explorer's — it sits before a box. */
+.filter-date > .filter-choice > .twisty { width: .8em; font-size: 9px; }
+
 /* ---------------------------------------------------------------- dialog */
 
 dialog {
@@ -490,3 +745,40 @@ dialog .note.bad { color: var(--error); }
 dialog .note.good { color: var(--ok); }
 dialog .actions { display: flex; justify-content: flex-end; gap: .5rem; margin-top: 1rem; }
 dialog [hidden] { display: none; }
+
+/* The format options. A fieldset rather than more loose labels, because there are
+   a dozen of them and they only apply to one format at a time. */
+dialog fieldset {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: .5rem .7rem .2rem;
+  margin: .6rem 0 0;
+  /* Long enough to need scrolling on a short window, rather than pushing the
+     buttons off the bottom of the dialogue. */
+  max-height: 40vh;
+  overflow: auto;
+}
+dialog legend {
+  padding: 0 .3rem;
+  font-size: 11px;
+  letter-spacing: .06em;
+  text-transform: uppercase;
+  color: var(--fg-muted);
+}
+dialog fieldset label { grid-template-columns: 8rem 1fr; }
+dialog fieldset input, dialog fieldset select { font-size: 12px; }
+
+/* The files to leave out: one tick per file, so the paths read as a list rather
+   than as the label column of a form. */
+dialog fieldset.files { max-height: 11rem; }
+dialog fieldset.files label {
+  grid-template-columns: auto 1fr;
+  justify-items: start;
+  gap: .5rem;
+  margin-bottom: .15rem;
+  font-family: var(--mono);
+  font-size: 12px;
+  cursor: pointer;
+}
+dialog fieldset.files input { width: auto; margin: 0; }
+dialog fieldset.files .hint { margin: 0 0 .3rem; }

@@ -13,6 +13,16 @@ pub struct Sheet {
     pub rows: Vec<Vec<Option<String>>>,
 }
 
+/// Every sheet in a workbook, in the order the file lists them.
+///
+/// A folder source needs this to turn one workbook into one table per sheet, which
+/// it cannot do without knowing what the sheets are called.
+pub fn sheet_names(path: &std::path::Path) -> Result<Vec<String>> {
+    let workbook = calamine::open_workbook_auto(path)
+        .map_err(|e| Error::BadRequest(format!("cannot read {}: {e}", path.display())))?;
+    Ok(workbook.sheet_names().to_vec())
+}
+
 /// The first row is the header. `sheet` picks one by name; without it, the first.
 pub fn read(path: &std::path::Path, sheet: Option<&str>) -> Result<Sheet> {
     let mut workbook = calamine::open_workbook_auto(path)

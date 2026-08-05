@@ -45,6 +45,10 @@ export const api = {
   readWorkspaceFile: (path) => call('GET', `/workspace/file?path=${q(path)}`),
   writeWorkspaceFile: (path, text) => putText(`/workspace/file?path=${q(path)}`, text),
 
+  /** The data files a folder holds, relative to it — the source dialog's list. */
+  dataFiles: (path, format) =>
+    call('GET', `/files?path=${q(path)}${format ? `&format=${q(format)}` : ''}`),
+
   shells: () => call('GET', '/shells'),
   sources: () => call('GET', '/sources'),
   addSource: (config) => call('POST', '/sources', config),

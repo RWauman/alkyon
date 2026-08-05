@@ -1,6 +1,7 @@
 // The SQL editor: CodeMirror in whichever dialect the active source speaks,
 // with autocompletion fed from the schema the explorer has loaded so far.
 
+import { cteColumns, mask as maskLiterals, referencedTables } from './cte.js';
 import { dialectForMime, qualifyLoosely } from './dialect.js';
 import { targetAt } from './target.js';
 
@@ -31,24 +32,104 @@ function targetCompletions(cm, sources) {
   };
 }
 
+/** At most this many column suggestions: a wide schema has thousands. */
+const MAX_COLUMNS = 40;
+
 /**
- * Candidates the SQL hint will not offer: schemas, and tables found by their own
- * name rather than by the schema in front of it.
+ * One suggestion, drawn as a name and where it came from.
+ *
+ * Two lanes rather than one string, so `id` in a column and `id` in a table do not
+ * look alike: the name is what you read, the origin is what tells you which of the
+ * two you are about to accept. `displayText` is still set, because the addon uses
+ * it for its own filtering and for the case where `render` is not called.
+ */
+function candidate(text, name, where, kind) {
+  return {
+    text,
+    displayText: `${name} — ${where}`,
+    className: `CodeMirror-hint-${kind}`,
+    render(element) {
+      const label = document.createElement('span');
+      label.className = 'hint-name';
+      label.textContent = name;
+      const origin = document.createElement('span');
+      origin.className = 'hint-where';
+      origin.textContent = where;
+      element.append(label, origin);
+    },
+  };
+}
+
+/** Words after which a *table* is what you are about to name. */
+const TABLE_WORDS = /\b(?:from|join|into|update|using)\b/gi;
+/** Words after which a *column* is. */
+const COLUMN_WORDS =
+  /\b(?:select|where|having|on|set|group|order|by|and|or|case|when|then|else|distinct)\b/gi;
+
+function lastIndexOfAny(text, pattern) {
+  pattern.lastIndex = 0;
+  let at = -1;
+  let found = pattern.exec(text);
+  while (found) {
+    at = found.index;
+    found = pattern.exec(text);
+  }
+  return at;
+}
+
+/**
+ * Whether a table is the likelier thing to be naming here.
+ *
+ * Both tables and columns are always offered — the clause only decides which goes
+ * first, and that matters because the list pops up as you type and Enter accepts
+ * whatever is highlighted.
+ */
+function wantsTable(cm) {
+  const before = maskLiterals(cm.getRange({ line: 0, ch: 0 }, cm.getCursor()));
+  return lastIndexOfAny(before, TABLE_WORDS) > lastIndexOfAny(before, COLUMN_WORDS);
+}
+
+/**
+ * A test for "this table is in scope for column completion", or null when the
+ * statement names no table and everything is.
+ *
+ * A reference may be written qualified or not — `sales.customer` or just
+ * `customer` — so a key matches on either its whole name or its table part.
+ */
+function columnScope(cm, tables) {
+  const cursor = cm.getCursor();
+  const offset = cm.indexFromPos(cursor);
+  const { names } = referencedTables(cm.getValue(), offset);
+  if (names.size === 0) return null;
+
+  const wanted = new Set([...names].map((name) => name.toLowerCase()));
+  return (qualified) => {
+    const lower = qualified.toLowerCase();
+    if (wanted.has(lower)) return true;
+    const cut = lower.indexOf('.');
+    return cut !== -1 && wanted.has(lower.slice(cut + 1));
+  };
+}
+
+/**
+ * Candidates the SQL hint will not offer: schemas, tables found by their own name
+ * rather than by the schema in front of it, and **columns**.
  *
  * The addon matches a candidate from its first character, and its candidates are
  * the *qualified* names — so `customer` matches nothing at all, and you have to
  * remember `sales` before it will help you find `sales.customer`. That is
- * backwards: the table name is the part you know.
+ * backwards: the table name is the part you know. Columns it offers only after a
+ * `table.`, which means the one thing you type most often is the one thing it
+ * cannot help with.
  *
- * Two additions, both only while the word being typed has no dot in it (after a
- * dot the addon already knows what to do):
- *
- *   - every `schema.table` whose **table** starts with what you typed;
- *   - every **schema**, which is what you want right after `FROM`.
+ * All of this only while the word being typed has no dot in it — after a dot the
+ * addon already knows what to do.
  */
-function byBareName(cm, result, tables) {
+function byBareName(cm, result, tables, inScope) {
   const typed = cm.getRange(result.from, result.to);
-  if (typed.includes('.') || typed.includes('"') || typed.includes('`')) return [];
+  if (typed.includes('.') || typed.includes('"') || typed.includes('`')) {
+    return { tables: [], columns: [], shadowed: new Set() };
+  }
 
   const prefix = typed.toLowerCase();
   const already = new Set(
@@ -57,34 +138,65 @@ function byBareName(cm, result, tables) {
 
   const schemas = new Set();
   const matched = [];
-  for (const qualified of Object.keys(tables)) {
-    const cut = qualified.indexOf('.');
-    if (cut === -1) continue;
-    const schema = qualified.slice(0, cut);
-    const table = qualified.slice(cut + 1);
+  /** Texts whose plain-string version the addon should no longer offer. */
+  const shadowed = new Set();
+  /** column name → the qualified tables holding one. */
+  const columns = new Map();
 
-    if (schema.toLowerCase().startsWith(prefix)) schemas.add(schema);
-    if (table.toLowerCase().startsWith(prefix) && !already.has(qualified)) {
-      matched.push({
-        text: qualified,
+  for (const [qualified, names] of Object.entries(tables)) {
+    const cut = qualified.indexOf('.');
+    if (cut !== -1) {
+      const schema = qualified.slice(0, cut);
+      const table = qualified.slice(cut + 1);
+      if (schema.toLowerCase().startsWith(prefix)) schemas.add(schema);
+      if (table.toLowerCase().startsWith(prefix) && !already.has(qualified)) {
         // The table first, since that is what you were looking for.
-        displayText: `${table} — ${schema}`,
-        className: 'CodeMirror-hint-table',
-      });
+        matched.push(candidate(qualified, table, schema, 'table'));
+      }
+    } else if (qualified.toLowerCase().startsWith(prefix)) {
+      // An unqualified entry is a CTE. The addon offers it too, as a bare string
+      // with nothing to say about it, so this one *replaces* that rather than
+      // stepping aside for it — otherwise the row that wins is the one that does
+      // not mention it is a CTE at all.
+      matched.push(candidate(qualified, qualified, 'CTE', 'table'));
+      shadowed.add(qualified);
+    }
+
+    // Columns only from the tables this statement actually reads. Offering all 285
+    // columns of a database when the query names two tables is a haystack, not a
+    // hint. With nothing named yet there is nothing to narrow by, so everything is
+    // offered — which is the state you are in while typing the select list first.
+    if (inScope && !inScope(qualified)) continue;
+    for (const name of names ?? []) {
+      if (!name.toLowerCase().startsWith(prefix)) continue;
+      if (!columns.has(name)) columns.set(name, []);
+      columns.get(name).push(qualified);
     }
   }
 
   const schemaItems = [...schemas]
     .filter((schema) => !already.has(schema))
     .sort()
-    .map((schema) => ({
-      text: schema,
-      displayText: `${schema} — schema`,
-      className: 'CodeMirror-hint-table',
-    }));
+    .map((schema) => candidate(schema, schema, 'schema', 'table'));
 
   matched.sort((a, b) => a.text.localeCompare(b.text));
-  return [...schemaItems, ...matched];
+
+  // One entry per column *name*, not per occurrence: `id` in forty tables is one
+  // completion and forty lines of noise.
+  const columnItems = [...columns.entries()]
+    .sort(([a], [b]) => a.localeCompare(b))
+    .slice(0, MAX_COLUMNS)
+    .map(([name, holders]) =>
+      candidate(
+        name,
+        name,
+        holders.length === 1 ? holders[0] : `${holders.length} tables`,
+        'column',
+      ),
+    )
+    .filter((item) => !already.has(item.text));
+
+  return { tables: [...schemaItems, ...matched], columns: columnItems, shadowed };
 }
 
 /**
@@ -103,13 +215,28 @@ function quotingSqlHint(cm, options) {
   const target = targetCompletions(cm, options.sources ?? []);
   if (target) return target;
 
-  const result = CodeMirror.hint.sql(cm, options);
+  // CTEs are read from the buffer *here* rather than kept in step on every
+  // keystroke: the parse is cheap, it only matters while the list is open, and
+  // nothing can go stale if there is nothing to invalidate.
+  const schema = options.tables ?? {};
+  const withCtes = { ...schema, ...cteColumns(cm.getValue(), schema) };
+
+  // The addon resolves `alias.` against its own `tables`, so it has to see the
+  // CTEs too or `c.` after `with c as (…)` offers nothing.
+  const result = CodeMirror.hint.sql(cm, { ...options, tables: withCtes });
   if (!result?.list) return result;
 
   const dialect = dialectForMime(cm.getOption('mode'));
   const reserved = CodeMirror.resolveMode(cm.getOption('mode'))?.keywords;
 
-  result.list = [...byBareName(cm, result, options.tables ?? {}), ...result.list];
+  const extra = byBareName(cm, result, withCtes, columnScope(cm, withCtes));
+  const kept = result.list.filter(
+    (item) => !extra.shadowed.has(typeof item === 'string' ? item : item.text),
+  );
+  // Both are always offered; the clause decides which the first Enter accepts.
+  result.list = wantsTable(cm)
+    ? [...extra.tables, ...extra.columns, ...kept]
+    : [...extra.columns, ...extra.tables, ...kept];
 
   result.list = result.list.map((item) => {
     const bare = typeof item === 'string' ? item : item.text;

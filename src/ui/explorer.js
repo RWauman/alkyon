@@ -17,8 +17,21 @@ import { quoteFor } from './dialect.js';
  * @param {() => void} [spec.onSelect]
  * @param {() => void} [spec.onActivate]  double click
  * @param {() => void} [spec.onRemove]    shows a delete affordance
+ * @param {(reload: () => Promise<void>) => void} [spec.onRefresh]  shows a reload
+ *        affordance, and is handed the way to rebuild this row's children
  */
-function makeNode({ label, badge, pk, dot, scope, load, onSelect, onActivate, onRemove }) {
+function makeNode({
+  label,
+  badge,
+  pk,
+  dot,
+  scope,
+  load,
+  onSelect,
+  onActivate,
+  onRemove,
+  onRefresh,
+}) {
   const node = document.createElement('div');
   node.className = 'node';
   node.setAttribute('role', 'treeitem');
@@ -57,9 +70,73 @@ function makeNode({ label, badge, pk, dot, scope, load, onSelect, onActivate, on
     row.append(tag);
   }
 
-  if (onRemove) {
+  const children = document.createElement('div');
+  children.className = 'children';
+
+  node.append(row, children);
+
+  let loaded = false;
+
+  /** Fetch and show this row's children. */
+  const fill = async () => {
+    const pending = document.createElement('div');
+    pending.className = 'empty muted';
+    pending.textContent = 'loading…';
+    children.replaceChildren(pending);
+
+    try {
+      const built = await load();
+      if (built.length === 0) {
+        const empty = document.createElement('div');
+        empty.className = 'empty muted';
+        empty.textContent = 'empty';
+        children.replaceChildren(empty);
+      } else {
+        children.replaceChildren(...built);
+      }
+    } catch (e) {
+      // Let the row be retried: a server that was down may come back.
+      loaded = false;
+      const failed = document.createElement('div');
+      failed.className = 'failed';
+      failed.textContent = e.message;
+      children.replaceChildren(failed);
+    }
+  };
+
+  /**
+   * Throw away what was loaded. An open row is rebuilt at once, a closed one on
+   * its next expand — so refreshing a source you are not looking into costs a
+   * probe and nothing else.
+   */
+  const reload = async () => {
+    if (!load) return;
+    if (node.getAttribute('aria-expanded') === 'true') {
+      loaded = true;
+      await fill();
+    } else {
+      loaded = false;
+      children.replaceChildren();
+    }
+  };
+
+  if (onRefresh || onRemove) {
     const spacer = document.createElement('span');
     spacer.className = 'spacer';
+    row.append(spacer);
+  }
+  if (onRefresh) {
+    const again = document.createElement('button');
+    again.className = 'drop';
+    again.title = `Re-read ${label}`;
+    again.textContent = '↻';
+    again.addEventListener('click', (event) => {
+      event.stopPropagation();
+      onRefresh(reload);
+    });
+    row.append(again);
+  }
+  if (onRemove) {
     const drop = document.createElement('button');
     drop.className = 'drop';
     drop.title = `Remove ${label}`;
@@ -68,19 +145,13 @@ function makeNode({ label, badge, pk, dot, scope, load, onSelect, onActivate, on
       event.stopPropagation();
       onRemove();
     });
-    row.append(spacer, drop);
+    row.append(drop);
   }
-
-  const children = document.createElement('div');
-  children.className = 'children';
-
-  node.append(row, children);
 
   if (!load) {
     node.setAttribute('aria-expanded', 'false');
   } else {
     node.setAttribute('aria-expanded', 'false');
-    let loaded = false;
 
     const toggle = async () => {
       const open = node.getAttribute('aria-expanded') === 'true';
@@ -93,30 +164,7 @@ function makeNode({ label, badge, pk, dot, scope, load, onSelect, onActivate, on
       twisty.textContent = '▾';
       if (loaded) return;
       loaded = true;
-
-      const pending = document.createElement('div');
-      pending.className = 'empty muted';
-      pending.textContent = 'loading…';
-      children.replaceChildren(pending);
-
-      try {
-        const built = await load();
-        if (built.length === 0) {
-          const empty = document.createElement('div');
-          empty.className = 'empty muted';
-          empty.textContent = 'empty';
-          children.replaceChildren(empty);
-        } else {
-          children.replaceChildren(...built);
-        }
-      } catch (e) {
-        // Let the row be retried: a server that was down may come back.
-        loaded = false;
-        const failed = document.createElement('div');
-        failed.className = 'failed';
-        failed.textContent = e.message;
-        children.replaceChildren(failed);
-      }
+      await fill();
     };
 
     twisty.addEventListener('click', (event) => {
@@ -150,6 +198,8 @@ function makeNode({ label, badge, pk, dot, scope, load, onSelect, onActivate, on
  * @param {(source, db, tables) => void} hooks.onTables  autocomplete warm-up
  * @param {(source, db, table, columns) => void} hooks.onColumns
  * @param {(message: string, isError?: boolean) => void} hooks.onStatus
+ * @param {(spec: object) => Promise<boolean>} hooks.onConfirm  ask before removing
+ * @param {(source: object) => void} [hooks.onRefreshed]  one source was re-read
  */
 export function createExplorer(element, hooks) {
   const quote = (source, name) => quoteFor(source.dialect, name);
@@ -250,11 +300,28 @@ export function createExplorer(element, hooks) {
       // A folder source has no host to name, so it shows where it points. Only
       // the tail: the last couple of directories are what identify it.
       badge: source.path
-        ? `files · ${source.path.length > 30 ? `…${source.path.slice(-29)}` : source.path}`
+        ? `${source.kind}${source.options?.format ? ` ${source.options.format}` : ''} · ${
+            source.path.length > 28 ? `…${source.path.slice(-27)}` : source.path
+          }`
         : `${source.dialect} · ${source.host}:${source.port}`,
       onSelect: () => hooks.onSelectSource(source),
+      // Per source, so re-reading a folder you have just added files to does not
+      // mean re-probing every server in the sidebar.
+      onRefresh: async (reload) => {
+        await probe(source, dot);
+        await reload();
+        await hooks.onRefreshed?.(source);
+        hooks.onStatus(`re-read ${source.key}`);
+      },
       onRemove: async () => {
-        if (!confirm(`Remove ${source.key}? Its credential is deleted from the vault.`)) return;
+        const confirmed = await hooks.onConfirm({
+          title: `Remove ${source.key}?`,
+          detail:
+            source.auth_method === 'none'
+              ? 'The source is deleted from the registry. The files it points at are untouched.'
+              : 'The source is deleted from the registry and its credential from the vault.',
+        });
+        if (!confirmed) return;
         try {
           await api.removeSource(source.key);
           hooks.onStatus(`removed ${source.key}`);

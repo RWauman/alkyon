@@ -3,6 +3,7 @@ import { createBuffers } from './buffers.js';
 import { previewSql, quoteFor } from './dialect.js';
 import { createEditor } from './editor.js';
 import { createExplorer } from './explorer.js';
+import { createPanes } from './panes.js';
 import { canSaveInPlace, download, openFiles, pickSaveTarget, writeFile } from './files.js';
 import { ResultGrid } from './grid.js';
 import { findCrossSource, unresolvedHeads } from './qualified.js';
@@ -41,7 +42,12 @@ function detail(text) {
 
 // --------------------------------------------------------------- components
 
-const grid = new ResultGrid($('grid'));
+// The filter's count goes in the detail slot rather than in the status line: the
+// status line holds what the *query* did, which a filter has not changed.
+const grid = new ResultGrid($('grid'), (text) => {
+  if (text) detail(text);
+  else if (state.source) detail(`${state.source.key} · ${state.database ?? state.source.database}`);
+});
 
 const editor = createEditor($('editor-pane'), {
   onRun: run,
@@ -59,6 +65,10 @@ const editor = createEditor($('editor-pane'), {
 });
 
 const terminal = createTerminal($('terminal'), { onStatus: status });
+
+// Nothing outside the sidebar measures itself against it, so there is no resize
+// hook to pass: the sections only rearrange each other.
+const panes = createPanes($('explorer-pane'));
 
 // ------------------------------------------------------------------ buffers
 
@@ -394,6 +404,8 @@ addEventListener('keydown', (event) => {
   // Chrome allows a page to take Ctrl+K, unlike Ctrl+N or Ctrl+W.
   if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'k') {
     event.preventDefault();
+    // Focusing a box inside a folded section would do nothing visible.
+    panes.reveal('pane-search');
     search.focus();
   }
 });
@@ -409,6 +421,7 @@ const workspace = createWorkspace($('workspace'), {
     line.title = root ?? '';
     line.hidden = !root;
     $('close-folder').hidden = !root;
+    $('refresh-folder').hidden = !root;
   },
   onOpenFile: async (file) => {
     try {
@@ -470,6 +483,29 @@ folderForm.addEventListener('submit', async (event) => {
   }
 });
 
+/**
+ * Re-list the folder. The listing is taken once, when the folder opens, so a file
+ * created afterwards — by the terminal, by another editor, by `Save as` — was
+ * simply not there when we looked.
+ *
+ * Polled on demand rather than watched: a filesystem watcher means a second
+ * long-lived channel to the browser and a per-platform notifier, for a listing
+ * that costs one directory walk. `focus` is the moment that matters, because
+ * creating the file happened somewhere else.
+ */
+async function refreshFolder({ quiet = false } = {}) {
+  if (!workspace.root) return;
+  const before = workspace.count;
+  const state = await workspace.refresh();
+  if (quiet || !state) return;
+  status(`${state.files.length} .sql file(s)${
+    state.files.length === before ? '' : ` — was ${before}`}`);
+}
+
+$('refresh-folder').addEventListener('click', () => refreshFolder());
+// Coming back to the tab is exactly when the tree is most likely to be stale.
+addEventListener('focus', () => refreshFolder({ quiet: true }));
+
 $('start-open-folder').addEventListener('click', () => $('open-folder').click());
 $('start-new-query').addEventListener('click', () => buffers.open());
 $('start-add-source').addEventListener('click', () => $('add-source').click());
@@ -527,6 +563,19 @@ const explorer = createExplorer($('explorer'), {
   onColumns: (source, db, qualified, columns) => {
     if (source.key !== state.source?.key) return;
     editor.addColumns(qualified, columns.map((c) => c.name));
+  },
+  onConfirm: confirmAction,
+  // The server caches a schema per source and database, so re-reading the row has
+  // to invalidate that too — otherwise the tree shows the new file and
+  // autocompletion does not.
+  onRefreshed: (source) => {
+    if (source.key === state.source?.key) {
+      loadSchema({ refresh: true });
+      return;
+    }
+    // Not the active one: drop its cached snapshot so `Ctrl+K` and the next visit
+    // see the folder as it is now. Fire-and-forget — nothing is waiting for it.
+    api.schema(source.key, source.database, { refresh: true }).catch(() => {});
   },
 });
 
@@ -762,7 +811,7 @@ async function applyQualified(sql) {
     const source = state.sources.find((s) => s.key === key);
     // A folder or file source has one catalogue and no databases, so nothing
     // between it and the name it is holding.
-    return { database: source?.kind !== 'files' };
+    return { database: source?.kind !== 'folder' && source?.kind !== 'file' };
   });
   if (!found) return { sql };
 
@@ -782,9 +831,18 @@ async function applyQualified(sql) {
   return { sql: found.sql };
 }
 
-/** Rows per page, from the header picker. */
+/**
+ * Rows per page, from the header picker.
+ *
+ * *No limit* is one page big enough to hold anything, not a special case: the
+ * paging machinery then simply never reaches a second page, and nothing on the
+ * server allocates against the number. It is the escape hatch for the times you
+ * want the whole answer — and the reason it is not the default is measured, not
+ * cautious: 39.6M rows is 6.16 GB of JSON and the tab dies around 14M.
+ */
 function pageSize() {
-  return Number($('page-size').value);
+  const chosen = $('page-size').value;
+  return chosen === 'all' ? Number.MAX_SAFE_INTEGER : Number(chosen);
 }
 
 /**
@@ -1076,11 +1134,19 @@ function makeSplitter(handle, { property, axis, container, min = 120, max = 0.85
     handle.classList.add('dragging');
     handle.setPointerCapture(event.pointerId);
 
+    // Measured from the container's *content* box, not its border box: the
+    // panels sit inside `main`'s padding, so the pointer's distance from the
+    // outer edge overstates the pane's width by exactly that padding.
     const box = container.getBoundingClientRect();
+    const style = getComputedStyle(container);
+    const before = parseFloat(axis === 'x' ? style.paddingLeft : style.paddingTop) || 0;
+    const after = parseFloat(axis === 'x' ? style.paddingRight : style.paddingBottom) || 0;
+    const origin = (axis === 'x' ? box.left : box.top) + before;
+    const extent = (axis === 'x' ? box.width : box.height) - before - after;
 
     const move = (move_) => {
-      const size = axis === 'x' ? move_.clientX - box.left : move_.clientY - box.top;
-      const limit = (axis === 'x' ? box.width : box.height) * max;
+      const size = (axis === 'x' ? move_.clientX : move_.clientY) - origin;
+      const limit = extent * max;
       document.body.style.setProperty(
         property,
         `${Math.round(Math.min(Math.max(size, min), limit))}px`,
@@ -1112,6 +1178,46 @@ makeSplitter($('split-editor'), {
   min: 60,
 });
 
+// ---------------------------------------------------------------- confirming
+
+/**
+ * Ask before something that cannot be undone. Resolves true when confirmed.
+ *
+ * Its own dialogue rather than the browser's `confirm`: Chrome offers to silence
+ * those for the rest of the session, and a silenced confirmation is a source
+ * deleted without being asked.
+ */
+function confirmAction({ title, detail = '', action = 'Remove' }) {
+  const box = $('confirm-dialog');
+  const ok = $('confirm-ok');
+  const cancel = $('confirm-cancel');
+  $('confirm-title').textContent = title;
+  $('confirm-detail').textContent = detail;
+  $('confirm-detail').hidden = !detail;
+  ok.textContent = action;
+
+  return new Promise((resolve) => {
+    // The buttons answer, rather than the dialogue's `close` event: that event is
+    // not delivered in every engine this runs in, and a confirmation that never
+    // resolves is a button that does nothing.
+    const finish = (answer) => {
+      ok.removeEventListener('click', yes);
+      cancel.removeEventListener('click', no);
+      box.removeEventListener('cancel', no);
+      if (box.open) box.close();
+      resolve(answer);
+    };
+    const yes = () => finish(true);
+    // Escape raises `cancel`, and closing without answering means no.
+    const no = () => finish(false);
+
+    ok.addEventListener('click', yes);
+    cancel.addEventListener('click', no);
+    box.addEventListener('cancel', no);
+    box.showModal();
+  });
+}
+
 // ------------------------------------------------------------ source dialog
 
 const dialog = $('source-dialog');
@@ -1130,13 +1236,22 @@ function syncDialogFields() {
   const method = form.elements.method.value;
   // A folder or file is reached through the filesystem: no host, no port, no
   // encryption and nothing to authenticate.
-  const server = kind !== 'files';
+  const server = kind !== 'folder' && kind !== 'file';
 
   for (const element of form.querySelectorAll('.server-only')) element.hidden = !server;
   for (const element of form.querySelectorAll('.files-only')) element.hidden = server;
+  for (const element of form.querySelectorAll('.folder-only')) element.hidden = kind !== 'folder';
+  for (const element of form.querySelectorAll('.file-only')) element.hidden = kind !== 'file';
   for (const label of form.querySelectorAll('.mssql-only')) {
     label.hidden = kind !== 'ms_sql';
   }
+
+  // Only the chosen type's options. A delimiter means nothing to a parquet file,
+  // and parquet and JSON have nothing to ask about at all — so until a type is
+  // chosen, and for the types with no options, there is nothing to show.
+  const format = server ? '' : form.elements.format.value;
+  for (const element of form.querySelectorAll('.csv-only')) element.hidden = format !== 'csv';
+  for (const element of form.querySelectorAll('.excel-only')) element.hidden = format !== 'excel';
   // Say what leaving it empty will actually connect to.
   $('database-field').placeholder = `optional — defaults to ${DEFAULT_DATABASE[kind] ?? 'the engine default'}`;
   for (const label of form.querySelectorAll('[class^="auth-"]')) {
@@ -1151,7 +1266,71 @@ function syncDialogFields() {
   }
 }
 
-form.elements.kind.addEventListener('change', syncDialogFields);
+/**
+ * Fill the Files list from the folder itself.
+ *
+ * A folder source reads everything of its type, minus what is ticked here, and the
+ * only place that choice can be made honestly is against what the folder actually
+ * holds — typing a relative path from memory is how you exclude nothing at all.
+ */
+async function refreshFileList() {
+  const list = $('folder-files');
+  const empty = $('folder-files-empty');
+  // Ticks survive a re-listing: changing the type should not silently re-include
+  // a file that is still there.
+  const excluded = new Set(readExclusions());
+  for (const label of [...list.querySelectorAll('label')]) label.remove();
+
+  const path = $('folder-path').value.trim();
+  const format = form.elements.format.value;
+  if (form.elements.kind.value !== 'folder' || !path || !format) {
+    empty.textContent = 'Give a path and a type to list what is in the folder.';
+    empty.hidden = false;
+    return;
+  }
+
+  let files;
+  try {
+    ({ files } = await api.dataFiles(path, format));
+  } catch (e) {
+    // A path that is not there yet is the ordinary state while one is being
+    // typed, so this is not an error in the note — the Test button reports those.
+    empty.textContent = e.message;
+    empty.hidden = false;
+    return;
+  }
+
+  empty.hidden = files.length > 0;
+  empty.textContent = `No ${format} file under this path.`;
+  for (const file of files) {
+    const label = document.createElement('label');
+    label.className = 'file';
+    const box = document.createElement('input');
+    box.type = 'checkbox';
+    box.name = 'exclude';
+    box.value = file;
+    box.checked = excluded.has(file);
+    const text = document.createElement('span');
+    text.textContent = file;
+    label.append(box, text);
+    list.append(label);
+  }
+}
+
+/** The files ticked for exclusion. */
+function readExclusions() {
+  return [...form.querySelectorAll('input[name="exclude"]:checked')].map((box) => box.value);
+}
+
+form.elements.kind.addEventListener('change', () => {
+  syncDialogFields();
+  refreshFileList();
+});
+form.elements.format.addEventListener('change', () => {
+  syncDialogFields();
+  refreshFileList();
+});
+$('folder-path').addEventListener('change', refreshFileList);
 form.elements.method.addEventListener('change', syncDialogFields);
 
 $('add-source').addEventListener('click', () => {
@@ -1164,6 +1343,10 @@ $('add-source').addEventListener('click', () => {
     ? 'This folder — .alkyon/sources.json, committable'
     : 'This folder — needs an open folder';
   syncDialogFields();
+  // `form.reset()` restores the values, but the last folder's file list is still
+  // in the DOM.
+  for (const label of [...$('folder-files').querySelectorAll('label')]) label.remove();
+  refreshFileList();
   dialog.showModal();
 });
 
@@ -1177,19 +1360,70 @@ function note(text, kind) {
   element.hidden = !text;
 }
 
+/**
+ * The format half of a folder or file source.
+ *
+ * Every empty box is left out entirely rather than sent as `""`: absent means
+ * "let DuckDB work it out", and its sniffer is better at that than a blank string
+ * would be at anything.
+ */
+function readFileOptions(data) {
+  const options = {};
+  const format = data.get('format');
+  if (format) options.format = format;
+
+  // Everything of that type is read unless it was ticked to be left out. Only
+  // ticked boxes reach the form data, so this is exactly the exclusion list.
+  const excluded = data.getAll('exclude');
+  if (excluded.length) options.exclude = excluded;
+
+  const csv = {};
+  const text = (field, name) => {
+    const value = (data.get(field) ?? '').trim();
+    if (value) csv[name] = value;
+  };
+  text('csv-delimiter', 'delimiter');
+  text('csv-quote', 'quote');
+  text('csv-escape', 'escape');
+  text('csv-decimal', 'decimal');
+  text('csv-encoding', 'encoding');
+  text('csv-null', 'null_string');
+  text('csv-date', 'date_format');
+  text('csv-timestamp', 'timestamp_format');
+
+  const header = data.get('csv-header');
+  if (header) csv.header = header === 'true';
+  if (data.get('csv-all-varchar')) csv.all_varchar = true;
+  if (data.get('csv-ignore-errors')) csv.ignore_errors = true;
+
+  const skip = data.get('csv-skip');
+  if (skip) csv.skip = Number(skip);
+  const sample = data.get('csv-sample');
+  if (sample) csv.sample_size = Number(sample);
+
+  if (Object.keys(csv).length) options.csv = csv;
+
+  const sheet = (data.get('excel-sheet') ?? '').trim();
+  if (sheet) options.excel = { sheet };
+
+  return options;
+}
+
 /** Read the form into the `POST /sources` shape. */
 function readForm() {
   const data = new FormData(form);
   const kind = data.get('kind');
 
-  // A folder source sends a path and nothing else; the fields the form still
-  // holds for the other engines would only be noise on the wire.
-  if (kind === 'files') {
+  // A folder or file source sends a path and its format options, and nothing
+  // else; the fields the form still holds for the other engines would only be
+  // noise on the wire.
+  if (kind === 'folder' || kind === 'file') {
     return {
       id: data.get('id').trim(),
       scope: data.get('scope'),
       kind,
-      path: data.get('path').trim(),
+      path: (kind === 'file' ? data.get('file-path') : data.get('path')).trim(),
+      options: readFileOptions(data),
       auth: { method: 'none' },
     };
   }
@@ -1239,18 +1473,31 @@ async function withFeedback(button, busyLabel, action) {
   }
 }
 
+/**
+ * What the form cannot say with `required`.
+ *
+ * A field the engine does not use is hidden, and a hidden required field makes the
+ * form unsubmittable outright — so the fields that matter are checked here.
+ * Returns the complaint, or nothing when there is none.
+ */
+function complaint(config) {
+  if (config.kind !== 'folder' && config.kind !== 'file') {
+    return config.host ? null : 'give a host';
+  }
+  if (!config.options.format) return 'choose the file type first';
+  return config.path ? null : 'give a path';
+}
+
 $('source-test').addEventListener('click', () => {
   const config = readForm();
-  // Neither field can carry `required`: whichever one the engine does not use is
-  // hidden, and a hidden required field makes the form unsubmittable outright.
-  // So the one that matters is checked here.
-  if (config.kind === 'files' && !config.path) return note('give a path to test', 'bad');
-  if (config.kind !== 'files' && !config.host) return note('give a host to test', 'bad');
+  const files = config.kind === 'folder' || config.kind === 'file';
+  const wrong = complaint(config);
+  if (wrong) return note(`${wrong} to test`, 'bad');
 
   withFeedback($('source-test'), 'Testing…', async () => {
     const result = await api.testConnection(config);
     note(
-      config.kind === 'files'
+      files
         ? `Readable in ${result.latency_ms} ms.`
         : `Connected to ${result.database} in ${result.latency_ms} ms.`,
       'good',
@@ -1261,6 +1508,8 @@ $('source-test').addEventListener('click', () => {
 form.addEventListener('submit', (event) => {
   event.preventDefault();
   const config = readForm();
+  const wrong = complaint(config);
+  if (wrong) return note(wrong, 'bad');
   withFeedback($('source-save'), 'Connecting…', async () => {
     const summary = await api.addSource(config);
     dialog.close();

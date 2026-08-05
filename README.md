@@ -9,6 +9,8 @@
 
 <p align="center">
   <a href="GUIDE.md"><strong>User guide →</strong></a>
+  &nbsp;·&nbsp;
+  <a href="CHANGELOG.md"><strong>Changelog →</strong></a>
 </p>
 
 ἀλκυών — the Greek word for the kingfisher, the bird that dives through opaque water and
@@ -45,10 +47,11 @@ MySQL. No translation layer and no lowest common denominator, so DDL, views, sto
 procedures and vendor-specific syntax all behave exactly as the server expects. Nothing sits
 between your text and the engine.
 
-A **folder source** is the same idea pointed at a disk: every `.csv`, `.parquet` or `.json`
-under a path becomes a table, subdirectories become schemas, and you write DuckDB SQL against
-them. It gets the explorer, the autocompletion and the search like any other source — and it
-can read nothing outside the path you gave it.
+A **folder source** is the same idea pointed at a disk: you say which type it holds, each file
+at the root becomes a table and each subdirectory becomes one table over its files — unioned,
+with a `source_file` column — and you write DuckDB SQL against them. It gets the explorer, the
+autocompletion and the search like any other source, and it can read nothing outside the path
+you gave it.
 
 **Federated.** A buffer that starts with `-- @duckdb` runs in DuckDB, over tables you pull in
 with `-- @import` and files in the open folder — join two servers against a spreadsheet, or
@@ -114,8 +117,11 @@ and cancellation, the keychain, the schema explorer and cross-schema search, tab
 save, the open folder, the PTY terminal, and DuckDB federation over Postgres, SQL Server,
 MySQL, CSV and Parquet. Folder and file sources are covered by tests that need no server.
 
-Written but not yet exercised: Excel import (calamine), Windows integrated authentication,
-and Entra ID token auth — the last two need servers this has not been run against.
+Excel is read in-process by calamine, as a folder or file source and through `-- @excel`,
+against workbooks committed under `tests/fixtures/`.
+
+Written but not yet exercised: Windows integrated authentication and Entra ID token auth —
+both need servers this has not been run against.
 
 Not built yet:
 
@@ -127,8 +133,6 @@ Not built yet:
   import in its native dialect.
 - **Blob-storage sources.** Local folders and files are in; anything over the network needs
   DuckDB's `httpfs`, which would have to be fetched at runtime.
-- **Excel as a source.** A folder source skips `.xlsx`; spreadsheets go through `-- @excel`
-  in a federated buffer.
 
 Deliberately out of scope: in-grid editing, migration management, multi-user auth. Oracle is
 absent but the `Connector` trait is ready for it.

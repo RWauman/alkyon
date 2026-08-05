@@ -176,6 +176,17 @@ pub fn strip_bom(mut text: String) -> String {
     text
 }
 
+/// Whether a path needs something to be relative *to*.
+///
+/// `~` counts as absolute: it names the home directory, which is not relative to
+/// anything the caller has to supply.
+pub fn is_relative(path: &str) -> bool {
+    if path.starts_with('~') {
+        return false;
+    }
+    !Path::new(path).is_absolute()
+}
+
 /// Turn a path a person typed into one the OS agrees exists: `~` expanded,
 /// symlinks followed, and readable as a plain path.
 ///

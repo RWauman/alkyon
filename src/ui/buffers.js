@@ -5,6 +5,22 @@
 // remembers which source and database it was last run against, so switching tabs
 // switches target the way SSMS and DataGrip do.
 
+/**
+ * `items` with the one at `from` moved so that it sits **before** `to`.
+ *
+ * `to` indexes the list as it is *now*, before the move — which is what a drop
+ * target naturally gives you — so removing the dragged item first shifts every
+ * later index down by one. Getting that wrong is an off-by-one that only shows up
+ * when you drag rightwards, which is why it is a function with tests rather than
+ * two lines inside an event handler.
+ */
+export function reorder(items, from, to) {
+  const next = [...items];
+  const [moving] = next.splice(from, 1);
+  next.splice(to > from ? to - 1 : to, 0, moving);
+  return next;
+}
+
 export function createBuffers(bar, { onActivate, onDirtyChange }) {
   /** @type {Array<{id:number,name:string,doc:any,handle:any,generation:number,target:object|null}>} */
   const buffers = [];
@@ -12,6 +28,73 @@ export function createBuffers(bar, { onActivate, onDirtyChange }) {
   let sequence = 0;
 
   const isDirty = (buffer) => !buffer.doc.isClean(buffer.generation);
+
+  /** The tab being dragged, while it is being dragged. */
+  let dragging = null;
+
+  /** Clear the insertion marks, wherever they ended up. */
+  function unmark() {
+    for (const marked of bar.querySelectorAll('.drop-before, .drop-after')) {
+      marked.classList.remove('drop-before', 'drop-after');
+    }
+  }
+
+  /**
+   * Reordering by drag, over the native drag API rather than pointer events.
+   *
+   * The native one is what gives the drag image, the cursor and the escape-to-cancel
+   * for free; hand-rolling it with pointer capture would mean reimplementing all
+   * three. The price is `dataTransfer.setData`, which Firefox requires before it
+   * will start a drag at all.
+   */
+  function makeDraggable(tab, buffer) {
+    tab.draggable = true;
+
+    tab.addEventListener('dragstart', (event) => {
+      dragging = buffer;
+      event.dataTransfer.effectAllowed = 'move';
+      event.dataTransfer.setData('text/plain', buffer.name);
+    });
+
+    tab.addEventListener('dragover', (event) => {
+      if (!dragging || dragging === buffer) return;
+      // Nothing is dropped anywhere unless the default is prevented.
+      event.preventDefault();
+      event.stopPropagation();
+      const box = tab.getBoundingClientRect();
+      const after = event.clientX > box.left + box.width / 2;
+      unmark();
+      tab.classList.add(after ? 'drop-after' : 'drop-before');
+    });
+
+    tab.addEventListener('drop', (event) => {
+      if (!dragging || dragging === buffer) return;
+      event.preventDefault();
+      event.stopPropagation();
+      const box = tab.getBoundingClientRect();
+      const at = buffers.indexOf(buffer) + (event.clientX > box.left + box.width / 2 ? 1 : 0);
+      api.move(dragging, at);
+    });
+
+    tab.addEventListener('dragend', () => {
+      dragging = null;
+      unmark();
+    });
+  }
+
+  // Dropping past the last tab moves it to the end — the strip is a target too,
+  // otherwise the only way to move a tab rightmost is to aim at half a tab.
+  bar.addEventListener('dragover', (event) => {
+    if (!dragging) return;
+    event.preventDefault();
+    unmark();
+    bar.lastElementChild?.classList.add('drop-after');
+  });
+  bar.addEventListener('drop', (event) => {
+    if (!dragging) return;
+    event.preventDefault();
+    api.move(dragging, buffers.length);
+  });
 
   function render() {
     bar.replaceChildren(
@@ -53,6 +136,7 @@ export function createBuffers(bar, { onActivate, onDirtyChange }) {
         tab.append(close);
 
         tab.addEventListener('click', () => api.activate(buffer));
+        makeDraggable(tab, buffer);
         return tab;
       }),
     );
@@ -122,6 +206,18 @@ export function createBuffers(bar, { onActivate, onDirtyChange }) {
       buffer.generation = buffer.doc.changeGeneration();
       render();
       return buffer;
+    },
+
+    /** Put `buffer` before whatever is at `at` today. Used by the tab drag. */
+    move(buffer, at) {
+      const from = buffers.indexOf(buffer);
+      if (from === -1) return;
+      const next = reorder(buffers, from, at);
+      // In place: `all` hands this array out and app.js holds on to it.
+      buffers.splice(0, buffers.length, ...next);
+      dragging = null;
+      unmark();
+      render();
     },
 
     activate(buffer) {
