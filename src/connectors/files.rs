@@ -587,6 +587,20 @@ pub struct FilesConnection {
 }
 
 impl FilesConnection {
+    /// Read `root` as a folder of data files.
+    ///
+    /// For the Azure source, which mirrors a remote folder into a local one and
+    /// then is a folder source in every respect that matters. Local folder
+    /// sources come through [`FilesConnector::connect`], which has a path from a
+    /// person to check first.
+    pub(crate) fn over(root: PathBuf, options: FileOptions) -> Self {
+        FilesConnection {
+            root,
+            single: false,
+            options,
+        }
+    }
+
     /// A single file is granted as a file, not as its directory — pointing a
     /// source at one spreadsheet should not hand over everything beside it.
     fn sandbox(&self) -> Sandbox {
@@ -1009,6 +1023,28 @@ mod tests {
             ],
             "node_modules should not be indexed, and .md is not a data file"
         );
+    }
+
+    /// The Azure source mirrors a remote folder and then hands it to
+    /// [`FilesConnection::over`], so a mirror has to become the same tables a
+    /// local folder of the same shape would.
+    #[test]
+    fn a_mirrored_folder_reads_as_the_folder_it_mirrors() {
+        let dir = fixture();
+        let mirrored = FilesConnection::over(dir.path().to_path_buf(), csv());
+
+        let found: Vec<(String, usize, bool)> = mirrored
+            .sets()
+            .iter()
+            .map(|set| (set.name.clone(), set.files.len(), set.tagged))
+            .collect();
+        assert_eq!(
+            found,
+            [("customers".to_owned(), 1, false), ("sales".to_owned(), 2, true)]
+        );
+        // A folder, never a single file: the sandbox has to grant the directory,
+        // or the union across `sales` could not be read.
+        assert!(!mirrored.single);
     }
 
     /// A root file and a subdirectory of the same name both survive.

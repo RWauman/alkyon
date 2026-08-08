@@ -29,8 +29,19 @@ rust-embed = "8"
 mime_guess = "2"
 
 chrono = { version = "0.4", default-features = false, features = ["std", "serde"] }
-uuid = { version = "1", features = ["serde"] }
+# `v4` is what mints the PKCE verifier and the sign-in tickets, so the random
+# bytes come from the crate already here rather than from a second RNG.
+uuid = { version = "1", features = ["serde", "v4"] }
 rust_decimal = "1"
+
+# Entra sign-in and the Azure storage REST API. `rustls-tls` rather than the
+# platform TLS: the rest of the binary already speaks rustls, and webpki roots
+# keep one less thing depending on how the host is configured.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+# PKCE: the challenge is base64url(sha256(verifier)), and there is no lighter way
+# to say that.
+sha2 = "0.10"
+base64 = "0.22"
 
 sqlx = { version = "0.8", default-features = false, features = [
     "runtime-tokio",

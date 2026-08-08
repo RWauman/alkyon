@@ -1,4 +1,4 @@
-//! The open folder: which directory the `.sql` tree, the file API and the
+//! The open folder: which directory the file tree, the file API and the
 //! terminal's working directory all refer to.
 //!
 //! Deliberately server-side. The browser's `showDirectoryPicker()` hands back a
@@ -11,10 +11,12 @@ use std::path::{Component, Path, PathBuf};
 use serde::Serialize;
 
 use crate::error::{Error, Result};
+use crate::model::FileFormat;
 
-/// Only `.sql` files are listed, read or written. The workspace API is not a
+/// Only `.sql` files are read or written. The workspace API is not a
 /// general-purpose file primitive — that matters as soon as `ALKYON_BIND` is
-/// pointed at anything but loopback.
+/// pointed at anything but loopback. Data files are *listed* so the sidebar can
+/// offer them as a source, and that is all: their bytes never go through here.
 const EXTENSION: &str = "sql";
 
 /// Directories never worth walking in a SQL project. Shared with folder sources,
@@ -42,9 +44,14 @@ pub struct Entry {
     pub path: String,
     pub name: String,
     pub bytes: u64,
+    /// The data format the extension implies, `None` for a `.sql` file. What
+    /// tells the sidebar which rows open in the editor and which ones are data.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub format: Option<FileFormat>,
 }
 
-/// Every `.sql` file under `root`, shallowest first then alphabetical.
+/// Every file under `root` that alkyon has something to do with — `.sql` to edit,
+/// and anything a source could read — shallowest first then alphabetical.
 ///
 /// Truncated rather than unbounded: `truncated` is true when a real project would
 /// have flooded the sidebar, and the UI says so instead of pretending the list is
@@ -93,11 +100,15 @@ fn walk(
                 continue;
             }
             walk(root, &path, depth + 1, entries, truncated)?;
-        } else if kind.is_file()
-            && path
-                .extension()
-                .is_some_and(|e| e.eq_ignore_ascii_case(EXTENSION))
-        {
+        } else if kind.is_file() {
+            let Some(extension) = path.extension().map(|e| e.to_string_lossy().into_owned()) else {
+                continue;
+            };
+            let sql = extension.eq_ignore_ascii_case(EXTENSION);
+            let format = FileFormat::from_extension(&extension);
+            if !sql && format.is_none() {
+                continue;
+            }
             let Ok(relative) = path.strip_prefix(root) else {
                 continue;
             };
@@ -105,6 +116,9 @@ fn walk(
                 path: relative.to_string_lossy().replace('\\', "/"),
                 name,
                 bytes: child.metadata().map(|m| m.len()).unwrap_or(0),
+                // `.sql` wins where the two overlap: it never happens today, but a
+                // SQL file is something to edit before it is something to read.
+                format: if sql { None } else { format },
             });
         }
     }
@@ -261,7 +275,9 @@ mod tests {
         std::fs::create_dir_all(root.join(".git")).unwrap();
         std::fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
         std::fs::write(root.join("top.sql"), "select 1").unwrap();
-        std::fs::write(root.join("notes.txt"), "ignored").unwrap();
+        std::fs::write(root.join("customers.csv"), "id\n1\n").unwrap();
+        std::fs::write(root.join("readme.md"), "ignored").unwrap();
+        std::fs::write(root.join("reports/sales.parquet"), "").unwrap();
         std::fs::write(root.join("reports/a.sql"), "select 2").unwrap();
         std::fs::write(root.join("reports/monthly/b.SQL"), "select 3").unwrap();
         std::fs::write(root.join(".git/hook.sql"), "hidden").unwrap();
@@ -270,13 +286,41 @@ mod tests {
     }
 
     #[test]
-    fn lists_only_sql_and_skips_noise() {
+    fn lists_what_alkyon_reads_and_skips_the_rest() {
         let dir = fixture();
         let (entries, truncated) = list(dir.path()).unwrap();
         let paths: Vec<&str> = entries.iter().map(|e| e.path.as_str()).collect();
 
-        assert_eq!(paths, ["top.sql", "reports/a.sql", "reports/monthly/b.SQL"]);
+        assert_eq!(
+            paths,
+            [
+                "customers.csv",
+                "top.sql",
+                "reports/a.sql",
+                "reports/sales.parquet",
+                "reports/monthly/b.SQL",
+            ]
+        );
+        // `readme.md` is nothing to alkyon; the vendored and hidden trees are noise.
         assert!(!truncated);
+    }
+
+    #[test]
+    fn a_data_file_carries_the_format_it_would_be_read_as() {
+        let dir = fixture();
+        let (entries, _) = list(dir.path()).unwrap();
+        let format = |path: &str| {
+            entries
+                .iter()
+                .find(|e| e.path == path)
+                .unwrap_or_else(|| panic!("{path} was not listed"))
+                .format
+        };
+
+        assert_eq!(format("customers.csv"), Some(FileFormat::Csv));
+        assert_eq!(format("reports/sales.parquet"), Some(FileFormat::Parquet));
+        // A `.sql` file is one to edit, not one to read as data.
+        assert_eq!(format("top.sql"), None);
     }
 
     #[test]
@@ -305,8 +349,10 @@ mod tests {
     #[test]
     fn refuses_anything_but_sql() {
         let dir = fixture();
-        assert!(resolve(dir.path(), "notes.txt", true).is_err());
+        assert!(resolve(dir.path(), "readme.md", true).is_err());
         assert!(resolve(dir.path(), "top", true).is_err());
+        // Listed in the sidebar, still not readable through the file API.
+        assert!(resolve(dir.path(), "customers.csv", true).is_err());
     }
 
     #[test]

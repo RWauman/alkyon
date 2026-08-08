@@ -1,5 +1,6 @@
 pub mod api;
 pub mod assets;
+pub mod azure;
 pub mod connectors;
 pub mod error;
 pub mod federation;

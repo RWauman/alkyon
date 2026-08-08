@@ -34,6 +34,62 @@ no binary yet.
 - `GET /files?path=&format=` lists what a folder holds, which is what fills the
   dialogue's list.
 
+### Azure
+
+- **Sign in to Microsoft Entra from the dialogue.** *Sign in…* opens the browser,
+  takes the redirect on a loopback port, and comes back with the account named —
+  authorization code with PKCE, no client secret, nothing pasted. **Device code**
+  is the same sign-in for when the browser is somewhere else, which is what makes
+  it work under Docker.
+- **What is kept is the refresh token**, in the keychain, and an access token is
+  minted from it when a connection opens. A signed-in source keeps working past
+  the hour an access token lasts — the whole point over pasting one in. Rotated
+  refresh tokens replace the old one, and an expired sign-in says so instead of
+  failing as a connection error.
+- **Tenant and application id are configurable**, defaulting to `organizations`
+  and Azure CLI's public client so that signing in works before anyone has
+  registered anything.
+- **The page never holds a token.** The sign-in finishes server-side and the
+  dialogue quotes a one-use ticket; the tokens go straight to the keychain.
+- **Azure storage is a source**: blob containers, ADLS Gen2 filesystems and Fabric
+  OneLake, which are one API under three names. It reads as a folder source in
+  every respect — catalogue, `public`, a table per root file, a subdirectory
+  unioned with `source_file`, spreadsheets per sheet, `@import`.
+- **It syncs rather than querying remotely**, because the sandboxed DuckDB has no
+  network access and can load no extension. Files are mirrored locally, kept
+  between runs, and re-fetched only when their ETag changes; there is no predicate
+  pushdown, and the guide says so plainly.
+- **Entra, Windows integrated and pasted tokens are no longer offered for
+  PostgreSQL and MySQL**, whose connectors have only ever accepted a password.
+- **A routing token is followed.** Azure SQL and Fabric answer the login by
+  pointing at the node that actually holds the database — for a Fabric endpoint,
+  every time — and that arrived as *Server requested a connection to an
+  alternative address*. The routed name is split on its backslash, as Microsoft's
+  own Go driver does: the host is dialled on the port the token carries, and the
+  instance is dropped rather than sent to a SQL Browser that is not there. One
+  redirect, never a loop.
+- **A hostname in *Named instance* is refused with a sentence saying where it
+  belongs.** Naming an instance sends the connection to the SQL Browser on UDP
+  1434, which no cloud endpoint runs, so pasting a Fabric endpoint there produced
+  a browser timeout accusing a host that answers perfectly well.
+
+### What does not work
+
+- **A Fabric SQL endpoint still cannot be connected to**, and the guide has a
+  section saying why. The sign-in, the token and the first login all succeed;
+  the login on the node Fabric routes to does not. `tiberius` takes one field
+  for both the TLS name and the login name, and after a Fabric redirect those
+  have to differ — host for the certificate, host *and* instance for the login.
+  Azure SQL is unaffected: its redirects carry no instance. Until this is
+  settled, the same lakehouse is readable through an Azure storage source over
+  OneLake.
+- **A Delta table is read as a plain folder of parquet.** The `_delta_log` is
+  ignored, so a lakehouse's `Tables/` is right only for append-only tables and
+  wrong after an update or a delete. `Files/` is unaffected.
+- **The Azure storage path has not been run end to end** against a real account
+  — the parts are tested and the error paths were exercised against the live
+  service, but no query has yet come back from a mirrored blob.
+
 ### The result grid
 
 - **A filter per column.** Hover a header and click the **▾**: plain text matches
@@ -68,6 +124,19 @@ no binary yet.
   which Chrome offers to silence for the rest of a session — and a silenced
   confirmation is a source deleted without being asked.
 - **Drag a tab to reorder it.**
+- **One click opens a `.sql` file**, or goes to the tab it is already in rather than
+  reading it again.
+- **The folder tree lists data files too** — everything a source can read, each with
+  its type — and clicking one, or a directory row, opens *Register a source* filled
+  in from what was clicked: kind, path, file type, an id, and the project registry,
+  since it came out of the open folder. A directory still folds away by its arrow.
+- **Tick which types the tree shows.** The button in the *Folder* head names them —
+  `all`, `sql`, `3 types` — and lists what the folder holds, with a count each. The
+  choice outlives the session, and it is the hidden types that are stored, so a
+  type the folder gains later shows up rather than being missing from a list
+  written before it existed.
+- **A dot where the cross would be** marks a tab with unsaved changes; the cross
+  comes back when you point at it.
 
 ### Elsewhere
 

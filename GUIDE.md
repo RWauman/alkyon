@@ -40,6 +40,7 @@ tries the connection without registering it.
 | MySQL / MariaDB | MySQL | 3306 |
 | **Folder of data files** | DuckDB | — |
 | **One data file** | DuckDB | — |
+| **Azure storage** — Blob, ADLS Gen2, OneLake | DuckDB | — |
 
 - **Database** is optional. Left empty you get `postgres`, `master` or
   `information_schema`.
@@ -48,9 +49,23 @@ tries the connection without registering it.
   failed.* Alkyon rewrites that one, because the server genuinely cannot tell
   "no such database" from "you may not open it", and the tail of the sentence is
   what everyone reads.
-- **Named instance** (SQL Server, on-prem): fill it in and leave **Port** empty.
-- **Entra ID**: paste a token from
-  `az account get-access-token --resource https://database.windows.net/`.
+- **Named instance** is for on-prem SQL Server only — a bare name like
+  `SQLEXPRESS`, resolved by the SQL Browser service on UDP 1434. Fill it in and
+  leave **Port** empty. **Never put a hostname here**: no cloud endpoint runs a
+  SQL Browser, so the connection times out against a host that answers perfectly
+  well. Alkyon refuses a hostname in that field and says where it belongs.
+- **A Fabric SQL analytics endpoint or warehouse does not connect yet.** See
+  [What does not work](#what-does-not-work-yet). Its data is reachable today
+  through an [Azure storage source](#azure-storage-as-a-source) over OneLake,
+  which does not use SQL Server's protocol at all.
+- **Microsoft Entra — sign in** opens your browser and takes the sign-in from
+  there; see [Sign in to Azure](#sign-in-to-azure). **Entra ID access token** is
+  still there for a token pasted from
+  `az account get-access-token --resource https://database.windows.net/`, which is
+  good for the hour Azure gives it.
+- **Entra, integrated and pasted tokens are SQL Server only.** The PostgreSQL and
+  MySQL connectors take a password and nothing else, so the dialogue no longer
+  offers a method those engines could only refuse.
 - **MySQL** has no schema layer — a schema *is* a database. The explorer shows the
   database twice for that reason, and identifiers are quoted with backticks,
   because `"orders"` in MySQL is the *text* `orders`, not the table.
@@ -199,6 +214,124 @@ Latin-1 with two lines of preamble. `.alkyon/sources.json` already registers the
 **project** sources, so opening this repository as a folder is enough to see them.
 Parquet needs `pyarrow` and Excel needs `openpyxl`; each is skipped with a message
 rather than failing the run.
+
+## Sign in to Azure
+
+**Microsoft Entra — sign in** is the authentication method for Azure SQL, and the
+only one for an Azure storage source. Press **Sign in…**: your browser opens at
+Microsoft's page, and when you come back the dialogue names the account. Then
+**Connect and save** as usual.
+
+**Device code** is the same sign-in for when the browser is not on the machine
+running alkyon — under Docker, or with `ALKYON_BIND` pointed elsewhere. It shows a
+code to type at `microsoft.com/devicelogin` from any device, and the sign-in lands
+back in the dialogue when you finish.
+
+**What is stored is the refresh token**, in the OS keychain like any other
+credential. An access token is minted from it when a connection opens and kept in
+memory until it expires, so a source keeps working past the hour Azure gives an
+access token — which is the whole difference from pasting one in. Entra rotates
+refresh tokens, and the new one replaces the old in the keychain.
+
+**Tenant** and **Application id** are for tenants that need them. Left empty they
+are `organizations` and Azure CLI's own application id — a public client with
+`http://localhost` registered and pre-consented everywhere, which is what makes
+signing in work before anyone has registered anything. A tenant that refuses
+unapproved clients needs its own registration: a **public client** with the
+redirect URI `http://localhost`, and delegated permissions for whichever of Azure
+SQL and Azure Storage you use.
+
+The page never holds a token. The sign-in finishes inside alkyon, which hands the
+dialogue a one-use *ticket*; the tokens go from the server's own memory to the
+keychain.
+
+**When a sign-in expires** — revoked, or invalidated by a password change — the
+source says so and asks you to sign in again rather than failing as a connection
+error.
+
+## Azure storage as a source
+
+One kind for three names: a **blob container**, an **ADLS Gen2 filesystem** and a
+**Fabric OneLake** workspace are the same API at three hostnames, and alkyon speaks
+the Data Lake Storage Gen2 endpoint to all of them.
+
+| Field | What goes in it |
+|---|---|
+| **Account** | `contoso`, `contoso.dfs.core.windows.net`, or `onelake.dfs.fabric.microsoft.com`. A blob hostname is accepted and quietly read as the DFS one — same data, and only that endpoint answers JSON |
+| **Container and folder** | the container or filesystem first, then how far in: `sales/exports/2026`, or `Workspace/Bronze.Lakehouse/Files/exports` for OneLake |
+| **File type** | as for a folder source, and for the same reason: a subdirectory's files are read as one table, and files of two formats cannot be |
+
+Once connected it **is** a folder source: same catalogue, same `public` schema, a
+file at the root is a table, a subdirectory is one table over its files with a
+`source_file` column, spreadsheets become one table per sheet, and it federates
+with `@import` like anything else.
+
+**It syncs, it does not query remotely.** Alkyon's DuckDB runs with
+`enable_external_access = false` and may load no extension — that is what keeps a
+folder source from reading the rest of the machine — so it cannot open an
+`abfss://` URL at all. The files are copied to this machine first and read locally.
+The consequences are worth knowing before you point one at a lake:
+
+- **No predicate pushdown.** A parquet file comes down whole the first time it is
+  seen; a `where` clause narrows it after it has arrived, not before it is sent.
+- **The copies are kept**, beside the registry rather than in a temp directory, and
+  re-fetched only when the service says the file's ETag changed. The download is
+  paid once per version of a file, not once per query.
+- **A file that disappears remotely stops being a table** on the next sync, so the
+  mirror never answers for something that is no longer there.
+- **The listing is re-read at most every 30 seconds**, so a query does not put an
+  internet round trip in front of every statement. A file dropped in the folder
+  shows up within that.
+- **Limits**: 200 files, and 4 GiB of new data in one sync. Past either it refuses
+  and says so rather than spending the afternoon. Point the source further in.
+
+**Permissions.** Reading needs the **Storage Blob Data Reader** role on the account
+or container. Owning the storage account is not the same thing — that grants
+management, not data — and it is the usual reason for a 403 that reads as a
+surprise.
+
+## What does not work yet
+
+Written down because finding it out twice is worse than reading it once.
+
+### Fabric SQL endpoints and warehouses
+
+**A Fabric SQL analytics endpoint or warehouse cannot be connected to over
+TDS.** Everything up to the last step works: the Entra sign-in, the token, the
+first login, and the routing token Fabric answers with. What fails is the login
+on the node it routes to.
+
+The cause is in the driver, not in Fabric. Fabric routes a login to the node
+holding the warehouse and names it `cluster.pbidedicated.windows.net\WORKSPACE-dw`.
+The two halves of that name do different jobs — the host is what the socket and
+the certificate are for, the whole name is what the login packet has to carry —
+and `tiberius` derives both from a single field. Sending the host alone gets the
+connection closed without a word; sending the whole name means the TLS handshake
+goes out with a placeholder name, and the login is refused with error 18456.
+Microsoft's own clients send host and full name separately, which is why SSMS
+connects to the same endpoint with the same account.
+
+**Azure SQL is unaffected**: its redirects name a host and a port and no
+instance, so the two names agree and there is nothing to split.
+
+**What to use instead, today**: an [Azure storage source](#azure-storage-as-a-source)
+reads the same lakehouse over OneLake, and answers DuckDB SQL. Point it at
+`onelake.dfs.fabric.microsoft.com` and `<Workspace>/<Lakehouse>.Lakehouse/Files/…`.
+
+### Delta tables
+
+An Azure storage source reads a folder of files. A Delta table is a folder of
+parquet **plus** a `_delta_log` recording what has been rewritten or deleted,
+and that log is not read. Under a lakehouse's `Tables/`, the union of the parquet
+files is therefore right only for a table that has only ever been appended to,
+and wrong after any update or delete. `Files/` has no such problem.
+
+### Azure storage, end to end
+
+The connector's parts are covered by tests, and its errors have been exercised
+against the live service — but the whole path, from a signed-in account through
+a sync to a query, has not yet been run against a real storage account. Expect
+the first attempt to turn something up.
 
 ## Run a query
 
@@ -536,6 +669,10 @@ Tabs are independent buffers with their own undo history, and **each remembers t
 source and database it was last pointed at** — switching tabs switches target. One
 tab per environment works well with `TARGET`.
 
+**A dot where the cross would be** means unsaved changes. Point at the tab and the
+cross comes back — so the one tab you must not lose by accident is never the one
+wearing a close button.
+
 | Key | Does |
 |---|---|
 | `Alt+N` / `Alt+W` | new tab / close tab |
@@ -558,9 +695,26 @@ It has to be a server-side path: a folder picked in the browser gives back a nam
 and no path, so it could never tell the shell where to begin, and under Docker the
 files sit next to the server rather than next to the browser.
 
-Only `.sql` files are listed, grouped by directory, skipping `.git`,
-`node_modules`, `target` and friends. The choice is remembered between runs; if the
-folder has since gone, Alkyon starts with none open rather than refusing to start.
+Listed are the files Alkyon has something to do with — `.sql` to edit, plus every
+data file a source could read (`.csv`, `.tsv`, `.txt`, `.parquet`, `.json`,
+`.jsonl`, `.ndjson`, `.xlsx` and the other Excel spellings) — grouped by directory,
+skipping `.git`, `node_modules`, `target` and friends. The choice is remembered
+between runs; if the folder has since gone, Alkyon starts with none open rather
+than refusing to start.
+
+**The button between *Open…* and *↻* says which types are on screen** — `all`,
+`sql`, `3 types` — and opens a tickable list of what this folder actually holds,
+with a count each, plus **All**. What it hides is remembered between runs, and it
+is the *hidden* types that are remembered: a type this folder does not hold today,
+or one a later alkyon learns to read, arrives visible rather than missing from a
+list written before it existed. Nothing is re-read — the filter narrows the listing
+already in the browser.
+
+**One click.** A `.sql` file opens in a tab, or goes to the tab it is already in.
+A data file, or a directory row, opens *Register a source* filled in from what you
+clicked — kind, path, file type and an id — as a **project** source, since it came
+out of the open folder. Fold a directory away with its arrow rather than its name,
+which is the part that registers it.
 
 **The listing is taken when you look, not watched.** A file created afterwards — by
 the terminal, by another editor — is not there yet. **↻** re-lists, and so does
@@ -729,6 +883,8 @@ The UI is only a client; everything is reachable directly.
 | GET | `/health` | status, version, vault, whether the terminal is available |
 | GET / POST | `/sources` | list (no credentials) / register (connects first); a folder source posts `{"kind":"folder","path":…,"options":{"format":"csv"},"auth":{"method":"none"}}` |
 | GET | `/files?path=&format=` | the data files a folder holds, relative to it — the source dialog's file list |
+| POST | `/auth/entra` | begin a sign-in — `{"kind":"ms_sql"}` opens a browser, `"device_code":true` returns a code to type elsewhere. Answers a `ticket` |
+| GET | `/auth/entra/{ticket}` | `pending`, `ready` with the account, `failed` with why, or `unknown` once swept. A source then registers with `{"auth":{"method":"entra","ticket":…}}` |
 | DELETE | `/sources/{key}` | also deletes the keychain entry |
 | POST | `/connection-test` | try credentials without registering |
 | GET | `/sources/{key}/status` | reachable now? always 200; the answer is in the body |
@@ -737,7 +893,7 @@ The UI is only a client; everything is reachable directly.
 | GET | `/sources/{key}/columns?db=&schema=&table=` | types, nullability, keys, defaults |
 | GET | `/sources/{key}/schema?db=&refresh=` | the whole schema in one round trip |
 | GET | `/search?q=&limit=` | across every indexed schema |
-| GET / PUT / DELETE | `/workspace` | the open folder, its `.sql` files, and the folders opened before (`recent`) |
+| GET / PUT / DELETE | `/workspace` | the open folder, its files (`.sql`, and data files with the `format` they would be read as), and the folders opened before (`recent`) |
 | GET / PUT | `/workspace/file?path=` | read / write, confined to the folder |
 | GET | `/shells` | shells found on the machine |
 | WS | `/ws/query` | `{source_id, database?, sql, page_size?}` → `columns` / `rows` / `affected` / `end` (carrying `page` and `more`). `{"type":"more"}` reads the next page off the query still running; `{"type":"cancel"}` drops it. Closing the socket releases the connection. |

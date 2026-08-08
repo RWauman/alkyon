@@ -299,10 +299,16 @@ export function createExplorer(element, hooks) {
       scope: source.scope,
       // A folder source has no host to name, so it shows where it points. Only
       // the tail: the last couple of directories are what identify it.
+      // An Azure source's path means nothing without the account it is in.
       badge: source.path
-        ? `${source.kind}${source.options?.format ? ` ${source.options.format}` : ''} · ${
-            source.path.length > 28 ? `…${source.path.slice(-27)}` : source.path
-          }`
+        ? (() => {
+            const where =
+              source.kind === 'adls' ? `${source.host}/${source.path}` : source.path;
+            const format = source.options?.format ? ` ${source.options.format}` : '';
+            return `${source.kind}${format} · ${
+              where.length > 28 ? `…${where.slice(-27)}` : where
+            }`;
+          })()
         : `${source.dialect} · ${source.host}:${source.port}`,
       onSelect: () => hooks.onSelectSource(source),
       // Per source, so re-reading a folder you have just added files to does not

@@ -211,7 +211,10 @@ async fn prepare_scan(
     pattern: &str,
 ) -> Result<Prepared> {
     let record = state.record(source).await?;
-    if !record.kind.is_files() {
+    // Azure storage is excluded along with the servers, and for the same reason
+    // in reverse: its path names a container, not a folder anyone can point a
+    // glob at. `@import x = azure-source : select …` is how it is imported.
+    if !record.kind.is_local_files() {
         return Err(Error::BadRequest(format!(
             "@import {alias}: `{source}` is a {:?} source, so it needs SQL to run — \
              write `@import {alias} = {source} : <sql>`. Only a folder or file source \

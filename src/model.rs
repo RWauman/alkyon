@@ -40,18 +40,44 @@ pub enum SourceKind {
     /// is granted that file alone rather than the directory around it, and the
     /// format options describe *this* file rather than a folder's worth.
     File,
+    /// A folder in Azure storage — a blob container, an ADLS Gen2 filesystem, or
+    /// a Fabric OneLake workspace, which are one API under three names. Reached
+    /// over the network like a server, then read like a folder: the files are
+    /// mirrored locally, because the sandboxed DuckDB cannot fetch anything
+    /// itself.
+    Adls,
 }
 
 impl SourceKind {
     /// Whether this kind is reached over the network. The false case is what
     /// makes `host`, `port`, encryption and authentication meaningless.
     pub fn is_server(self) -> bool {
-        !matches!(self, SourceKind::Folder | SourceKind::File)
+        !matches!(
+            self,
+            SourceKind::Folder | SourceKind::File | SourceKind::Adls
+        )
     }
 
-    /// Whether this kind is read off the local filesystem.
+    /// Whether this kind is read as data files by DuckDB rather than queried on
+    /// a server. True of Azure storage as well: its files are mirrored locally
+    /// and then read exactly as a folder's are.
     pub fn is_files(self) -> bool {
         !self.is_server()
+    }
+
+    /// Whether the source's `path` names somewhere on this machine.
+    ///
+    /// The distinction [`is_files`] cannot make: an Azure source's path is a
+    /// container and a folder inside it, so resolving it against the filesystem
+    /// — or against the open project — would be answering a different question.
+    pub fn is_local_files(self) -> bool {
+        matches!(self, SourceKind::Folder | SourceKind::File)
+    }
+
+    /// Whether a host is required. Azure storage is not a "server" — there is no
+    /// port and nothing to encrypt a choice about — but it is certainly remote.
+    pub fn needs_host(self) -> bool {
+        self.is_server() || self == SourceKind::Adls
     }
 
     pub fn default_port(self) -> u16 {
@@ -61,7 +87,7 @@ impl SourceKind {
             SourceKind::MySql => 3306,
             // Not a port at all. Reported as 0 and hidden by the UI, rather than
             // making every summary carry an `Option` for one kind's sake.
-            SourceKind::Folder | SourceKind::File => 0,
+            SourceKind::Folder | SourceKind::File | SourceKind::Adls => 0,
         }
     }
 
@@ -75,7 +101,20 @@ impl SourceKind {
             SourceKind::MySql => "",
             // Every table a folder or file source exposes. `public` rather than
             // DuckDB's own `main`, because that is the name a SQL user expects.
-            SourceKind::Folder | SourceKind::File => "public",
+            SourceKind::Folder | SourceKind::File | SourceKind::Adls => "public",
+        }
+    }
+
+    /// Which Entra resource a token for this kind has to be minted for.
+    ///
+    /// Tokens are per-resource: one issued for Azure SQL is refused by storage.
+    /// `None` is every kind Entra has nothing to say about — a local folder, or
+    /// a PostgreSQL server that is not Azure's.
+    pub fn entra_resource(self) -> Option<crate::azure::entra::Resource> {
+        match self {
+            SourceKind::MsSql => Some(crate::azure::entra::Resource::AzureSql),
+            SourceKind::Adls => Some(crate::azure::entra::Resource::Storage),
+            _ => None,
         }
     }
 
@@ -90,7 +129,7 @@ impl SourceKind {
             SourceKind::MySql => "information_schema",
             // What DuckDB itself calls an in-memory catalogue. Only the fallback
             // for a path with no name of its own — see [`catalogue_name`].
-            SourceKind::Folder | SourceKind::File => "memory",
+            SourceKind::Folder | SourceKind::File | SourceKind::Adls => "memory",
         }
     }
 }
@@ -288,10 +327,41 @@ pub enum AuthConfig {
     /// A pre-acquired Microsoft Entra ID access token, for Azure SQL and Fabric.
     /// Get one with:
     /// `az account get-access-token --resource https://database.windows.net/`
+    ///
+    /// Also what every other Entra method turns into by the time a connector
+    /// sees it: a bearer token is a bearer token, however it was obtained.
     AadToken { token: String },
+    /// Signed in through the browser. What is kept is the *refresh* token, and an
+    /// access token is minted from it when a connection opens — an access token
+    /// alone would make the source stop working an hour after registering it.
+    Entra {
+        #[serde(default = "default_tenant")]
+        tenant: String,
+        #[serde(default = "default_client_id")]
+        client_id: String,
+        /// A just-finished sign-in, quoted by the dialogue. Redeemed server-side
+        /// into `refresh_token`, which is why the page never holds one.
+        #[serde(default)]
+        ticket: Option<String>,
+        /// Filled in when the ticket is redeemed or the vault is read. Never
+        /// accepted from the wire — `skip` is what stops a request supplying one.
+        #[serde(skip)]
+        refresh_token: Option<String>,
+        /// Who signed in. Display only.
+        #[serde(skip)]
+        account: String,
+    },
     /// Nothing to authenticate: a folder or file source is reached through the
     /// filesystem, with whatever rights the alkyon process already has.
     None,
+}
+
+fn default_tenant() -> String {
+    crate::azure::entra::DEFAULT_TENANT.to_owned()
+}
+
+fn default_client_id() -> String {
+    crate::azure::entra::AZURE_CLI_CLIENT_ID.to_owned()
 }
 
 impl AuthConfig {
@@ -300,7 +370,32 @@ impl AuthConfig {
             AuthConfig::Password { .. } => "password",
             AuthConfig::Integrated => "integrated",
             AuthConfig::AadToken { .. } => "aad_token",
+            AuthConfig::Entra { .. } => "entra",
             AuthConfig::None => "none",
+        }
+    }
+
+    /// The sign-in this credential is waiting to be given, if any.
+    pub fn ticket(&self) -> Option<&str> {
+        match self {
+            AuthConfig::Entra { ticket, .. } => ticket.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// Put a redeemed sign-in — or one read back out of the vault — in place.
+    pub fn with_entra_tokens(self, token: Option<String>, signed_in_as: String) -> AuthConfig {
+        match self {
+            AuthConfig::Entra {
+                tenant, client_id, ..
+            } => AuthConfig::Entra {
+                tenant,
+                client_id,
+                ticket: None,
+                refresh_token: token,
+                account: signed_in_as,
+            },
+            other => other,
         }
     }
 }
@@ -317,6 +412,18 @@ impl fmt::Debug for AuthConfig {
             AuthConfig::AadToken { .. } => f
                 .debug_struct("AadToken")
                 .field("token", &"<redacted>")
+                .finish(),
+            AuthConfig::Entra {
+                tenant,
+                client_id,
+                account,
+                ..
+            } => f
+                .debug_struct("Entra")
+                .field("tenant", tenant)
+                .field("client_id", client_id)
+                .field("account", account)
+                .field("refresh_token", &"<redacted>")
                 .finish(),
             AuthConfig::None => f.write_str("None"),
         }
@@ -357,6 +464,15 @@ pub enum AuthKind {
     Password { username: String },
     Integrated,
     AadToken,
+    /// The tenant and application the sign-in was made against, so renewing it
+    /// asks the same place, and the account it was made as, to show in the UI.
+    /// The refresh token itself is the secret, and lives in the keychain.
+    Entra {
+        tenant: String,
+        client_id: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        account: String,
+    },
     None,
 }
 
@@ -366,6 +482,7 @@ impl AuthKind {
             AuthKind::Password { .. } => "password",
             AuthKind::Integrated => "integrated",
             AuthKind::AadToken => "aad_token",
+            AuthKind::Entra { .. } => "entra",
             AuthKind::None => "none",
         }
     }
@@ -373,6 +490,14 @@ impl AuthKind {
     /// Whether using this source needs a secret from the vault.
     pub fn needs_secret(&self) -> bool {
         !matches!(self, AuthKind::Integrated | AuthKind::None)
+    }
+
+    /// The account a signed-in source is signed in as, for the sources pane.
+    pub fn account(&self) -> Option<&str> {
+        match self {
+            AuthKind::Entra { account, .. } if !account.is_empty() => Some(account),
+            _ => None,
+        }
     }
 }
 
@@ -449,6 +574,7 @@ impl SourceRecord {
             // The effective database, so the UI never has to know the defaults.
             database: self.database(),
             auth_method: self.auth.method(),
+            account: self.auth.account().map(str::to_owned),
             tls: self.tls,
             editor_mime: dialect.mime(),
         }
@@ -462,9 +588,23 @@ impl SourceRecord {
                 password,
             },
             (AuthKind::AadToken, Some(token)) => AuthConfig::AadToken { token },
+            (
+                AuthKind::Entra {
+                    tenant,
+                    client_id,
+                    account,
+                },
+                Some(refresh_token),
+            ) => AuthConfig::Entra {
+                tenant: tenant.clone(),
+                client_id: client_id.clone(),
+                ticket: None,
+                refresh_token: Some(refresh_token),
+                account: account.clone(),
+            },
             (AuthKind::Integrated, _) => AuthConfig::Integrated,
             (AuthKind::None, _) => AuthConfig::None,
-            (AuthKind::Password { .. } | AuthKind::AadToken, None) => {
+            (AuthKind::Password { .. } | AuthKind::AadToken | AuthKind::Entra { .. }, None) => {
                 return Err(crate::error::Error::MissingSecret(self.id.clone()))
             }
         };
@@ -534,6 +674,20 @@ impl SourceConfig {
             }
             AuthConfig::Integrated => (AuthKind::Integrated, None),
             AuthConfig::AadToken { token } => (AuthKind::AadToken, Some(token)),
+            AuthConfig::Entra {
+                tenant,
+                client_id,
+                refresh_token,
+                account,
+                ..
+            } => (
+                AuthKind::Entra {
+                    tenant,
+                    client_id,
+                    account,
+                },
+                refresh_token,
+            ),
             AuthConfig::None => (AuthKind::None, None),
         };
         let record = SourceRecord {
@@ -571,6 +725,9 @@ pub struct SourceSummary {
     pub instance: Option<String>,
     pub database: String,
     pub auth_method: &'static str,
+    /// Who a signed-in source is signed in as. Absent for every other method.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
     pub tls: TlsMode,
     /// Which CodeMirror mode the editor should switch to for this source. The
     /// backend owns dialect knowledge; the UI just applies what it is told.

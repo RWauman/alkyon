@@ -38,6 +38,19 @@ fn fingerprint(cfg: &SourceConfig, db: &str) -> u64 {
             "aad".hash(&mut hasher);
             token.hash(&mut hasher);
         }
+        // Refused further down as unsupported, but a pool keyed on an incomplete
+        // identity is the kind of bug that only shows up as the wrong session.
+        AuthConfig::Entra {
+            tenant,
+            client_id,
+            refresh_token,
+            ..
+        } => {
+            "entra".hash(&mut hasher);
+            tenant.hash(&mut hasher);
+            client_id.hash(&mut hasher);
+            refresh_token.hash(&mut hasher);
+        }
         // Neither carries a credential, so the method name is the whole identity.
         other @ (AuthConfig::Integrated | AuthConfig::None) => other.method().hash(&mut hasher),
     }

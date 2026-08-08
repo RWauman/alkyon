@@ -108,7 +108,9 @@
         <span>Folder</span>
         <span class="spacer"></span>
         <button id="open-folder" title="Open a folder on the machine running alkyon">Open…</button>
-        <button id="refresh-folder" title="Re-list the .sql files in this folder" hidden>&#x21bb;</button>
+        <!-- Says what it is showing, so the filter is visible without opening it. -->
+        <button id="filter-types" title="Which file types the tree shows" hidden>all</button>
+        <button id="refresh-folder" title="Re-list the files in this folder" hidden>&#x21bb;</button>
         <button id="close-folder" title="Close the folder" hidden>&#x2715;</button>
       </div>
       <div class="pane-body">
@@ -177,7 +179,7 @@
     <h2>Open a folder</h2>
     <label>Path <input name="path" required placeholder="C:\projects\warehouse" size="44"></label>
     <p class="hint">A path on the machine running alkyon — that is where the terminal
-      will start. Only <code>.sql</code> files are listed. <code>~</code> works.</p>
+      will start. <code>.sql</code> files and data files are listed. <code>~</code> works.</p>
     <p class="note" id="folder-note" hidden></p>
     <div class="actions">
       <button type="button" id="folder-cancel">Cancel</button>
@@ -199,6 +201,7 @@
         <option value="my_sql">MySQL / MariaDB</option>
         <option value="folder">Folder of data files</option>
         <option value="file">One data file</option>
+        <option value="adls">Azure storage — Blob, ADLS Gen2, OneLake</option>
       </select>
     </label>
     <!-- Then the file type, before anything else: it decides which options below
@@ -226,6 +229,11 @@
 
     <label class="folder-only">Path <input name="path" id="folder-path" placeholder="C:\data\exports"></label>
     <label class="file-only">Path <input name="file-path" placeholder="C:\data\exports\sales.csv"></label>
+
+    <label class="adls-only">Account <input name="account"
+      placeholder="contoso — or onelake.dfs.fabric.microsoft.com"></label>
+    <label class="adls-only">Container and folder <input name="adls-path"
+      placeholder="sales/exports/2026 — or a workspace and lakehouse"></label>
 
     <!-- Filled from the folder itself once the path and the type are in. Every
          file is read unless it is ticked here. -->
@@ -284,13 +292,17 @@
 
     <label class="server-only">Host <input name="host" placeholder="127.0.0.1"></label>
     <label class="server-only">Port <input name="port" type="number" min="1" max="65535" placeholder="default"></label>
-    <label class="mssql-only">Named instance <input name="instance" placeholder="SQLEXPRESS — leave port empty"></label>
+    <!-- The hostname gets pasted in here, and the failure is a SQL Browser
+         timeout naming a host that answers perfectly well. Say where it belongs. -->
+    <label class="mssql-only">Named instance <input name="instance"
+      placeholder="SQLEXPRESS — on-prem only, never for Azure or Fabric"></label>
     <label class="server-only">Database <input name="database" id="database-field" placeholder="optional"></label>
 
     <label class="server-only">Authentication
       <select name="method">
         <option value="password">Login and password</option>
         <option value="integrated">Windows integrated</option>
+        <option value="entra">Microsoft Entra — sign in</option>
         <option value="aad_token">Entra ID access token</option>
       </select>
     </label>
@@ -298,6 +310,23 @@
     <label class="auth-password">Password <input name="password" type="password"></label>
     <label class="auth-aad_token">Access token <input name="token" type="password"
       placeholder="az account get-access-token --resource https://database.windows.net/"></label>
+
+    <!-- Signing in is the whole point of this method, so the button comes first
+         and the two fields nobody usually changes come after it. -->
+    <!-- "Sign-in" rather than "Account": an Azure storage source already has an
+         Account field above, and it means the storage one. -->
+    <div class="auth-entra field">
+      <span class="label">Sign-in</span>
+      <div class="signin">
+        <button type="button" id="entra-signin">Sign in…</button>
+        <button type="button" id="entra-device" class="quiet"
+          title="Use this when the browser is not on the machine running alkyon">Device code</button>
+        <span id="entra-account" class="note" hidden></span>
+      </div>
+    </div>
+    <label class="auth-entra">Tenant <input name="tenant" placeholder="organizations — or your tenant id or domain"></label>
+    <label class="auth-entra">Application id <input name="client_id"
+      placeholder="Azure CLI's — override with your own registration"></label>
 
     <label class="server-only">Encryption
       <select name="tls">
@@ -320,6 +349,14 @@
       becomes a single table, and the source can read nothing else — not even the files beside
       it. The type you choose overrides the extension, which is how <code>export.dat</code>
       gets read as CSV.</p>
+    <!-- The one thing about this source that will surprise someone: it is a
+         mirror, not a remote query. Better said here than discovered. -->
+    <p class="hint adls-only">A container or filesystem, read as a folder of data files —
+      the same tables, unions and <code>source_file</code> column. <strong>The files are
+      copied to this machine first</strong> and re-fetched only when their ETag changes:
+      alkyon's DuckDB runs with no network access, so nothing is scanned where it lives and
+      a parquet comes down whole. Point it at a folder, not at a whole lake. Reading needs
+      the <em>Storage Blob Data Reader</em> role — owning the account is not the same thing.</p>
     <p class="note" id="source-note" hidden></p>
 
     <div class="actions">

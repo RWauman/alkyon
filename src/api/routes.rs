@@ -30,6 +30,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/sources/{id}/schema", get(schema))
         .route("/search", get(search))
         .route("/files", get(data_files))
+        .route("/auth/entra", post(start_sign_in))
+        .route("/auth/entra/{ticket}", get(sign_in_status))
         .route(
             "/workspace",
             get(workspace).put(open_workspace).delete(close_workspace),
@@ -74,7 +76,7 @@ async fn add_source(
     // everything else, an absent one would be a connection attempt to nowhere.
     // The mirror of this — a folder source without a path — is caught by its
     // connector, which also covers records loaded from disk.
-    if config.kind.is_server() && config.host.trim().is_empty() {
+    if config.kind.needs_host() && config.host.trim().is_empty() {
         return Err(Error::BadRequest("source needs a host".into()));
     }
     // Format options describe files. Accepting them on a server source would
@@ -84,11 +86,86 @@ async fn add_source(
             "format options only apply to a folder or file source".into(),
         ));
     }
+    // The sign-in becomes the credential here, before anything is stored: the
+    // record keeps the refresh token, the connection below uses an access token
+    // minted from it.
+    let config = state.redeem_sign_in(config)?;
     // Reject bad credentials now rather than on the first query, and before the
     // secret goes anywhere near the vault.
-    state.connector(config.kind).connect(&config).await?;
+    let connecting = state.authorise(config.clone(), None).await?;
+    state.connector(connecting.kind).connect(&connecting).await?;
     let summary = state.register(config).await?;
     Ok((StatusCode::CREATED, Json(summary)))
+}
+
+// ---------------------------------------------------------------- Entra sign-in
+
+#[derive(Deserialize)]
+struct SignInRequest {
+    /// Which source kind the token is for. Entra mints per-resource tokens, so
+    /// signing in "to Azure" is not a thing that exists.
+    kind: crate::model::SourceKind,
+    #[serde(default)]
+    tenant: Option<String>,
+    #[serde(default)]
+    client_id: Option<String>,
+    /// `true` when the browser is not on the machine running alkyon.
+    #[serde(default)]
+    device_code: bool,
+}
+
+/// Begin a sign-in and hand back the ticket that stands for it.
+///
+/// Returns immediately in both flows: the browser one because the browser has
+/// only just opened, the device one because there is a code to show first. What
+/// happens next is watched through `GET /auth/entra/{ticket}`.
+async fn start_sign_in(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<SignInRequest>,
+) -> Result<Json<Value>> {
+    let resource = body.kind.entra_resource().ok_or_else(|| {
+        Error::BadRequest("this kind of source is not reached through Entra".into())
+    })?;
+    let credential = crate::azure::entra::Credential {
+        tenant: body
+            .tenant
+            .filter(|t| !t.trim().is_empty())
+            .unwrap_or_else(|| crate::azure::entra::DEFAULT_TENANT.to_owned()),
+        client_id: body
+            .client_id
+            .filter(|c| !c.trim().is_empty())
+            .unwrap_or_else(|| crate::azure::entra::AZURE_CLI_CLIENT_ID.to_owned()),
+    }
+    .validated()?;
+
+    if body.device_code {
+        let (ticket, code) = state.sign_ins.start_device(credential, resource).await?;
+        return Ok(Json(json!({
+            "ticket": ticket,
+            "user_code": code.user_code,
+            "verification_uri": code.verification_uri,
+            "expires_in": code.expires_in,
+        })));
+    }
+
+    let ticket = state.sign_ins.start_interactive(credential, resource);
+    Ok(Json(json!({ "ticket": ticket })))
+}
+
+/// How a sign-in is getting on. Polled by the dialogue while it waits.
+async fn sign_in_status(
+    State(state): State<Arc<AppState>>,
+    Path(ticket): Path<String>,
+) -> Json<Value> {
+    let status = state.sign_ins.status(&ticket);
+    let mut body = serde_json::to_value(&status).unwrap_or_else(|_| json!({ "status": "unknown" }));
+    // Re-offer the code on every poll, so a page reloaded mid-sign-in can still
+    // tell the user what to type.
+    if let (Some(prompt), Some(object)) = (state.sign_ins.prompt(&ticket), body.as_object_mut()) {
+        object.insert("user_code".into(), json!(prompt.user_code));
+        object.insert("verification_uri".into(), json!(prompt.verification_uri));
+    }
+    Json(body)
 }
 
 /// Try the credentials without registering anything — the dialogue's *Test*
@@ -99,6 +176,9 @@ async fn test_connection(
     Json(config): Json<SourceConfig>,
 ) -> Result<Json<Value>> {
     let started = Instant::now();
+    // Nothing is stored, so nothing is cached and no rotated token is written
+    // back: this token is minted for one connection and dropped.
+    let config = state.authorise(state.borrow_sign_in(config)?, None).await?;
     state.connector(config.kind).connect(&config).await?;
     Ok(Json(json!({
         "ok": true,
@@ -233,7 +313,8 @@ async fn data_files(Query(params): Query<DataFilesQuery>) -> Result<Json<Value>>
 
 // ------------------------------------------------------------------ workspace
 
-/// The open folder and its `.sql` files. `root: null` when nothing is open.
+/// The open folder and the files under it alkyon can do something with — `.sql`
+/// to edit, data files to register as a source. `root: null` when nothing is open.
 async fn workspace(State(state): State<Arc<AppState>>) -> Result<Json<Value>> {
     let recent = recent(&state).await;
     let Some(root) = state.workspace().await else {

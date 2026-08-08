@@ -105,6 +105,7 @@ export function createBuffers(bar, { onActivate, onDirtyChange }) {
           buffer === active ? 'active' : '',
           // Italic, the way an editor marks a tab you are only passing through.
           buffer.preview ? 'preview' : '',
+          isDirty(buffer) ? 'dirty' : '',
         ]
           .filter(Boolean)
           .join(' ');
@@ -117,6 +118,9 @@ export function createBuffers(bar, { onActivate, onDirtyChange }) {
         label.textContent = buffer.name;
         tab.append(label);
 
+        // Both live in the same slot: the dot holds it until the pointer arrives,
+        // and then the close button takes over. Same box either way, so the strip
+        // does not shift under the cursor.
         if (isDirty(buffer)) {
           const dot = document.createElement('span');
           dot.className = 'tab-dirty';

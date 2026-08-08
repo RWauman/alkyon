@@ -252,16 +252,31 @@ main {
   border-bottom-color: var(--accent);
 }
 .tab.preview .tab-name { font-style: italic; }
-.tab-dirty { color: var(--accent); font-size: 9px; }
+.tab-dirty {
+  color: var(--accent);
+  font-size: 9px;
+  /* The close button's box, so swapping one for the other moves nothing. */
+  display: inline-block;
+  width: 1.1rem;
+  padding: 0;
+  text-align: center;
+}
 .tab-close {
   border: 0;
   background: none;
   color: var(--fg-muted);
-  padding: 0 .3rem;
+  width: 1.1rem;
+  padding: 0;
   font-size: 11px;
+  text-align: center;
   visibility: hidden;
 }
 .tab:hover .tab-close, .tab.active .tab-close { visibility: visible; }
+/* Unsaved: the dot stands where the cross would, and yields to it on hover —
+   otherwise the one tab you must not lose is the one wearing a close button. */
+.tab.dirty .tab-close { display: none; }
+.tab.dirty:hover .tab-close { display: block; }
+.tab.dirty:hover .tab-dirty { display: none; }
 .tab-close:hover { color: var(--error); }
 
 /* Where a dragged tab would land. An inset shadow rather than a border, so the
@@ -560,6 +575,14 @@ main {
   letter-spacing: .08em;
 }
 .pane-head button { padding: 0 .35rem; line-height: 1.4; }
+/* Names what it shows — `all`, `sql`, `3 types` — and gives up on saying it
+   rather than pushing ↻ and ✕ off the end of a narrow sidebar. */
+#filter-types {
+  max-width: 6rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 
 .tree { overflow: auto; padding: .25rem 0; user-select: none; }
 
@@ -739,6 +762,15 @@ dialog {
 dialog::backdrop { background: rgb(0 0 0 / .45); }
 dialog h2 { margin: 0 0 .8rem; font-size: 14px; }
 dialog label { display: grid; grid-template-columns: 9rem 1fr; align-items: center; gap: .4rem; margin-bottom: .4rem; }
+/* A row that is not a label: the sign-in buttons sit where an input would, so
+   the form still reads as one column of labels and one of controls. */
+dialog .field { display: grid; grid-template-columns: 9rem 1fr; align-items: center; gap: .4rem; margin-bottom: .4rem; }
+dialog .field > .label { font-size: inherit; }
+dialog .signin { display: flex; align-items: center; gap: .5rem; flex-wrap: wrap; }
+dialog .signin .note { margin: 0; }
+/* The second way of doing the same thing, offered without competing with the
+   first. */
+dialog button.quiet { color: var(--fg-muted); font-size: 11px; }
 dialog .hint { color: var(--fg-muted); font-size: 12px; margin: .8rem 0 0; }
 dialog .note { font-size: 12px; white-space: pre-wrap; margin: .5rem 0 0; }
 dialog .note.bad { color: var(--error); }

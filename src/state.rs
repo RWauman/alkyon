@@ -1,9 +1,11 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tokio::sync::RwLock;
 
+use crate::azure::entra;
+use crate::connectors::adls::AdlsConnector;
 use crate::connectors::files::FilesConnector;
 use crate::connectors::mssql::MssqlConnector;
 use crate::connectors::mysql::MySqlConnector;
@@ -99,10 +101,19 @@ pub struct AppState {
     pub terminal_enabled: bool,
     /// Schema snapshots, feeding both autocompletion and the search bar.
     schema: SchemaCache,
+    /// Entra sign-ins in flight, waiting on a browser somewhere.
+    pub sign_ins: Arc<crate::azure::SignIns>,
+    /// Access tokens minted from a refresh token, by vault key.
+    ///
+    /// Held in memory only, and only until they expire: an access token is worth
+    /// an hour, and going back to Entra for every query would add a round trip
+    /// to the other side of the internet before each one.
+    tokens: RwLock<HashMap<String, crate::azure::entra::Tokens>>,
     postgres: PgConnector,
     mssql: MssqlConnector,
     mysql: MySqlConnector,
     files: FilesConnector,
+    adls: AdlsConnector,
 }
 
 /// Whether to expose `/ws/terminal`. Alkyon has no authentication by design, so
@@ -128,10 +139,13 @@ impl AppState {
             recent: RwLock::new(Vec::new()),
             terminal_enabled: true,
             schema: SchemaCache::default(),
+            sign_ins: Arc::default(),
+            tokens: RwLock::new(HashMap::new()),
             postgres: PgConnector::default(),
             mssql: MssqlConnector,
             mysql: MySqlConnector::default(),
             files: FilesConnector,
+            adls: AdlsConnector::new(std::env::temp_dir().join("alkyon-azure")),
         })
     }
 
@@ -176,10 +190,16 @@ impl AppState {
             recent: RwLock::new(stored.recent),
             terminal_enabled,
             schema: SchemaCache::default(),
+            sign_ins: Arc::default(),
+            tokens: RwLock::new(HashMap::new()),
             postgres: PgConnector::default(),
             mssql: MssqlConnector,
             mysql: MySqlConnector::default(),
             files: FilesConnector,
+            // Beside the registry rather than in the temp directory: the point
+            // of the mirror is that it survives a restart, and a cleaner that
+            // empties `%TEMP%` overnight would make every morning the first one.
+            adls: AdlsConnector::new(dir.join("azure-cache")),
         }))
     }
 
@@ -362,6 +382,7 @@ impl AppState {
             SourceKind::MsSql => &self.mssql,
             SourceKind::MySql => &self.mysql,
             SourceKind::Folder | SourceKind::File => &self.files,
+            SourceKind::Adls => &self.adls,
         }
     }
 
@@ -452,7 +473,133 @@ impl AppState {
             config.database = Some(db.to_owned());
         }
         config.path = self.anchor_path(&record, config.path).await?;
+        let vault_key = self.vault_key(&record).await;
+        let config = self.authorise(config, Some(&vault_key)).await?;
         self.connector(config.kind).connect(&config).await
+    }
+
+    // ---------------------------------------------------------- Entra tokens
+
+    /// Redeem a finished sign-in into the credential the source will keep. The
+    /// ticket is spent: registering is what it was for.
+    pub fn redeem_sign_in(&self, config: SourceConfig) -> Result<SourceConfig> {
+        self.with_sign_in(config, true)
+    }
+
+    /// The same, leaving the ticket where it is — *Test* must not spend the
+    /// sign-in that the save right after it is going to need.
+    pub fn borrow_sign_in(&self, config: SourceConfig) -> Result<SourceConfig> {
+        self.with_sign_in(config, false)
+    }
+
+    /// Put the tokens of a finished sign-in into the credential.
+    ///
+    /// The ticket is how the dialogue refers to a sign-in whose tokens it was
+    /// never given, which is what keeps a refresh token out of the page.
+    fn with_sign_in(&self, config: SourceConfig, consume: bool) -> Result<SourceConfig> {
+        let Some(ticket) = config.auth.ticket() else {
+            return Ok(config);
+        };
+        let held = if consume {
+            self.sign_ins.redeem(ticket)
+        } else {
+            self.sign_ins.peek(ticket)
+        };
+        let tokens = held.ok_or_else(|| {
+            Error::BadRequest("that sign-in has expired or was already used — sign in again".into())
+        })?;
+        if tokens.refresh_token.is_none() {
+            return Err(Error::BadRequest(
+                "Entra issued no refresh token, so the sign-in would stop working within the \
+                 hour. Check that the application allows `offline_access`."
+                    .into(),
+            ));
+        }
+        let account = tokens.account.clone();
+        Ok(SourceConfig {
+            auth: config.auth.with_entra_tokens(tokens.refresh_token, account),
+            ..config
+        })
+    }
+
+    /// Turn an Entra sign-in into the bearer token a connector understands.
+    ///
+    /// Every other method passes straight through. `store_as` is the keychain
+    /// entry to write a rotated refresh token back to — `None` for a source that
+    /// is not registered yet, which is the *Test* button.
+    pub async fn authorise(
+        &self,
+        config: SourceConfig,
+        store_as: Option<&str>,
+    ) -> Result<SourceConfig> {
+        let crate::model::AuthConfig::Entra {
+            tenant,
+            client_id,
+            refresh_token,
+            ..
+        } = &config.auth
+        else {
+            return Ok(config);
+        };
+
+        let resource = config.kind.entra_resource().ok_or_else(|| {
+            Error::BadRequest("this kind of source cannot be reached with an Entra sign-in".into())
+        })?;
+        // Reached only when no ticket was quoted and nothing came out of the
+        // vault: a source registered this way has its refresh token by now, so
+        // what is missing is the sign-in itself.
+        let refresh = refresh_token.as_deref().ok_or_else(|| {
+            Error::BadRequest(format!(
+                "source `{}` has no Entra sign-in yet — sign in before testing it",
+                config.id
+            ))
+        })?;
+
+        // A cached token is only reusable by the source it was minted for: the
+        // key is the keychain entry, so two sources signed in as two accounts
+        // never share one.
+        if let Some(key) = store_as {
+            if let Some(held) = self.tokens.read().await.get(key) {
+                if held.fresh() {
+                    return Ok(SourceConfig {
+                        auth: crate::model::AuthConfig::AadToken {
+                            token: held.access_token.clone(),
+                        },
+                        ..config
+                    });
+                }
+            }
+        }
+
+        let credential = entra::Credential {
+            tenant: tenant.clone(),
+            client_id: client_id.clone(),
+        };
+        let tokens = entra::refresh(&credential, resource, refresh).await?;
+        let access_token = tokens.access_token.clone();
+
+        if let Some(key) = store_as {
+            // Entra usually rotates the refresh token and may invalidate the old
+            // one, so the new one has to replace what is in the keychain — miss
+            // this and the source works until the next restart and then does not.
+            match &tokens.refresh_token {
+                Some(rotated) if rotated != refresh => {
+                    self.vault.store(key, rotated)?;
+                    tracing::debug!(source = key, "rotated the Entra refresh token");
+                }
+                _ => {}
+            }
+            let mut cache = self.tokens.write().await;
+            cache.retain(|_, held| held.fresh());
+            cache.insert(key.to_owned(), tokens);
+        }
+
+        Ok(SourceConfig {
+            auth: crate::model::AuthConfig::AadToken {
+                token: access_token,
+            },
+            ..config
+        })
     }
 
     /// Make a folder or file source's path absolute.
@@ -472,6 +619,11 @@ impl AppState {
     ) -> Result<Option<String>> {
         let Some(path) = path else { return Ok(None) };
         let trimmed = path.trim();
+        // An Azure source's path is a container and a folder inside it, which is
+        // relative to that account and to nothing on this machine.
+        if !record.kind.is_local_files() {
+            return Ok(Some(path));
+        }
         if trimmed.is_empty() || !crate::workspace::is_relative(trimmed) {
             return Ok(Some(path));
         }

@@ -49,6 +49,13 @@ export const api = {
   dataFiles: (path, format) =>
     call('GET', `/files?path=${q(path)}${format ? `&format=${q(format)}` : ''}`),
 
+  /**
+   * Start an Entra sign-in. Answers as soon as there is something to wait on —
+   * a ticket, plus the code to type when the browser is somewhere else.
+   */
+  startSignIn: (body) => call('POST', '/auth/entra', body),
+  signInStatus: (ticket) => call('GET', `/auth/entra/${q(ticket)}`),
+
   shells: () => call('GET', '/shells'),
   sources: () => call('GET', '/sources'),
   addSource: (config) => call('POST', '/sources', config),

@@ -413,6 +413,7 @@ addEventListener('keydown', (event) => {
 // ---------------------------------------------------------------- workspace
 
 const workspace = createWorkspace($('workspace'), {
+  types: $('filter-types'),
   onStatus: status,
   onRootChange: (root) => {
     const line = $('workspace-root');
@@ -422,8 +423,16 @@ const workspace = createWorkspace($('workspace'), {
     line.hidden = !root;
     $('close-folder').hidden = !root;
     $('refresh-folder').hidden = !root;
+    $('filter-types').hidden = !root;
   },
   onOpenFile: async (file) => {
+    // Already open: go to its tab. Re-reading would be a wasted round trip, and
+    // with a single click to open the tree is clicked through far more often.
+    const open = buffers.all.find((buffer) => buffer.workspacePath === file.path);
+    if (open) {
+      buffers.activate(open);
+      return;
+    }
     try {
       const { text } = await api.readWorkspaceFile(file.path);
       buffers.open({ name: file.name, text, workspacePath: file.path });
@@ -432,6 +441,9 @@ const workspace = createWorkspace($('workspace'), {
       status(e.message, true);
     }
   },
+  // A data file is not something to edit — it is something to read as a table, so
+  // clicking one starts registering it rather than opening it.
+  onAddSource: (entry) => openSourceDialog(entry),
 });
 
 const folderDialog = $('folder-dialog');
@@ -461,7 +473,7 @@ async function openFolder(path) {
   // The folder brings its own sources with it.
   await loadSources();
   paintRecent(opened.recent);
-  status(`opened ${opened.root} — ${opened.files.length} .sql file(s)`);
+  status(`opened ${opened.root} — ${opened.files.length} file(s)`);
   // The working directory is fixed when the shell is spawned, so an open
   // terminal has to be restarted to land in the new folder.
   terminal.restart();
@@ -498,7 +510,7 @@ async function refreshFolder({ quiet = false } = {}) {
   const before = workspace.count;
   const state = await workspace.refresh();
   if (quiet || !state) return;
-  status(`${state.files.length} .sql file(s)${
+  status(`${state.files.length} file(s)${
     state.files.length === before ? '' : ` — was ${before}`}`);
 }
 
@@ -1233,15 +1245,19 @@ const DEFAULT_DATABASE = {
 /** Show only the fields the selected engine and auth method actually use. */
 function syncDialogFields() {
   const kind = form.elements.kind.value;
-  const method = form.elements.method.value;
+  // Azure storage sits between the two: remote, and signed in to, but read as
+  // files — so it takes the format options and none of the server ones.
+  const adls = kind === 'adls';
+  const method = adls ? 'entra' : form.elements.method.value;
   // A folder or file is reached through the filesystem: no host, no port, no
   // encryption and nothing to authenticate.
-  const server = kind !== 'folder' && kind !== 'file';
+  const server = kind !== 'folder' && kind !== 'file' && !adls;
 
   for (const element of form.querySelectorAll('.server-only')) element.hidden = !server;
   for (const element of form.querySelectorAll('.files-only')) element.hidden = server;
   for (const element of form.querySelectorAll('.folder-only')) element.hidden = kind !== 'folder';
   for (const element of form.querySelectorAll('.file-only')) element.hidden = kind !== 'file';
+  for (const element of form.querySelectorAll('.adls-only')) element.hidden = !adls;
   for (const label of form.querySelectorAll('.mssql-only')) {
     label.hidden = kind !== 'ms_sql';
   }
@@ -1254,16 +1270,26 @@ function syncDialogFields() {
   for (const element of form.querySelectorAll('.excel-only')) element.hidden = format !== 'excel';
   // Say what leaving it empty will actually connect to.
   $('database-field').placeholder = `optional — defaults to ${DEFAULT_DATABASE[kind] ?? 'the engine default'}`;
+  // Azure storage has one way in, so it shows the sign-in without the choice of
+  // method above it.
   for (const label of form.querySelectorAll('[class^="auth-"]')) {
-    label.hidden = !server || !label.classList.contains(`auth-${method}`);
+    label.hidden = !(server || adls) || !label.classList.contains(`auth-${method}`);
   }
-  // Windows integrated authentication is a SQL Server concept.
-  const integrated = form.querySelector('option[value="integrated"]');
-  integrated.disabled = kind !== 'ms_sql';
-  if (integrated.disabled && method === 'integrated') {
-    form.elements.method.value = 'password';
-    syncDialogFields();
+  // Windows integrated authentication is a SQL Server concept, and so — as far
+  // as anything alkyon connects to goes — is an Entra token: the PostgreSQL and
+  // MySQL connectors take a password and nothing else, so offering either there
+  // was offering a method that could only fail.
+  const only = { integrated: 'ms_sql', entra: 'ms_sql', aad_token: 'ms_sql' };
+  let corrected = false;
+  for (const [value, wants] of Object.entries(only)) {
+    const option = form.querySelector(`option[value="${value}"]`);
+    option.disabled = kind !== wants;
+    if (option.disabled && form.elements.method.value === value) {
+      form.elements.method.value = 'password';
+      corrected = true;
+    }
   }
+  if (corrected) syncDialogFields();
 }
 
 /**
@@ -1333,22 +1359,188 @@ form.elements.format.addEventListener('change', () => {
 $('folder-path').addEventListener('change', refreshFileList);
 form.elements.method.addEventListener('change', syncDialogFields);
 
-$('add-source').addEventListener('click', () => {
+// ------------------------------------------------------------ Entra sign-in
+
+/**
+ * The sign-in the dialogue is currently holding, if any.
+ *
+ * A ticket rather than the tokens themselves: the refresh token goes from the
+ * server's own memory to the keychain, and the page only ever learns who signed
+ * in. Reset with the form, so a dialogue reopened for another source cannot
+ * quietly register the previous one's account.
+ */
+const signIn = { ticket: null, account: null, polling: null };
+
+function resetSignIn() {
+  clearTimeout(signIn.polling);
+  signIn.ticket = null;
+  signIn.account = null;
+  signIn.polling = null;
+  paintSignIn();
+}
+
+function paintSignIn(message, kind) {
+  const line = $('entra-account');
+  const text = message ?? (signIn.account ? `Signed in as ${signIn.account}` : '');
+  line.textContent = text;
+  line.className = kind ? `note ${kind}` : 'note';
+  line.hidden = !text;
+}
+
+/**
+ * Watch a sign-in through to its end.
+ *
+ * Polled rather than pushed: it finishes in a browser this page has no channel
+ * to, the wait is a couple of seconds of human time either way, and a WebSocket
+ * for one event nobody is streaming would be machinery for its own sake.
+ */
+function watchSignIn(ticket) {
+  clearTimeout(signIn.polling);
+  signIn.ticket = ticket;
+
+  const tick = async () => {
+    let state;
+    try {
+      state = await api.signInStatus(ticket);
+    } catch (e) {
+      paintSignIn(e.message, 'bad');
+      return;
+    }
+    // Still going: keep whatever the device flow gave us on screen.
+    if (state.status === 'pending') {
+      if (state.user_code) {
+        paintSignIn(`Enter ${state.user_code} at ${state.verification_uri}`);
+      }
+      signIn.polling = setTimeout(tick, 1500);
+      return;
+    }
+    if (state.status === 'ready') {
+      signIn.account = state.account || 'your account';
+      paintSignIn(undefined, 'good');
+      return;
+    }
+    signIn.ticket = null;
+    paintSignIn(
+      state.status === 'failed' ? state.error : 'the sign-in went away — try again',
+      'bad',
+    );
+  };
+
+  paintSignIn('Waiting for the sign-in…');
+  signIn.polling = setTimeout(tick, 600);
+}
+
+async function beginSignIn(deviceCode) {
+  const data = new FormData(form);
+  resetSignIn();
+  try {
+    const started = await api.startSignIn({
+      kind: data.get('kind'),
+      tenant: data.get('tenant').trim() || undefined,
+      client_id: data.get('client_id').trim() || undefined,
+      device_code: deviceCode,
+    });
+    if (started.user_code) {
+      paintSignIn(`Enter ${started.user_code} at ${started.verification_uri}`);
+    }
+    watchSignIn(started.ticket);
+  } catch (e) {
+    paintSignIn(e.message, 'bad');
+  }
+}
+
+$('entra-signin').addEventListener('click', () => beginSignIn(false));
+$('entra-device').addEventListener('click', () => beginSignIn(true));
+
+/**
+ * The Entra half of a source's credential.
+ *
+ * The ticket, not the tokens: what the sign-in produced never reaches the page.
+ * Empty fields are left out so the server applies its own defaults rather than
+ * being told to use an empty tenant.
+ */
+function entraAuth(data) {
+  const auth = { method: 'entra' };
+  const tenant = data.get('tenant').trim();
+  const clientId = data.get('client_id').trim();
+  if (tenant) auth.tenant = tenant;
+  if (clientId) auth.client_id = clientId;
+  // Only once it has finished: an unfinished ticket cannot be redeemed, and
+  // sending it would turn "still waiting" into a failure.
+  if (signIn.ticket && signIn.account) auth.ticket = signIn.ticket;
+  return auth;
+}
+
+/**
+ * An id the form will accept, from a file or folder name: `2024 sales.csv` is
+ * `2024-sales`. Empty when nothing usable is left, and then the field stays blank
+ * rather than being filled with something meaningless.
+ */
+function suggestId(name) {
+  return name
+    .replace(/\.[^.]+$/, '')
+    .replace(/[^A-Za-z0-9._-]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+}
+
+/** The last segment of a path, whichever separator it uses. */
+function basename(path) {
+  return path.split(/[\\/]/).filter(Boolean).pop() ?? '';
+}
+
+/**
+ * A path in the open folder, made absolute — the only kind the dialogue can act
+ * on, since its file list and *Test* both resolve what is typed against the
+ * server's own working directory rather than against the open folder.
+ */
+function inWorkspace(relative) {
+  const root = workspace.root ?? '';
+  if (!relative || relative === '.') return root;
+  const separator = root.includes('\\') ? '\\' : '/';
+  return `${root}${separator}${relative.split('/').join(separator)}`;
+}
+
+/**
+ * Open the source dialogue, empty or already pointed at something.
+ *
+ * `entry` comes from the file tree: a data file, or a folder holding some. What it
+ * cannot say is which CSV options the files need, so those stay at their sniffed
+ * defaults — the prefill saves the typing, not the thinking.
+ */
+function openSourceDialog(entry = null) {
   form.reset();
   note();
+  // `form.reset()` does not know about a sign-in held outside the form.
+  resetSignIn();
   // A project source has nowhere to live without an open folder.
   const project = form.querySelector('option[value="project"]');
   project.disabled = !workspace.root;
   project.textContent = workspace.root
     ? 'This folder — .alkyon/sources.json, committable'
     : 'This folder — needs an open folder';
+
+  if (entry) {
+    form.elements.kind.value = entry.directory ? 'folder' : 'file';
+    if (entry.format) form.elements.format.value = entry.format;
+    const path = inWorkspace(entry.path);
+    if (entry.directory) $('folder-path').value = path;
+    else form.elements['file-path'].value = path;
+    // The folder's own name, and for the root row the open folder's.
+    const named = entry.name ?? entry.path.split('/').pop();
+    form.elements.id.value = suggestId(named || basename(workspace.root ?? ''));
+    // It came out of the open folder, so that is where it belongs.
+    form.elements.scope.value = 'project';
+  }
+
   syncDialogFields();
   // `form.reset()` restores the values, but the last folder's file list is still
   // in the DOM.
   for (const label of [...$('folder-files').querySelectorAll('label')]) label.remove();
   refreshFileList();
   dialog.showModal();
-});
+}
+
+$('add-source').addEventListener('click', () => openSourceDialog());
 
 $('source-cancel').addEventListener('click', () => dialog.close());
 
@@ -1428,8 +1620,22 @@ function readForm() {
     };
   }
 
+  // Remote like a server, read like a folder: it carries both a host and the
+  // format options, and its only way in is a sign-in.
+  if (kind === 'adls') {
+    return {
+      id: data.get('id').trim(),
+      scope: data.get('scope'),
+      kind,
+      host: data.get('account').trim(),
+      path: data.get('adls-path').trim(),
+      options: readFileOptions(data),
+      auth: entraAuth(data),
+    };
+  }
+
   const method = data.get('method');
-  const auth = { method };
+  const auth = method === 'entra' ? entraAuth(data) : { method };
   if (method === 'password') {
     auth.username = data.get('username');
     auth.password = data.get('password');
@@ -1481,6 +1687,14 @@ async function withFeedback(button, busyLabel, action) {
  * Returns the complaint, or nothing when there is none.
  */
 function complaint(config) {
+  if (config.auth.method === 'entra' && !config.auth.ticket) {
+    return signIn.ticket ? 'wait for the sign-in to finish' : 'sign in first';
+  }
+  if (config.kind === 'adls') {
+    if (!config.host) return 'give an account or hostname';
+    if (!config.options.format) return 'choose the file type first';
+    return config.path ? null : 'give a container and folder';
+  }
   if (config.kind !== 'folder' && config.kind !== 'file') {
     return config.host ? null : 'give a host';
   }
@@ -1513,6 +1727,9 @@ form.addEventListener('submit', (event) => {
   withFeedback($('source-save'), 'Connecting…', async () => {
     const summary = await api.addSource(config);
     dialog.close();
+    // The ticket was spent registering it; holding on to a stale one would let
+    // the next dialogue think it is already signed in.
+    resetSignIn();
     await loadSources({ keep: false });
     await selectSource(summary.key);
     status(`registered ${summary.key}`);
