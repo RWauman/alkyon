@@ -13,7 +13,7 @@ mod common;
 
 use alkyon::model::{RowBatch, TableKind};
 use alkyon::state::AppState;
-use common::seeded;
+use common::{relational, seeded};
 use futures::StreamExt;
 use serde_json::Value;
 
@@ -52,6 +52,7 @@ async fn metadata_describes_the_demo_schema() {
         let id = &source.id;
         let connection = state.open(id, None).await.expect("connect");
 
+        // Every kind answers these two, whatever its seed looks like.
         let databases = connection.list_databases().await.expect("list_databases");
         assert!(
             databases.contains(&source.database),
@@ -63,6 +64,11 @@ async fn metadata_describes_the_demo_schema() {
             .list_tables(&source.database)
             .await
             .expect("list_tables");
+        assert!(!tables.is_empty(), "{id}: no tables at all");
+        if !relational(source.kind) {
+            continue;
+        }
+
         let find = |name: &str| {
             tables
                 .iter()
@@ -121,6 +127,9 @@ async fn queries_stream_in_batches() {
     };
 
     for source in state.summaries().await {
+        if !relational(source.kind) {
+            continue;
+        }
         let id = &source.id;
         let (columns, rows, batches) = collect(
             &state,
@@ -159,6 +168,9 @@ async fn every_column_of_the_demo_table_decodes() {
     };
 
     for source in state.summaries().await {
+        if !relational(source.kind) {
+            continue;
+        }
         let id = &source.id;
         let (columns, rows, _) = collect(&state, id, "SELECT * FROM sales.customer").await;
         assert!(!rows.is_empty(), "{id}: the seed has customers");

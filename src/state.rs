@@ -463,6 +463,17 @@ impl AppState {
     /// source's own default otherwise. The secret is fetched here and dropped
     /// when the connection is built.
     pub async fn open(&self, key: &str, database: Option<&str>) -> Result<Box<dyn Connection>> {
+        let config = self.resolve(key, database).await?;
+        self.connector(config.kind).connect(&config).await
+    }
+
+    /// Everything [`AppState::open`] does *except* connect: the record, its
+    /// secret, the database it is bound to, and any Entra token minted for it.
+    ///
+    /// Separate because a federated `@attach` needs the credential without
+    /// wanting a connection — DuckDB opens its own, and what it needs is a
+    /// host, a login and a TLS choice rather than a [`Connection`].
+    pub async fn resolve(&self, key: &str, database: Option<&str>) -> Result<SourceConfig> {
         let record = self.record(key).await?;
         let secret = if record.auth.needs_secret() {
             self.load_secret(&record).await?
@@ -476,8 +487,7 @@ impl AppState {
         }
         config.path = self.anchor_path(&record, config.path).await?;
         let vault_key = self.vault_key(&record).await;
-        let config = self.authorise(config, Some(&vault_key)).await?;
-        self.connector(config.kind).connect(&config).await
+        self.authorise(config, Some(&vault_key)).await
     }
 
     // ---------------------------------------------------------- Entra tokens

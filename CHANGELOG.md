@@ -63,8 +63,41 @@ no binary yet.
   collection where one field is in turn an integer, a string, a double, a document
   and an array.
 
+### Federation
+
+- **`@attach` — let DuckDB read the server itself.** `-- @attach pg = pg-prod/warehouse`
+  makes the whole database a catalogue: `pg.sales.customer`, planned by DuckDB rather
+  than pulled through alkyon. Projections and filters are pushed down to the server;
+  **aggregations and joins are not**, measured with `pg_debug_show_queries` and
+  written into the guide, because that is what decides which directive to reach for.
+  `@import` stays the right one whenever the remote engine should do the work.
+- PostgreSQL and MySQL only — the engines DuckDB has a **core** extension for. SQL
+  Server and MongoDB have community ones, which this session refuses to load;
+  `@attach` on either says so and points at `@import`.
+- **READ_ONLY with no opt-out**, since it would otherwise be the one path in the
+  program that can write to a production server. The credential goes into a DuckDB
+  secret rather than an ATTACH string, and your encryption choice carries over —
+  *Require* becomes libpq's `verify-full`, not its `require`, which encrypts without
+  checking the certificate.
+- **Attaching costs no confinement.** Attach, grant the folder, *then* shut external
+  access and lock it: a remote count, a pushed-down filter and a self-join all still
+  answer, while an ungranted local file and a second `ATTACH` of your own are both
+  refused. Pinned by a test.
+- **The million-row import cap is gone.** It was a memory limit wearing a row count:
+  every cell was held as a `String` in this process until the import finished. Rows
+  now stream into DuckDB as they arrive, and DuckDB spills to a temp directory when
+  memory runs out, so the bound is disk. `ALKYON_IMPORT_MAX_ROWS` still sets a
+  ceiling if you want one; it no longer sets one by default.
+
 ### Fixed
 
+- **A MongoDB failure was a 400, not a 502.** A refused login came back as "your
+  request was malformed" when the request was fine and the credential was not — the
+  other connectors have said 502 for a server's own refusal all along.
+- **Three test suites asserted the relational demo seed against MongoDB**, whose seed
+  is document-shaped on purpose, so `cargo test` failed for every source once
+  `mongo-dev` was in `ALKYON_SOURCES`. They now cover the sources that carry that
+  seed and say why MongoDB's own shape is asserted in `tests/mongo.rs` instead.
 - **Dates, decimals, structs and lists coming out of a DuckDB source were Rust's
   `Debug` output.** A date read as `Date32(20455)`, a total as `Decimal(Decimal {
   width: 38, scale: 2, value: 41948375 })`, a struct as `Struct(OrderedMap([…]))`.

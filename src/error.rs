@@ -43,6 +43,15 @@ pub enum Error {
     #[error("sql server: {0}")]
     MsSql(#[from] tiberius::error::Error),
 
+    /// Anything the MongoDB driver reports.
+    ///
+    /// Its own variant for one reason: what the *server* says belongs in the same
+    /// class as what PostgreSQL and SQL Server say. Reported as a `BadRequest`, a
+    /// refused login came back as 400 — "your request was malformed" — when the
+    /// request was fine and the credential was not.
+    #[error("mongodb: {0}")]
+    Mongo(String),
+
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 
@@ -60,7 +69,7 @@ impl Error {
             Error::DuplicateSource(_) => StatusCode::CONFLICT,
             Error::BadRequest(_) | Error::Unsupported(_) => StatusCode::BAD_REQUEST,
             Error::MissingSecret(_) => StatusCode::PRECONDITION_FAILED,
-            Error::Sqlx(_) | Error::MsSql(_) => StatusCode::BAD_GATEWAY,
+            Error::Sqlx(_) | Error::MsSql(_) | Error::Mongo(_) => StatusCode::BAD_GATEWAY,
             // A federated failure is usually the user's SQL, not a broken server.
             Error::Federated(_) => StatusCode::BAD_REQUEST,
             Error::Io(_)

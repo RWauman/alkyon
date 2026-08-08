@@ -929,8 +929,79 @@ anywhere.
 ```text
 -- @import <alias> = <source>[/<database>] : <SQL in that source's dialect>
 -- @import <alias> = <folder source>/<path or glob>      -- no `:` — see below
+-- @attach <alias> = <source>[/<database>]               -- PostgreSQL, MySQL
 -- @excel  <alias> = <path>[#<sheet>]
 ```
+
+### `@attach` — let DuckDB read the server itself
+
+`@import` runs *your* SQL on the source. `@attach` hands DuckDB the live server and
+lets its planner write the remote query:
+
+```sql
+-- @duckdb
+-- @attach pg = pg-prod/warehouse
+select name, credit from pg.sales.customer where country = 'BE';
+```
+
+The alias is a **catalogue**, not a table, so the name has three parts —
+`pg.sales.customer` — or two for MySQL, which has no schema layer. Nothing is read
+until the query asks, and there is no cap because nothing is copied.
+
+**Which to reach for.** Not a matter of taste; they push down different things.
+Measured against a real PostgreSQL with `pg_debug_show_queries`, here is what the
+server actually receives:
+
+| you write | PostgreSQL receives |
+|---|---|
+| `select name … where id = 7` | `SELECT "id","name" … WHERE "id" = '7'` — pushed |
+| `select count(*) …` | `SELECT NULL FROM "customer"` — **every row** |
+| `select country, count(*) … group by 1` | `SELECT "country" FROM "customer"` — all of them |
+| `customer join order_line where country='BE'` | two `COPY`s; `order_line` comes over **whole** |
+
+So **projections and filters are pushed down; aggregations and joins are not.**
+
+- **`@attach`** when you want a slice of a large remote table, or to join across
+  engines without writing SQL per engine. Browsing is cheap: only the columns you
+  name cross the wire.
+- **`@import`** when the remote engine should do the work — a `group by` over a
+  hundred million rows, a window function, a hint, anything in a dialect DuckDB
+  does not speak. There the server runs your SQL verbatim and only the answer
+  travels.
+
+Both in one buffer is normal, and often right:
+
+```sql
+-- @duckdb
+-- @attach pg  = pg-prod/warehouse
+-- @import agg = mssql-prod/sales : select customer_id, sum(unit_price) total
+                                    from sales.order_line group by customer_id
+select p.name, a.total
+from pg.sales.customer p join agg a on a.customer_id = p.id;
+```
+
+**Only PostgreSQL and MySQL.** They are the engines DuckDB has a **core** extension
+for. SQL Server and MongoDB have *community* extensions, which this session refuses
+to load — community code is third-party native code in this process, which is a
+different promise from the one alkyon makes. `@attach` on either says so and points
+at `@import`, which is not a workaround there but the supported path.
+
+**It is READ_ONLY, with no opt-out.** `@import` cannot write at all, so this would
+otherwise be the one path in the program that mutates a production server. An
+`insert` against an attachment is refused by DuckDB itself.
+
+**The credential is DuckDB's to use, not alkyon's.** It opens its own connection, so
+it needs a login and a password: `integrated`, an Entra sign-in or a bearer token
+cannot be handed over, and `@attach` says so before anything is tried. Your
+encryption choice does carry over — *Require* becomes libpq's `verify-full` and not
+its `require`, which encrypts without checking the certificate.
+
+**Attaching costs no confinement.** `ATTACH` needs the network, and the network is
+what a federated session normally has shut. The order is what makes it work:
+attach first, grant the open folder, *then* shut the door and lock it. Measured: a
+remote count, a pushed-down filter and even a self-join all still answer afterwards,
+while `read_csv` on an ungranted local file is refused — and so is a second
+`ATTACH` of your own choosing.
 
 ### Importing files without copying them
 
@@ -982,18 +1053,25 @@ consulted.
 ### What to expect
 
 - **The rows travel through Alkyon** — for `@import … : <sql>` and `@excel`, not for
-  a path import. No predicate pushdown, so a single one is capped at 1,000,000 rows
-  (`ALKYON_IMPORT_MAX_ROWS`). Exceeding it is an **error**, never a silent
-  truncation. Narrow the import, or point at the files by path instead.
+  a path import or an `@attach`. Everything you wrote is pushed down, because the
+  server is the one running it; what comes back is the result.
+- **There is no row cap.** There used to be one at a million rows, and it was really
+  a memory limit wearing a row count: every cell was held as a `String` in this
+  process until the import finished. Rows now go into DuckDB as they arrive, and
+  DuckDB spills to a temp directory when it runs out of memory, so the bound is
+  disk. Set `ALKYON_IMPORT_MAX_ROWS` if you want a ceiling anyway — on a shared
+  machine a mistyped import filling a disk is worth guarding against. Exceeding it
+  is an **error**, never a silent truncation.
 - **Formats**: CSV, Parquet and JSON, all built in — nothing is ever downloaded.
   Excel is read in-process, with each column's type inferred from its cells.
   **Delta and Iceberg are not available**; they would require fetching an extension.
 - **Decimals** land as `DECIMAL(38,9)`. Result-set metadata carries no scale, so one
   had to be chosen; cast explicitly in the import if you need more.
-- **Sandbox**: each federated session can reach the open folder and nothing else, is
-  refused any extension install, and is then frozen so a query cannot undo it. With
-  no folder open it gets no file access at all. Treat it as defence in depth, not a
-  guarantee.
+- **Sandbox**: each federated session can reach the open folder and nothing else,
+  and is then frozen so a query cannot undo it. With no folder open it gets no file
+  access at all. Anything the session needs — an extension, an `@attach` — is
+  fetched *before* the freeze; your SQL is refused all of it, `install` included.
+  Treat it as defence in depth, not a guarantee.
 
 ## The terminal
 
@@ -1033,7 +1111,7 @@ The theme button cycles Auto → Light → Dark and remembers your choice.
 | `ALKYON_SHELL` | PowerShell / `$SHELL` | what the terminal spawns |
 | `ALKYON_TERMINAL` | loopback only | `always` to expose the terminal elsewhere |
 | `ALKYON_PAGE_ROWS` | `50000` | rows in one page of a result |
-| `ALKYON_IMPORT_MAX_ROWS` | `1000000` | cap on one federated `@import` |
+| `ALKYON_IMPORT_MAX_ROWS` | — | opt-in ceiling on one federated `@import` |
 | `ALKYON_LOG` | `alkyon=info` | `tracing` filter |
 
 `ALKYON_CONFIG_DIR` is what makes a container or a portable install work — the

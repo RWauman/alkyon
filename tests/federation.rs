@@ -129,12 +129,50 @@ async fn integers_and_dates_survive_the_round_trip() {
     );
 }
 
+/// There is no row cap. The old default was a million, and it was really a memory
+/// limit wearing a row count — every cell was held as a `String` in this process
+/// until the import finished.
+///
+/// So the number here is deliberately just past that million: it is the assertion
+/// that the old ceiling is gone, and it only passes because the rows now go into
+/// DuckDB as they arrive.
 #[tokio::test]
-async fn the_import_cap_fails_loudly() {
+async fn an_import_is_not_capped() {
     let Some(state) = seeded().await else {
         eprintln!("skipped: ALKYON_SOURCES is not set");
         return;
     };
+
+    let (_, rows) = run(
+        &state,
+        "-- @duckdb\n\
+         -- @import big = pg-dev/alkyon_demo : select i, i * 2 as double from generate_series(1, 1200000) g(i)\n\
+         select count(*) as n, sum(double) as total, max(i) as biggest from big;",
+    )
+    .await
+    .expect("an import past the old million-row ceiling");
+
+    assert_eq!(rows[0][0], Value::from(1_200_000));
+    assert_eq!(rows[0][2], Value::from(1_200_000));
+    // 2 × (1 + 2 + … + 1 200 000), exactly — a float would have drifted.
+    assert_eq!(rows[0][1], Value::from(1_440_001_200_000i64));
+}
+
+/// A cap is opt-in, and when one is asked for it still fails rather than
+/// truncating: a join quietly missing half its rows is worse than a query that
+/// failed.
+#[tokio::test]
+async fn an_opt_in_cap_still_fails_loudly() {
+    let Some(state) = seeded().await else {
+        eprintln!("skipped: ALKYON_SOURCES is not set");
+        return;
+    };
+    assert_eq!(
+        Limits::default().max_import_rows,
+        None,
+        "the default must be no cap at all"
+    );
+
     // Passed in, not set through the environment: cargo runs these tests as
     // threads of one process, so a global would leak into every other test.
     let error = run_with(
@@ -143,7 +181,7 @@ async fn the_import_cap_fails_loudly() {
          -- @import o = pg-dev/alkyon_demo : select * from sales.order_line\n\
          select count(*) from o;",
         Limits {
-            max_import_rows: 100,
+            max_import_rows: Some(100),
         },
     )
     .await
@@ -153,7 +191,7 @@ async fn the_import_cap_fails_loudly() {
     assert!(message.contains("more than 100 rows"), "{message}");
     assert!(
         message.contains("ALKYON_IMPORT_MAX_ROWS"),
-        "the message should say how to raise it: {message}"
+        "the message should say where the ceiling came from: {message}"
     );
 }
 
@@ -265,6 +303,206 @@ async fn reads_and_writes_files_in_the_open_folder() {
             run(&state, &sql).await.is_err(),
             "`{outside}` should have been refused"
         );
+    }
+}
+
+// ------------------------------------------------------------------ @attach
+
+/// The physical plan of `sql` against an attached PostgreSQL, as one blob of text.
+async fn plan_of(state: &AppState, sql: &str) -> String {
+    let buffer = format!("-- @duckdb\n-- @attach pg = pg-dev/alkyon_demo\nEXPLAIN {sql};");
+    let (_, rows) = run(state, &buffer).await.expect("a plan");
+    rows.iter()
+        .filter_map(|row| row.last().and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[tokio::test]
+async fn an_attached_server_is_queried_where_it_lives() {
+    let Some(state) = seeded().await else {
+        eprintln!("skipped: ALKYON_SOURCES is not set");
+        return;
+    };
+
+    // The alias is a *catalogue*, so the name has three parts. Nothing was read
+    // until this query asked.
+    let (columns, rows) = run(
+        &state,
+        "-- @duckdb\n\
+         -- @attach pg = pg-dev/alkyon_demo\n\
+         select count(*) as n from pg.sales.customer;",
+    )
+    .await
+    .expect("an attached postgres answers");
+    assert_eq!(columns, ["n"]);
+    assert_eq!(rows[0][0], Value::from(250));
+
+    // A view on the remote side is a relation like any other.
+    let (_, rows) = run(
+        &state,
+        "-- @duckdb\n\
+         -- @attach pg = pg-dev/alkyon_demo\n\
+         select count(*) as n from pg.sales.order_value;",
+    )
+    .await
+    .expect("a remote view");
+    assert!(rows[0][0].as_i64().is_some_and(|n| n > 0), "{:?}", rows[0]);
+}
+
+#[tokio::test]
+async fn mysql_attaches_too() {
+    let Some(state) = seeded().await else {
+        eprintln!("skipped: ALKYON_SOURCES is not set");
+        return;
+    };
+    // MySQL has no schema layer, so the name has two parts rather than three.
+    let (_, rows) = run(
+        &state,
+        "-- @duckdb\n\
+         -- @attach my = mysql-dev/sales\n\
+         select count(*) as n from my.customer;",
+    )
+    .await
+    .expect("an attached mysql answers");
+    assert!(rows[0][0].as_i64().is_some_and(|n| n > 0), "{:?}", rows[0]);
+}
+
+/// What `@attach` buys, and what it does not — asserted rather than promised.
+///
+/// The plan is the evidence: a filter lands *inside* `POSTGRES_SCAN`, so the server
+/// applies it, while a `group by` sits above the scan, so DuckDB does the grouping
+/// after every value has crossed the wire. That second half is the reason `@import`
+/// is still the right tool when the remote engine should do the work.
+#[tokio::test]
+async fn a_filter_is_pushed_down_but_a_group_by_is_not() {
+    let Some(state) = seeded().await else {
+        eprintln!("skipped: ALKYON_SOURCES is not set");
+        return;
+    };
+
+    let filtered = plan_of(&state, "select name from pg.sales.customer where id = 7").await;
+    assert!(filtered.contains("POSTGRES_SCAN"), "{filtered}");
+    assert!(
+        filtered.contains("Filters: id=7"),
+        "the filter should have gone to the server: {filtered}"
+    );
+    assert!(
+        filtered.contains("Projections:"),
+        "only the named columns should be read: {filtered}"
+    );
+
+    let grouped = plan_of(&state, "select country, count(*) from pg.sales.customer group by 1").await;
+    let scan = grouped.find("POSTGRES_SCAN").expect("a scan");
+    let group = grouped.find("HASH_GROUP_BY").expect("a local group-by");
+    assert!(
+        group < scan,
+        "the group-by sits above the scan, so it happens here and not there:\n{grouped}"
+    );
+}
+
+/// An attached catalogue joined to an imported table: the two ways in, in one
+/// buffer, which is the arrangement that makes them complementary rather than
+/// competing.
+#[tokio::test]
+async fn an_attached_server_joins_an_imported_one() {
+    let Some(state) = seeded().await else {
+        eprintln!("skipped: ALKYON_SOURCES is not set");
+        return;
+    };
+
+    let (columns, rows) = run(
+        &state,
+        "-- @duckdb\n\
+         -- @attach pg = pg-dev/alkyon_demo\n\
+         -- @import ms = mssql-dev/alkyon_demo : select top 5 id, credit from sales.customer order by id\n\
+         select p.id, p.name, m.credit\n\
+         from pg.sales.customer p join ms m on m.id = p.id\n\
+         order by p.id;",
+    )
+    .await
+    .expect("joining an attached server to an imported one");
+
+    assert_eq!(columns, ["id", "name", "credit"]);
+    assert_eq!(rows.len(), 5);
+    assert!(rows.iter().all(|row| row[2] != Value::Null), "{rows:?}");
+}
+
+/// `@attach` is READ_ONLY without an opt-out, because it is the only path in the
+/// whole program that could otherwise write to a production server.
+#[tokio::test]
+async fn an_attachment_cannot_be_written_to() {
+    let Some(state) = seeded().await else {
+        eprintln!("skipped: ALKYON_SOURCES is not set");
+        return;
+    };
+    for attempt in [
+        "insert into pg.sales.customer (name) values ('nope')",
+        "delete from pg.sales.customer where id = 1",
+        "create table pg.sales.nope (a int)",
+    ] {
+        let sql = format!("-- @duckdb\n-- @attach pg = pg-dev/alkyon_demo\n{attempt};");
+        let error = run(&state, &sql)
+            .await
+            .expect_err(&format!("`{attempt}` should have been refused"));
+        assert!(
+            error.to_string().to_lowercase().contains("read-only")
+                || error.to_string().to_lowercase().contains("read only"),
+            "`{attempt}` failed for the wrong reason: {error}"
+        );
+    }
+}
+
+/// Attaching opens the network, and the measurement that made this design
+/// possible is that the door can be shut afterwards. This is that measurement, as
+/// a test: a session with a live server in it must still be unable to read the
+/// machine it runs on.
+#[tokio::test]
+async fn an_attached_session_is_still_confined() {
+    let Some(state) = seeded().await else {
+        eprintln!("skipped: ALKYON_SOURCES is not set");
+        return;
+    };
+    for attempt in [
+        "select * from read_csv('C:/Windows/win.ini')",
+        "select * from 'C:/Windows/win.ini'",
+        "copy (select 1 as x) to 'C:/Windows/Temp/alkyon-should-not-exist.csv'",
+        "install httpfs",
+        // The extension is loaded, so this is the interesting one: a second
+        // attachment of the user's own choosing, to a server alkyon never approved.
+        "attach 'host=127.0.0.1 port=55432 dbname=alkyon_demo user=postgres password=alkyon-dev' as sneaky (type postgres)",
+    ] {
+        let sql = format!("-- @duckdb\n-- @attach pg = pg-dev/alkyon_demo\n{attempt};");
+        assert!(
+            run(&state, &sql).await.is_err(),
+            "`{attempt}` should have been refused"
+        );
+    }
+
+    // And the attachment itself still works, so the confinement did not simply
+    // break everything.
+    let (_, rows) = run(
+        &state,
+        "-- @duckdb\n-- @attach pg = pg-dev/alkyon_demo\nselect count(*) as n from pg.sales.customer;",
+    )
+    .await
+    .expect("the attachment survives the confinement");
+    assert_eq!(rows[0][0], Value::from(250));
+}
+
+/// For SQL Server and MongoDB there is no core extension, so the error has to send
+/// you to `@import` — which is not a workaround but the supported path.
+#[tokio::test]
+async fn an_engine_that_cannot_be_attached_says_what_to_do_instead() {
+    let Some(state) = seeded().await else {
+        eprintln!("skipped: ALKYON_SOURCES is not set");
+        return;
+    };
+    for source in ["mssql-dev", "mongo-dev"] {
+        let sql = format!("-- @duckdb\n-- @attach x = {source}\nselect 1;");
+        let error = run(&state, &sql).await.expect_err(source).to_string();
+        assert!(error.contains("@import"), "{source}: {error}");
+        assert!(error.contains("core extension"), "{source}: {error}");
     }
 }
 

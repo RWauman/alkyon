@@ -10,10 +10,11 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use alkyon::model::SourceKind;
 use alkyon::state::AppState;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use common::seeded;
+use common::{relational, seeded};
 use futures::{SinkExt, StreamExt};
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
@@ -160,6 +161,12 @@ async fn metadata_routes_answer_without_leaking_credentials() {
         assert!(databases.as_array().unwrap().contains(&json!(db)));
 
         let tables = get_json(Arc::clone(&state), &format!("/sources/{id}/tables?db={db}")).await;
+        assert!(!tables.as_array().unwrap().is_empty(), "{id}: no tables");
+        let kind: SourceKind =
+            serde_json::from_value(source["kind"].clone()).expect("a known source kind");
+        if !relational(kind) {
+            continue;
+        }
         assert!(
             tables.as_array().unwrap().iter().any(|t| {
                 t["schema"] == "sales" && t["name"] == "customer" && t["kind"] == "table"
@@ -290,6 +297,9 @@ async fn websocket_streams_a_result_set() {
     let addr = serve(Arc::clone(&state)).await;
 
     for source in sources {
+        if !relational(source.kind) {
+            continue;
+        }
         let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws/query"))
             .await
             .expect("websocket upgrade");
@@ -340,6 +350,9 @@ async fn websocket_pages_a_result_without_losing_rows() {
     let addr = serve(Arc::clone(&state)).await;
 
     for source in sources {
+        if !relational(source.kind) {
+            continue;
+        }
         let id = &source.id;
         let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws/query"))
             .await

@@ -125,7 +125,7 @@ fn client_options(cfg: &SourceConfig) -> Result<ClientOptions> {
 impl Connector for MongoConnector {
     async fn connect(&self, config: &SourceConfig) -> Result<Box<dyn Connection>> {
         let client = Client::with_options(client_options(config)?)
-            .map_err(|e| Error::BadRequest(format!("cannot reach MongoDB: {e}")))?;
+            .map_err(|e| Error::Mongo(format!("cannot reach the deployment: {e}")))?;
 
         // Prove the credentials before the source is registered, the way every
         // other connector does — building a client on its own connects to
@@ -148,19 +148,23 @@ impl Connector for MongoConnector {
 }
 
 /// Turn the driver's error into something worth reading.
+///
+/// [`Error::Mongo`] and not `BadRequest`: this is what the *server* said, so it
+/// belongs in the same class as what PostgreSQL and SQL Server say — a refused
+/// login is a bad gateway, not a malformed request.
 fn explain(error: mongodb::error::Error) -> Error {
     let said = error.to_string();
     // The one everybody hits: a right password against the wrong auth database,
     // or no `--auth` at all on the server.
     if said.contains("Authentication failed") {
-        return Error::BadRequest(
-            "MongoDB refused the login. The credential is checked against `admin`, which is \
+        return Error::Mongo(
+            "the login was refused. The credential is checked against `admin`, which is \
              where a root user lives; a user created inside another database has to be \
              given there."
                 .into(),
         );
     }
-    Error::BadRequest(format!("mongodb: {said}"))
+    Error::Mongo(said)
 }
 
 pub struct MongoConnection {

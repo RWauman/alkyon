@@ -20,7 +20,13 @@
 
 use crate::error::{Error, Result};
 
-/// A table to materialise into DuckDB before the query runs.
+/// Something made available to the DuckDB session before the query runs.
+///
+/// Not all of these are materialised, and the difference is the whole cost model:
+/// [`Import::Query`] and [`Import::Excel`] bring rows across, [`Import::Files`]
+/// hands DuckDB a path, and [`Import::Attach`] hands it a live server to plan
+/// against. They share this enum because they share one rule — an alias is claimed
+/// once, whatever claims it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Import {
     /// The result of native SQL run against a registered source.
@@ -51,6 +57,18 @@ pub enum Import {
         path: String,
         sheet: Option<String>,
     },
+    /// A whole server, attached so DuckDB plans the remote read itself.
+    ///
+    /// The alias is a **catalogue**, not a table, so what you write is
+    /// `pg.sales.customer` rather than a bare name. Nothing is read until the
+    /// query asks, and what the server receives is DuckDB's SQL — see
+    /// [`crate::federation::attach`] for exactly how much of the query gets
+    /// pushed down, which is less than one would hope.
+    Attach {
+        alias: String,
+        source: String,
+        database: Option<String>,
+    },
 }
 
 impl Import {
@@ -58,7 +76,8 @@ impl Import {
         match self {
             Import::Query { alias, .. }
             | Import::Files { alias, .. }
-            | Import::Excel { alias, .. } => alias,
+            | Import::Excel { alias, .. }
+            | Import::Attach { alias, .. } => alias,
         }
     }
 }
@@ -114,6 +133,7 @@ pub fn parse(buffer: &str) -> Result<Program> {
         let import = match name {
             "duckdb" => continue,
             "import" => parse_query_import(rest).map_err(|e| annotate(e, &at()))?,
+            "attach" => parse_attach(rest).map_err(|e| annotate(e, &at()))?,
             "excel" => parse_excel_import(rest).map_err(|e| annotate(e, &at()))?,
             // An unknown `@word` is just prose in a comment.
             _ => continue,
@@ -176,24 +196,60 @@ fn parse_query_import(rest: &str) -> Result<Import> {
         return Err(Error::BadRequest(format!("@import {alias}: no SQL given")));
     }
 
-    // A source key may itself contain `/`? It may not — ids are
-    // `[A-Za-z0-9._-]+` and the scope prefix uses `:`. So the last `/` is the
-    // database separator.
-    let (source, database) = match target.rsplit_once('/') {
-        Some((source, database)) => (source.trim().to_owned(), Some(database.trim().to_owned())),
-        None => (target.clone(), None),
-    };
-    if source.is_empty() {
-        return Err(Error::BadRequest(format!(
-            "@import {alias}: no source given"
-        )));
-    }
-
+    let (source, database) = split_target(&target, &format!("@import {alias}"))?;
     Ok(Import::Query {
         alias,
         source,
         database,
         sql,
+    })
+}
+
+/// `<source>[/<database>]`.
+///
+/// A source key cannot contain `/` — ids are `[A-Za-z0-9._-]+` and the scope
+/// prefix uses `:` — so the last one separates the database.
+fn split_target(target: &str, what: &str) -> Result<(String, Option<String>)> {
+    let (source, database) = match target.rsplit_once('/') {
+        Some((source, database)) => (source.trim().to_owned(), Some(database.trim().to_owned())),
+        None => (target.trim().to_owned(), None),
+    };
+    if source.is_empty() {
+        return Err(Error::BadRequest(format!("{what}: no source given")));
+    }
+    Ok((source, database))
+}
+
+/// `<alias> = <source>[/<database>]`
+///
+/// No `:` and no SQL, and that is the point: there is nothing to write in the
+/// source's dialect because DuckDB generates the remote query itself.
+fn parse_attach(rest: &str) -> Result<Import> {
+    let (alias, target) = split_once_trimmed(rest, '=').ok_or_else(|| {
+        Error::BadRequest("@attach needs `<alias> = <source>[/<database>]`".to_owned())
+    })?;
+    check_alias(&alias)?;
+
+    // Someone who has been writing `@import` all morning will type a colon here.
+    // Saying why there is no SQL to write is more use than "unexpected character".
+    // Past the scope prefix, which carries the one colon that is legitimate.
+    let scope = SCOPES
+        .iter()
+        .find(|scope| target.starts_with(**scope))
+        .map_or(0, |scope| scope.len());
+    if target[scope..].contains(':') {
+        return Err(Error::BadRequest(format!(
+            "@attach {alias}: takes no SQL — DuckDB writes the remote query itself. Drop the \
+             `:` to attach the whole database, or write `@import {alias} = … : <sql>` to run \
+             that SQL on the server instead."
+        )));
+    }
+
+    let (source, database) = split_target(&target, &format!("@attach {alias}"))?;
+    Ok(Import::Attach {
+        alias,
+        source,
+        database,
     })
 }
 
@@ -423,6 +479,61 @@ mod tests {
                 "`{pattern}` should have been refused"
             );
         }
+    }
+
+    #[test]
+    fn parses_an_attach() {
+        let program = parse(
+            "-- @duckdb\n\
+             -- @attach pg = user:pg-dev/warehouse\n\
+             select * from pg.sales.customer;",
+        )
+        .unwrap();
+        assert_eq!(
+            program.imports,
+            [Import::Attach {
+                alias: "pg".into(),
+                source: "user:pg-dev".into(),
+                database: Some("warehouse".into()),
+            }]
+        );
+
+        // The database is optional here too — the source's own is used.
+        let program = parse("-- @attach pg = pg-dev").unwrap();
+        assert_eq!(
+            program.imports,
+            [Import::Attach {
+                alias: "pg".into(),
+                source: "pg-dev".into(),
+                database: None,
+            }]
+        );
+    }
+
+    /// Anyone who has been writing `@import` all morning will reach for the colon.
+    /// Saying why there is no SQL to write beats "unexpected character".
+    #[test]
+    fn an_attach_with_sql_explains_itself() {
+        let error = parse("-- @attach pg = pg-dev : select 1")
+            .expect_err("no SQL belongs here")
+            .to_string();
+        assert!(error.contains("takes no SQL"), "{error}");
+        assert!(error.contains("@import"), "{error}");
+
+        // But a scope prefix carries a legitimate colon of its own.
+        assert!(parse("-- @attach pg = user:pg-dev/warehouse").is_ok());
+    }
+
+    /// One alias, one meaning — whichever directive claimed it.
+    #[test]
+    fn an_attach_clashes_with_an_import_of_the_same_name() {
+        let error = parse(
+            "-- @attach c = pg-dev\n\
+             -- @import c = mssql-dev : select 1",
+        )
+        .expect_err("clash")
+        .to_string();
+        assert!(error.contains("already imported"), "{error}");
     }
 
     #[test]

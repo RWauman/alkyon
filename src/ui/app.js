@@ -812,9 +812,9 @@ function nearMissHint(sql) {
  * statement cannot be run as written.
  */
 async function applyQualified(sql) {
-  // In DuckDB mode each `@import` names its own source and there is no single
-  // target to retarget to. Retargeting there would also rewrite names the
-  // federated query means literally.
+  // In DuckDB mode each `@attach` or `@import` names its own source and there is
+  // no single target to retarget to. Retargeting there would also rewrite names
+  // the federated query means literally.
   if (looksFederated(sql)) return { sql };
 
   const found = findCrossSource(sql, (id) => {
@@ -830,7 +830,8 @@ async function applyQualified(sql) {
   if (found.conflict) {
     status(
       `this statement names ${found.conflict.join(' and ')} — one query goes to one ` +
-        'source. To join across them, put `-- @duckdb` at the top and import each.',
+        'source. To join across them, put `-- @duckdb` at the top, then `@attach` or ' +
+        '`@import` each.',
       true,
     );
     return null;

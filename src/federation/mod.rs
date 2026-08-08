@@ -1,12 +1,25 @@
-//! DuckDB as a federator: materialise each import, then run the buffer over them.
+//! DuckDB as a federator: make each source available, then run the buffer over
+//! them.
 //!
-//! Imports rather than `ATTACH`, for now. It keeps the promise the whole project
-//! rests on — *pure dialect per source*: the `@import` line is written in the
-//! source's own SQL and nothing rewrites it, whereas `ATTACH` would have DuckDB's
-//! planner generate the remote query. It also works offline and with every
-//! connector, present and future. The cost is real and worth stating: the rows
-//! travel through Alkyon, there is no predicate pushdown, and so there is a cap.
+//! There are two ways in, and they are not ranked — they trade different things:
+//!
+//! - **`@import`** runs *your* SQL on the source, in the source's own dialect,
+//!   and streams the answer in. Everything you write is pushed down, because the
+//!   server is the one running it: aggregates, window functions, hints, a stored
+//!   procedure if you like. What travels is the result.
+//! - **`@attach`** hands DuckDB the live server and lets its planner generate the
+//!   remote query. Projections and filters are pushed down; **aggregations and
+//!   joins are not** — see [`attach`] for the measurements. What you get instead
+//!   is a whole catalogue you can browse and join without writing SQL per engine,
+//!   and only for PostgreSQL and MySQL, which are the engines DuckDB has a core
+//!   extension for.
+//!
+//! Neither path has a row cap. An import used to buffer every cell as a `String`
+//! in this process, which is why it did: the limit was really a memory limit
+//! wearing a row count. It now streams into DuckDB batch by batch, and DuckDB
+//! spills to [`Spill`] when it runs out of memory, so the bound is disk.
 
+pub mod attach;
 pub mod excel;
 pub mod program;
 
@@ -27,32 +40,30 @@ use program::{Import, Program};
 /// Bounds on a federated run, passed in rather than read from the environment
 /// deep inside the machinery — a global read there is untestable, and made two
 /// tests interfere the first time this was written.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct Limits {
-    /// How many rows a single import may pull. Exceeding it is an error, not a
-    /// silent truncation: a join quietly missing half its rows is worse than a
-    /// query that failed.
-    pub max_import_rows: usize,
-}
-
-impl Default for Limits {
-    fn default() -> Self {
-        Self {
-            max_import_rows: 1_000_000,
-        }
-    }
+    /// How many rows a single import may pull. **`None` by default**: there is no
+    /// cap.
+    ///
+    /// There used to be one, at a million rows, and it was really a memory limit
+    /// wearing a row count — every cell was held as a `String` in this process
+    /// until the import finished. Rows now go into DuckDB as they arrive and DuckDB
+    /// spills to disk, so the number that mattered stopped being the row count.
+    ///
+    /// Still settable with `ALKYON_IMPORT_MAX_ROWS`, for a shared machine where a
+    /// mistyped import should fail rather than fill a disk. Exceeding it is an
+    /// error and never a truncation: a join quietly missing half its rows is worse
+    /// than a query that failed.
+    pub max_import_rows: Option<usize>,
 }
 
 impl Limits {
     pub fn from_env() -> Self {
-        let mut limits = Self::default();
-        if let Some(rows) = std::env::var("ALKYON_IMPORT_MAX_ROWS")
-            .ok()
-            .and_then(|value| value.parse().ok())
-        {
-            limits.max_import_rows = rows;
+        Self {
+            max_import_rows: std::env::var("ALKYON_IMPORT_MAX_ROWS")
+                .ok()
+                .and_then(|value| value.parse().ok()),
         }
-        limits
     }
 }
 
@@ -100,23 +111,30 @@ pub(crate) struct Materialised {
     pub(crate) rows: Vec<Vec<Option<String>>>,
 }
 
-/// An import, once it is ready for the DuckDB session.
-enum Prepared {
-    /// Rows pulled through Alkyon and rebuilt as a table.
-    Rows(Materialised),
-    /// A path DuckDB reads for itself.
-    ///
-    /// Worth the separate arm: a materialised import turns every cell into a
-    /// `String` in this process, which for a 2.5M-row parquet is minutes and
-    /// gigabytes. A scan is a view over the file, so DuckDB reads the columns it
-    /// needs and nothing crosses the process at all.
-    Scan {
+/// One instruction for the thread that owns the DuckDB connection.
+///
+/// The session is built from the *outside* now: rows arrive from a source on the
+/// async side and are appended as they come, rather than being collected into a
+/// `Vec<Vec<Option<String>>>` first. That is the whole of what removed the row cap
+/// — the cap was never about rows, it was about holding all of them at once.
+enum Step {
+    /// A view over files DuckDB reads for itself. Nothing crosses this process:
+    /// binding it reads a header, and the columns it does not need are never read.
+    Scan { alias: String, expression: String },
+    /// Start a table. The columns are known from the source's own metadata, which
+    /// arrives before its first row.
+    Begin {
         alias: String,
-        /// e.g. `read_parquet('C:/data/2022/*.parquet')`
-        expression: String,
-        /// What the session must be allowed to touch for that to bind.
-        grant: Sandbox,
+        columns: Vec<ColumnMeta>,
     },
+    /// Rows for the table most recently begun.
+    Rows(Vec<Vec<Option<String>>>),
+    /// That table is complete: cast it into shape.
+    Seal,
+    /// A source failed. The query must not run against a half-filled session, so
+    /// this says "stop" rather than simply closing the channel — closing it means
+    /// "everything arrived".
+    Stop,
 }
 
 pub(crate) fn quote_identifier(name: &str) -> String {
@@ -143,62 +161,83 @@ fn as_text(value: &Value) -> Option<String> {
     }
 }
 
-/// Pull an import's rows from its source. Async, because this is ordinary
-/// connector work — the DuckDB half happens later, on a blocking thread.
-async fn materialise_query(
+/// Pull an import's rows from its source and push them at DuckDB as they arrive.
+///
+/// Nothing accumulates here. The channel is short, so a source that outruns the
+/// appender is made to wait rather than filling this process with `String`s —
+/// which is what the row cap used to be protecting against.
+async fn stream_query(
     state: &AppState,
+    steps: &tokio::sync::mpsc::Sender<Step>,
     alias: &str,
     source: &str,
     database: Option<&str>,
     sql: &str,
-    cap: usize,
-) -> Result<Materialised> {
+    cap: Option<usize>,
+) -> Result<()> {
     let connection = state.open(source, database).await?;
     let mut batches = connection.execute(sql);
 
-    let mut columns: Vec<ColumnMeta> = Vec::new();
-    let mut rows: Vec<Vec<Option<String>>> = Vec::new();
+    let mut began = false;
+    let mut rows = 0usize;
 
     while let Some(batch) = batches.next().await {
         match batch? {
             RowBatch::Columns(meta) => {
-                if columns.is_empty() {
-                    columns = meta.as_ref().clone();
-                } else {
+                if began {
                     // A batch of several statements has no single shape to import.
                     return Err(Error::BadRequest(format!(
                         "@import {alias}: the SQL returned more than one result set"
                     )));
                 }
+                began = true;
+                send(
+                    steps,
+                    Step::Begin {
+                        alias: alias.to_owned(),
+                        columns: meta.as_ref().clone(),
+                    },
+                )
+                .await?;
             }
             RowBatch::Rows(batch) => {
-                if rows.len() + batch.len() > cap {
+                rows += batch.len();
+                if let Some(cap) = cap.filter(|cap| rows > *cap) {
                     return Err(Error::BadRequest(format!(
-                        "@import {alias}: more than {cap} rows. Narrow the import, or raise \
-                         ALKYON_IMPORT_MAX_ROWS."
+                        "@import {alias}: more than {cap} rows, which is the ceiling \
+                         ALKYON_IMPORT_MAX_ROWS sets. Narrow the import, or raise it — there is \
+                         no cap unless one is asked for."
                     )));
                 }
-                rows.extend(
-                    batch
-                        .iter()
-                        .map(|row| row.iter().map(as_text).collect::<Vec<_>>()),
-                );
+                let text = batch
+                    .iter()
+                    .map(|row| row.iter().map(as_text).collect::<Vec<_>>())
+                    .collect();
+                send(steps, Step::Rows(text)).await?;
             }
             RowBatch::Affected(_) => {}
         }
     }
 
-    if columns.is_empty() {
+    if !began {
         return Err(Error::BadRequest(format!(
             "@import {alias}: the SQL returned no result set"
         )));
     }
+    send(steps, Step::Seal).await?;
+    tracing::info!(alias, rows, "streamed an import");
+    Ok(())
+}
 
-    Ok(Materialised {
-        alias: alias.to_owned(),
-        columns,
-        rows,
-    })
+/// Hand a step to the DuckDB thread.
+///
+/// A closed channel means the worker has already failed, and its error is the one
+/// worth reporting — so this says so plainly and lets the caller reconcile.
+async fn send(steps: &tokio::sync::mpsc::Sender<Step>, step: Step) -> Result<()> {
+    steps
+        .send(step)
+        .await
+        .map_err(|_| Error::Federated("the DuckDB session ended early".into()))
 }
 
 /// Turn `<folder source>/<pattern>` into a scan DuckDB can bind.
@@ -210,7 +249,7 @@ async fn prepare_scan(
     alias: &str,
     source: &str,
     pattern: &str,
-) -> Result<Prepared> {
+) -> Result<(String, Sandbox)> {
     let record = state.record(source).await?;
     // Azure storage is excluded along with the servers, and for the same reason
     // in reverse: its path names a container, not a folder anyone can point a
@@ -252,18 +291,17 @@ async fn prepare_scan(
             ))
         })?;
 
-    Ok(Prepared::Scan {
-        alias: alias.to_owned(),
-        expression: format!("{reader}({})", quote_literal(&target)),
+    Ok((
+        format!("{reader}({})", quote_literal(&target)),
         // A folder source grants its folder — a glob has to be listed before it
         // can be opened. A file source grants only that file, so importing it
         // here is no wider than querying it directly.
-        grant: if root.is_dir() {
+        if root.is_dir() {
             Sandbox::directory(root)
         } else {
             Sandbox::file(root)
         },
-    })
+    ))
 }
 
 fn materialise_excel(
@@ -534,9 +572,76 @@ pub fn open_duckdb_needing(
     schema: Option<&str>,
     extensions: &[&str],
 ) -> Result<Connection> {
+    open_duckdb_with(Setup {
+        sandbox,
+        schema,
+        extensions,
+        attachments: &[],
+        spill: None,
+    })
+}
+
+/// Everything a confined DuckDB session may be opened with.
+///
+/// A struct rather than five positional arguments, because the *order* of what
+/// follows is the only thing that makes any of it work, and a caller has no
+/// business choosing it.
+pub struct Setup<'a> {
+    pub sandbox: &'a Sandbox,
+    /// Created and put on the search path, so a bare name resolves there.
+    pub schema: Option<&'a str>,
+    /// Fetched before the door shuts. `INSTALL` reaches the network.
+    pub extensions: &'a [&'a str],
+    /// Servers to attach. Their extensions are fetched from
+    /// [`attach::Engine::extension`], so they need not be listed above.
+    pub attachments: &'a [attach::Attachment],
+    /// Where DuckDB may spill when it runs out of memory. Without one, an
+    /// oversized query is an out-of-memory error instead.
+    pub spill: Option<&'a std::path::Path>,
+}
+
+/// Open an in-memory DuckDB, give it what [`Setup`] allows, then freeze it.
+///
+/// The order is the whole design, and every step of it was measured:
+///
+/// 1. **Extensions and attachments first**, while external access is still on:
+///    `INSTALL` fetches over the network and `ATTACH` opens a connection, and
+///    external access cannot be turned back on once a database is running.
+/// 2. **Then the grants** — `allowed_directories` and `allowed_paths` — which
+///    DuckDB refuses to change after external access is off.
+/// 3. **Then the door**, and then the lock.
+///
+/// The measurement that matters: an attachment made in step 1 keeps working after
+/// step 3. A remote `count`, a pushed-down filter, even a self-join that needs more
+/// connections than the warm one — all still answer, while `read_csv` on an
+/// ungranted local file is refused. So attaching a server costs no confinement,
+/// exactly as loading an extension does not.
+pub fn open_duckdb_with(setup: Setup<'_>) -> Result<Connection> {
+    let Setup {
+        sandbox,
+        schema,
+        extensions,
+        attachments,
+        spill,
+    } = setup;
     let connection = Connection::open_in_memory().map_err(federated)?;
     for extension in extensions {
         fetch_extension(&connection, extension)?;
+    }
+    for attachment in attachments {
+        fetch_extension(&connection, attachment.engine.extension())?;
+        for statement in attachment.statements() {
+            connection.execute_batch(statement).map_err(|e| {
+                // Never the statement: the secret is in it. The alias is enough to
+                // say which `@attach` line went wrong.
+                Error::Federated(format!("@attach {}: {e}", attachment.alias))
+            })?;
+        }
+        tracing::info!(
+            alias = %attachment.alias,
+            engine = attachment.engine.extension(),
+            "attached a server"
+        );
     }
 
     // Before anything is locked down, and best effort: the `parquet` and `json`
@@ -581,6 +686,19 @@ pub fn open_duckdb_needing(
         setup.push_str(&format!(
             "SET allowed_paths = [{}];\n",
             list(&sandbox.files)
+        ));
+    }
+    if let Some(spill) = spill {
+        // Somewhere to put what will not fit in memory. Without this an oversized
+        // query is an "Out of Memory Error" and nothing else; with it, DuckDB
+        // writes temporary files and finishes. Measured under a 150 MB limit: a
+        // million appended rows landed in seven spill files and counted exactly.
+        //
+        // Not part of the grant, and it does not have to be: the temp directory is
+        // DuckDB's own bookkeeping, and it keeps working with external access off.
+        setup.push_str(&format!(
+            "SET temp_directory = {};\n",
+            quote_literal(&spill.to_string_lossy())
         ));
     }
 
@@ -642,14 +760,28 @@ fn substitute(sql: &str, root: Option<&PathBuf>) -> Result<String> {
     Ok(sql.replace(FOLDER_TOKEN, &path))
 }
 
-/// Create `alias` in DuckDB from already-pulled rows.
+/// A table being filled from a source, one batch at a time.
 ///
-/// Two steps on purpose: an all-VARCHAR staging table, then a `CAST` into the real
-/// one. DuckDB parses the text, so decimals keep their digits and dates parse
-/// without a hand-written converter per dialect.
-pub(crate) fn load(connection: &Connection, table: &Materialised) -> Result<()> {
-    let staging = format!("{}__alkyon_raw", table.alias);
-    let placeholders = (0..table.columns.len())
+/// Two tables on purpose, and this is where that happens: rows land in an
+/// all-VARCHAR staging table, and [`seal`] `CAST`s them into the real one. DuckDB
+/// parses the text, so decimals keep their digits and dates parse without a
+/// hand-written converter per dialect.
+struct Staging<'a> {
+    alias: String,
+    columns: Vec<ColumnMeta>,
+    table: String,
+    appender: duckdb::Appender<'a>,
+    rows: usize,
+}
+
+/// Create the staging table for `alias` and open an appender on it.
+fn begin<'a>(
+    connection: &'a Connection,
+    alias: &str,
+    columns: Vec<ColumnMeta>,
+) -> Result<Staging<'a>> {
+    let table = format!("{alias}__alkyon_raw");
+    let placeholders = (0..columns.len())
         .map(|index| format!("c{index} VARCHAR"))
         .collect::<Vec<_>>()
         .join(", ");
@@ -659,22 +791,39 @@ pub(crate) fn load(connection: &Connection, table: &Materialised) -> Result<()> 
     connection
         .execute_batch(&format!(
             "CREATE TABLE main.{} ({placeholders});",
-            quote_identifier(&staging)
+            quote_identifier(&table)
         ))
         .map_err(federated)?;
 
-    {
-        let mut appender = connection.appender(&staging).map_err(federated)?;
-        for row in &table.rows {
+    let appender = connection.appender(&table).map_err(federated)?;
+    Ok(Staging {
+        alias: alias.to_owned(),
+        columns,
+        table,
+        appender,
+        rows: 0,
+    })
+}
+
+impl Staging<'_> {
+    fn push(&mut self, batch: &[Vec<Option<String>>]) -> Result<()> {
+        for row in batch {
             // `&dyn ToSql` over Option<String> gives NULL for None.
             let values: Vec<&dyn duckdb::ToSql> =
                 row.iter().map(|cell| cell as &dyn duckdb::ToSql).collect();
-            appender.append_row(&values[..]).map_err(federated)?;
+            self.appender.append_row(&values[..]).map_err(federated)?;
         }
-        appender.flush().map_err(federated)?;
+        self.rows += batch.len();
+        Ok(())
     }
+}
 
-    let projection = table
+/// Type the staged rows into the table the query will see, and drop the staging.
+fn seal(connection: &Connection, mut staging: Staging<'_>) -> Result<usize> {
+    staging.appender.flush().map_err(federated)?;
+    drop(staging.appender);
+
+    let projection = staging
         .columns
         .iter()
         .enumerate()
@@ -696,16 +845,94 @@ pub(crate) fn load(connection: &Connection, table: &Materialised) -> Result<()> 
         .execute_batch(&format!(
             "CREATE TABLE {alias} AS SELECT {projection} FROM main.{staging};\n\
              DROP TABLE main.{staging};",
-            alias = quote_identifier(&table.alias),
-            staging = quote_identifier(&staging),
+            alias = quote_identifier(&staging.alias),
+            staging = quote_identifier(&staging.table),
         ))
         .map_err(|e| {
             Error::Federated(format!(
                 "@import {}: could not type the imported rows: {e}",
-                table.alias
+                staging.alias
             ))
         })?;
+    Ok(staging.rows)
+}
+
+/// Create `alias` in DuckDB from rows already held in memory.
+///
+/// The one caller left is the folder connector's spreadsheet path: calamine reads
+/// a whole sheet before it can report a column, so there is nothing to stream.
+pub(crate) fn load(connection: &Connection, table: &Materialised) -> Result<()> {
+    let mut staging = begin(connection, &table.alias, table.columns.clone())?;
+    staging.push(&table.rows)?;
+    seal(connection, staging)?;
     Ok(())
+}
+
+/// Build the session from the steps the feeder sends, until it says it is done.
+///
+/// Returns whether the query should run: a [`Step::Stop`] means a source failed
+/// part way, and answering from a half-filled session would be worse than any
+/// error message.
+fn build(connection: &Connection, steps: &mut tokio::sync::mpsc::Receiver<Step>) -> Result<bool> {
+    let mut open: Option<Staging> = None;
+
+    while let Some(step) = steps.blocking_recv() {
+        match step {
+            Step::Scan { alias, expression } => {
+                // A view, not a table: binding it reads the file's header and
+                // nothing else until the query asks for rows.
+                connection
+                    .execute_batch(&format!(
+                        "CREATE VIEW {} AS SELECT * FROM {expression};",
+                        quote_identifier(&alias)
+                    ))
+                    .map_err(|e| Error::Federated(format!("@import {alias}: {e}")))?;
+            }
+            Step::Begin { alias, columns } => {
+                open = Some(begin(connection, &alias, columns)?);
+            }
+            Step::Rows(batch) => match open.as_mut() {
+                Some(staging) => staging.push(&batch)?,
+                None => {
+                    return Err(Error::Federated(
+                        "rows arrived before the table they belong to".into(),
+                    ))
+                }
+            },
+            Step::Seal => {
+                if let Some(staging) = open.take() {
+                    let alias = staging.alias.clone();
+                    let rows = seal(connection, staging)?;
+                    tracing::debug!(alias = %alias, rows, "loaded an import");
+                }
+            }
+            Step::Stop => return Ok(false),
+        }
+    }
+    Ok(true)
+}
+
+/// Where DuckDB writes what will not fit in memory, removed when the query ends.
+///
+/// This is what makes an uncapped import a promise rather than a hope: without a
+/// temp directory, an in-memory DuckDB that runs out of memory has nowhere to go
+/// and fails.
+struct Spill(PathBuf);
+
+impl Spill {
+    fn new() -> Result<Self> {
+        let path = std::env::temp_dir().join(format!("alkyon-spill-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&path)?;
+        Ok(Spill(path))
+    }
+}
+
+impl Drop for Spill {
+    fn drop(&mut self) {
+        // Best effort: a leftover directory is untidy, not wrong, and there is
+        // nothing useful to do with the error here.
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 /// Run `sql` in DuckDB, pushing batches down `sink`.
@@ -1023,66 +1250,67 @@ pub fn execute<'a>(
             None => Sandbox::default(),
         };
 
-        // Everything the sources have to give, gathered before DuckDB opens.
-        let mut tables = Vec::new();
+        // First pass: everything that has to be settled *before* DuckDB opens,
+        // because the session's grants and its attachments cannot be changed once
+        // it is locked. No rows are read here.
+        let mut scans = Vec::new();
+        let mut attachments = Vec::new();
         for import in &program.imports {
-            let prepared = match import {
-                Import::Query { alias, source, database, sql } => {
-                    Prepared::Rows(materialise_query(
-                        state,
-                        alias,
-                        source,
-                        database.as_deref(),
-                        sql,
-                        limits.max_import_rows,
-                    )
-                    .await?)
-                }
+            match import {
                 Import::Files { alias, source, pattern } => {
-                    prepare_scan(state, alias, source, pattern).await?
-                }
-                Import::Excel { alias, path, sheet } => {
-                    Prepared::Rows(materialise_excel(alias, root.as_ref(), path, sheet.as_deref())?)
-                }
-            };
-            match &prepared {
-                Prepared::Rows(table) => {
-                    tracing::info!(alias = %table.alias, rows = table.rows.len(), "materialised import")
-                }
-                Prepared::Scan { alias, expression, grant } => {
+                    let (expression, grant) = prepare_scan(state, alias, source, pattern).await?;
                     tracing::info!(alias, expression, "scanned import");
-                    sandbox.absorb(grant.clone());
+                    sandbox.absorb(grant);
+                    scans.push(Step::Scan { alias: alias.clone(), expression });
                 }
+                Import::Attach { alias, source, database } => {
+                    let config = state.resolve(source, database.as_deref()).await?;
+                    attachments.push(attach::plan(alias, &config)?);
+                }
+                Import::Query { .. } | Import::Excel { .. } => {}
             }
-            tables.push(prepared);
         }
 
         let sql = substitute(&program.sql, root.as_ref())?;
+        let spill = Spill::new()?;
+        let (steps, mut instructions) = tokio::sync::mpsc::channel::<Step>(2);
         let (sink, mut source) = tokio::sync::mpsc::channel::<Result<RowBatch>>(4);
 
         // DuckDB is synchronous, so it gets its own thread rather than stalling
-        // the runtime for the length of the query.
+        // the runtime for the length of the query. It owns the connection for the
+        // whole run now — the rows arrive while it is open, which is what lets an
+        // import of any size through.
         let worker = tokio::task::spawn_blocking(move || -> Result<()> {
-            let connection = open_duckdb(&sandbox)?;
-            for table in &tables {
-                match table {
-                    Prepared::Rows(table) => load(&connection, table)?,
-                    Prepared::Scan { alias, expression, .. } => {
-                        // A view, not a table: binding it reads the file's header
-                        // and nothing else until the query asks for rows.
-                        connection
-                            .execute_batch(&format!(
-                                "CREATE VIEW {} AS SELECT * FROM {expression};",
-                                quote_identifier(alias)
-                            ))
-                            .map_err(|e| {
-                                Error::Federated(format!("@import {alias}: {e}"))
-                            })?;
-                    }
-                }
+            let connection = open_duckdb_with(Setup {
+                sandbox: &sandbox,
+                schema: None,
+                extensions: &[],
+                attachments: &attachments,
+                spill: Some(&spill.0),
+            })?;
+            if build(&connection, &mut instructions)? {
+                run(&connection, &sql, &sink)?;
             }
-            run(&connection, &sql, &sink)
+            // Held until the query is done: DuckDB may still be reading what it
+            // spilled there.
+            drop(spill);
+            Ok(())
         });
+
+        // Second pass: fill the session. Views first, so an import failing does not
+        // leave a half-built one behind.
+        let fed = feed(state, &program, root.as_ref(), &steps, scans, limits).await;
+        if let Err(e) = fed {
+            // Tell the worker not to answer from what did arrive, then let its own
+            // error win if it had one — a closed channel is a symptom, not a cause.
+            let _ = steps.send(Step::Stop).await;
+            drop(steps);
+            worker.await.map_err(|e| Error::Federated(format!("the federated query panicked: {e}")))??;
+            Err(e)?;
+            return;
+        }
+        // Nothing more to send: the worker takes the closed channel as "go".
+        drop(steps);
 
         while let Some(batch) = source.recv().await {
             yield batch?;
@@ -1091,4 +1319,46 @@ pub fn execute<'a>(
             .await
             .map_err(|e| Error::Federated(format!("the federated query panicked: {e}")))??;
     })
+}
+
+/// Send the session everything it needs, in the order it needs it.
+async fn feed(
+    state: &AppState,
+    program: &Program,
+    root: Option<&PathBuf>,
+    steps: &tokio::sync::mpsc::Sender<Step>,
+    scans: Vec<Step>,
+    limits: Limits,
+) -> Result<()> {
+    for scan in scans {
+        send(steps, scan).await?;
+    }
+
+    for import in &program.imports {
+        match import {
+            Import::Query { alias, source, database, sql } => {
+                stream_query(
+                    state,
+                    steps,
+                    alias,
+                    source,
+                    database.as_deref(),
+                    sql,
+                    limits.max_import_rows,
+                )
+                .await?;
+            }
+            Import::Excel { alias, path, sheet } => {
+                // Calamine reads a whole sheet before it can name a column, so
+                // there is nothing here to stream.
+                let table = materialise_excel(alias, root, path, sheet.as_deref())?;
+                tracing::info!(alias = %table.alias, rows = table.rows.len(), "read a spreadsheet");
+                send(steps, Step::Begin { alias: table.alias.clone(), columns: table.columns }).await?;
+                send(steps, Step::Rows(table.rows)).await?;
+                send(steps, Step::Seal).await?;
+            }
+            Import::Files { .. } | Import::Attach { .. } => {}
+        }
+    }
+    Ok(())
 }
