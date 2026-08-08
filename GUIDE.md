@@ -367,6 +367,11 @@ session can read the one account it was opened for.
   about bandwidth — it is what keeps the tree, and a snapshot that reads one
   header per table, usable. Past it the extra files are left out and the log says
   how many.
+- **What has been run against a real account**: a Fabric OneLake workspace, end
+  to end — the Entra sign-in, the extension installing itself, a listing of 336
+  files, parquet queries, and a Delta table read through its log. A plain blob or
+  ADLS Gen2 account uses the same code and the same API; it has not had the same
+  run.
 - **Permissions**: reading needs the **Storage Blob Data Reader** role on the
   account or container. Owning the storage account is not the same thing — that
   grants management, not data — and it is the usual reason for a surprising 403.
@@ -404,13 +409,6 @@ instance, so the two names agree and the redirect is followed normally.
 
 **What to use instead**: an [Azure storage source](#azure-storage-as-a-source)
 reads the same lakehouse over OneLake and answers DuckDB SQL.
-
-### Azure storage, end to end
-
-The parts are covered by tests and the error paths have been exercised against
-the live service, but the whole path — a signed-in account, the extension
-installing itself, a listing, and a query coming back — has not yet been run
-against a real storage account. Expect the first attempt to turn something up.
 
 ## Run a query
 

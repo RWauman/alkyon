@@ -84,6 +84,10 @@ no binary yet.
   DuckDB's `delta` extension, fetched once; a local Delta source keeps its
   confinement, because the extension is loaded before external access is shut and
   both still hold afterwards.
+- Verified against a real Fabric OneLake workspace: the sign-in, the extension
+  installing itself, a listing of 336 files, parquet queries, and a Delta table
+  read through its log. A plain blob or ADLS Gen2 account is the same code against
+  the same API, and has not had the same run.
 - **Excel is not read over Azure storage**: calamine wants a local file, and there
   is no longer one. The dialogue greys the option out and says why.
 - **The dialogue offers only the authentication methods an engine can use**, and
@@ -120,9 +124,6 @@ no binary yet.
   and the patch was dropped rather than kept for nothing. The same lakehouse is
   readable through an Azure storage source over OneLake.
 
-- **The Azure storage path has not been run end to end** against a real account —
-  the parts are tested and the error paths were exercised against the live
-  service, but no query has yet come back from a container.
 
 ### The result grid
 
