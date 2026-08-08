@@ -6,7 +6,10 @@
 # on purpose: a project's `.alkyon/sources.json` holds no credential and is meant
 # to be committed.
 /sources.json
-.alkyon/
+# The contents, not the directory: git cannot re-include a file whose parent is
+# excluded, and the one file worth committing lives in here.
+.alkyon/*
+!.alkyon/sources.json
 
 # Rust
 /target

@@ -101,21 +101,19 @@ fn config_for(cfg: &SourceConfig, db: &str) -> Result<Config> {
 ///
 /// - the part before the backslash is the host to open a socket to, and the name
 ///   the certificate is checked against;
-/// - the **whole** name, instance included, is what the login packet has to
-///   carry. On a Fabric endpoint the instance is what says which warehouse on a
-///   shared node this is, and a login without it is closed without a word —
-///   which is what "unexpected end of file" was. Microsoft's own Go driver
-///   builds the same string: `ServerName = p.Host + "\\" + p.Instance`.
+/// - the **whole** name, instance included, is what the login packet would have
+///   to carry, and `tiberius` cannot say both: `Config::host` is the certificate's
+///   name *and* the login's. Sending the host alone gets a Fabric login closed
+///   without a word, so a redirect carrying an instance is refused here with a
+///   sentence instead. See *What does not work yet* in the guide.
 ///
-/// The instance is never handed to the SQL Browser: the routing token brings its
-/// own port, so there is nothing to resolve, and asking would be the UDP timeout
-/// this path exists to avoid.
-fn routed_config(
-    cfg: &SourceConfig,
-    db: &str,
-    alternative: &str,
-    port: u16,
-) -> Result<(String, Config)> {
+/// Azure SQL is unaffected: it routes to a host and a port, with no instance, so
+/// the two names agree and there is nothing to choose between.
+///
+/// The instance is never handed to the SQL Browser either: the routing token
+/// brings its own port, so there is nothing to resolve, and asking would be a
+/// UDP timeout against a service no cloud endpoint runs.
+fn routed_config(cfg: &SourceConfig, db: &str, alternative: &str, port: u16) -> Result<Routed> {
     let (host, instance) = match alternative.split_once('\\') {
         Some((host, instance)) => (host, instance),
         None => (alternative, ""),
@@ -127,7 +125,18 @@ fn routed_config(
         )));
     }
 
-    let mut routed = config_for(
+    if !instance.is_empty() {
+        return Err(crate::error::Error::Unsupported(format!(
+            "`{}` redirects this connection to `{alternative}`, and the login would have to \
+             carry that whole name — instance included — for the server to know which \
+             database is meant. The driver alkyon uses takes one name for both the login \
+             and the certificate, so it cannot send it. This is why a Microsoft Fabric SQL \
+             endpoint does not connect; the guide says more. Azure SQL is unaffected.",
+            cfg.host
+        )));
+    }
+
+    let config = config_for(
         &SourceConfig {
             host: host.to_owned(),
             port: Some(port),
@@ -136,27 +145,20 @@ fn routed_config(
         },
         db,
     )?;
-    let addr = routed.get_addr();
 
-    if !instance.is_empty() {
-        // tiberius takes one name for both the login and the TLS check, and a
-        // name with a backslash in it is not a hostname a certificate can be
-        // verified against. So the instance can be sent only where the
-        // certificate is not being checked — which is a real limit, and one to
-        // state rather than to quietly impose.
-        if cfg.tls == TlsMode::Require {
-            return Err(crate::error::Error::BadRequest(format!(
-                "`{}` redirects to `{alternative}`, and that name has to be sent as it is \
-                 for the login to be accepted — which leaves nothing to verify the \
-                 certificate against. Choose `Require, trust any certificate`: the \
-                 connection stays encrypted, and only the certificate check is given up.",
-                cfg.host
-            )));
-        }
-        routed.host(alternative);
-    }
+    Ok(Routed {
+        addr: config.get_addr(),
+        config,
+    })
+}
 
-    Ok((addr, routed))
+/// Where a redirect sends us.
+#[derive(Debug)]
+struct Routed {
+    /// The address to dial. Kept out of the configuration so it can be asserted
+    /// on, and logged, without reading the driver's own state back.
+    addr: String,
+    config: Config,
 }
 
 /// Open a fresh session. SQL Server connections are cheap enough for a personal
@@ -183,7 +185,9 @@ async fn open(cfg: &SourceConfig, db: &str) -> Result<Session> {
         Ok(session) => Ok(session),
         Err(tiberius::error::Error::Routing { host, port }) => {
             tracing::debug!(%host, port, "following the server's routing token");
-            let (addr, routed) = routed_config(cfg, db, &host, port)?;
+            let routed = routed_config(cfg, db, &host, port)?;
+            let addr = routed.addr;
+            tracing::debug!(dialling = %addr, "reconnecting to the routed node");
 
             // Both legs otherwise fail with the same sentence, and which one
             // gave way is the whole question when a redirect is involved.
@@ -194,7 +198,7 @@ async fn open(cfg: &SourceConfig, db: &str) -> Result<Session> {
                 ))
             })?;
             tcp.set_nodelay(true)?;
-            Client::connect(routed, tcp.compat_write())
+            Client::connect(routed.config, tcp.compat_write())
                 .await
                 .map_err(|e| {
                     crate::error::Error::BadRequest(format!(
@@ -659,63 +663,42 @@ mod tests {
         }
     }
 
-    /// What Fabric answers a login with: go to this node instead. The name
-    /// carries an instance, and the address to dial is the part before it.
+    /// An Azure SQL redirect: a host and a port, nothing to choose between, and
+    /// the connection simply moves.
     #[test]
-    fn a_routed_address_dials_the_host_and_logs_in_with_the_whole_name() {
-        let full = r"pbipswissn2-switzerlandnorth.pbidedicated.windows.net\7TF6KDG7-AQNJJHAC-dw";
-        let (addr, routed) = routed_config(&azure(None), "db", full, 1433).unwrap();
-
-        // Dialled: the host alone. With the instance still attached this
-        // resolves to nothing at all.
-        assert_eq!(
-            addr,
-            "pbipswissn2-switzerlandnorth.pbidedicated.windows.net:1433"
-        );
-        // Sent in the login: the whole name. Without the instance the server
-        // closes the connection without a word.
-        assert_eq!(routed.get_addr(), format!("{full}:1433"));
-    }
-
-    #[test]
-    fn a_routed_address_without_an_instance_is_taken_as_it_is() {
-        let (addr, routed) =
+    fn a_routed_address_without_an_instance_is_followed() {
+        let routed =
             routed_config(&azure(None), "db", "node-3.database.windows.net", 11003).unwrap();
-        assert_eq!(addr, "node-3.database.windows.net:11003");
-        // Nothing extra to send, so the two agree and the certificate can be
-        // verified against the name.
-        assert_eq!(routed.get_addr(), addr);
+        assert_eq!(routed.addr, "node-3.database.windows.net:11003");
+        assert_eq!(routed.config.get_addr(), routed.addr);
     }
 
-    /// The redirect must not resurrect the SQL Browser: the routing token brings
-    /// its own port, and a lookup here would be the very timeout being avoided.
+    /// A Fabric redirect: the login would have to carry the instance, the driver
+    /// cannot say two names, and that is said rather than half-attempted. It was
+    /// half-attempted, and the server closed the connection without a word.
     #[test]
-    fn a_redirect_never_goes_back_to_the_browser() {
-        // 1434 is the browser's port, and `get_port` returns it whenever an
-        // instance is set without one.
-        let (addr, _) =
-            routed_config(&azure(Some("SQLEXPRESS")), "db", r"node.example\INST", 1433)
-                .expect("the source's own instance must not follow the redirect");
-        assert!(addr.ends_with(":1433"), "{addr}");
+    fn a_routed_address_carrying_an_instance_is_refused_with_the_reason() {
+        let full = r"pbipswissn2-switzerlandnorth.pbidedicated.windows.net\7TF6KDG7-AQNJJHAC-dw";
+        let refused = routed_config(&azure(None), "db", full, 1433)
+            .expect_err("the instance cannot be sent, so this must not look like it worked");
+
+        let said = refused.to_string();
+        assert!(said.contains("Fabric"), "{said}");
+        assert!(said.contains(full), "{said}");
     }
 
-    /// A certificate cannot be verified against a name that is not a hostname,
-    /// so that combination is refused with the setting that works — rather than
-    /// the verification being dropped without telling anyone.
+    /// Following a redirect must not quietly cost the certificate check — which
+    /// it would if the whole routed name were pushed through the field the
+    /// certificate is verified against.
     #[test]
-    fn a_redirect_carrying_an_instance_says_what_it_needs() {
+    fn following_a_redirect_keeps_the_certificate_verified() {
         let mut verifying = azure(None);
         verifying.tls = TlsMode::Require;
 
-        let refused = routed_config(&verifying, "db", r"node.example\INST-dw", 1433)
-            .expect_err("a backslash is not a name a certificate can be checked against");
-        assert!(
-            refused.to_string().contains("trust any certificate"),
-            "{refused}"
-        );
-
-        // With no instance there is nothing to give up, so it goes through.
-        assert!(routed_config(&verifying, "db", "node.example", 1433).is_ok());
+        let routed = routed_config(&verifying, "db", "node-3.database.windows.net", 11003)
+            .expect("a plain redirect is followable with the certificate still checked");
+        assert_eq!(routed.addr, "node-3.database.windows.net:11003");
+        assert_eq!(routed.config.get_addr(), routed.addr);
     }
 
     #[test]

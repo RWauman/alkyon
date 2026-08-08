@@ -216,6 +216,7 @@
         <option value="json">JSON</option>
         <option value="json_lines">JSON lines (one per line)</option>
         <option value="excel">Excel</option>
+        <option value="delta">Delta table</option>
       </select>
     </label>
 
@@ -230,10 +231,12 @@
     <label class="folder-only">Path <input name="path" id="folder-path" placeholder="C:\data\exports"></label>
     <label class="file-only">Path <input name="file-path" placeholder="C:\data\exports\sales.csv"></label>
 
+    <!-- A whole `abfss://` URL in either box is understood and taken apart: it is
+         what Fabric's Copy ABFS path and the portal both hand over. -->
     <label class="adls-only">Account <input name="account"
-      placeholder="contoso — or onelake.dfs.fabric.microsoft.com"></label>
+      placeholder="contoso — or paste a whole abfss:// path here"></label>
     <label class="adls-only">Container and folder <input name="adls-path"
-      placeholder="sales/exports/2026 — or a workspace and lakehouse"></label>
+      placeholder="sales/exports/2026 — or abfss://workspace@onelake.dfs.fabric.microsoft.com/…"></label>
 
     <!-- Filled from the folder itself once the path and the type are in. Every
          file is read unless it is ticked here. -->

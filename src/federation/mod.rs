@@ -10,6 +10,7 @@
 pub mod excel;
 pub mod program;
 
+use std::fmt;
 use std::path::PathBuf;
 
 use async_stream::try_stream;
@@ -356,6 +357,116 @@ impl Sandbox {
     }
 }
 
+/// Install and load an extension that is not linked in.
+///
+/// `LOAD` first: after the first time there is nothing to fetch. `INSTALL`
+/// reaches `extensions.duckdb.org` and writes to DuckDB's own extension
+/// directory, which is why it happens for a source that cannot be read without it
+/// and never as a side effect of anything else.
+fn fetch_extension(connection: &Connection, name: &str) -> Result<()> {
+    if connection.execute_batch(&format!("LOAD {name};")).is_ok() {
+        return Ok(());
+    }
+    tracing::info!(extension = name, "installing a DuckDB extension");
+    connection
+        .execute_batch(&format!("INSTALL {name}; LOAD {name};"))
+        .map_err(|e| {
+            Error::Federated(format!(
+                "cannot install DuckDB's `{name}` extension, which is what reads this source: {e}"
+            ))
+        })
+}
+
+/// What an Azure storage session needs to reach the account, and nothing else.
+#[derive(Clone)]
+pub struct AzureAccess {
+    /// The storage account the secret is for — `contoso`, or `onelake`.
+    pub account: String,
+    /// A bearer token for `https://storage.azure.com`, which is exactly what the
+    /// Entra sign-in mints.
+    pub token: String,
+    /// What the explorer shows where a server shows a database: the container and
+    /// how far into it, which is what tells one Azure source from another.
+    pub catalogue: String,
+}
+
+impl fmt::Debug for AzureAccess {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AzureAccess")
+            .field("account", &self.account)
+            .field("catalogue", &self.catalogue)
+            .field("token", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Open a DuckDB that can read one Azure storage account, and **no local file**.
+///
+/// The confinement is the same idea as [`open_duckdb_in`]'s, turned inside out.
+/// There, external access is off and a directory is the exception; here external
+/// access has to stay on — an extension and a network read both need it — so the
+/// local filesystem is shut instead:
+///
+/// ```text
+/// read a local file            → File system LocalFileSystem has been disabled
+/// reopen the local filesystem  → the configuration has been locked
+/// ```
+///
+/// Which makes this session *tighter* than a folder source's: that one can read a
+/// directory, this one can read nothing on the machine at all.
+///
+/// `enable_external_access` is deliberately never mentioned. It cannot be turned
+/// on after startup — DuckDB refuses with "Cannot enable external access while
+/// database is running" — so the only way to have it is to leave the default
+/// alone, and the only thing that matters is what is closed afterwards.
+pub fn open_duckdb_azure(
+    access: &AzureAccess,
+    schema: Option<&str>,
+    extensions: &[&str],
+) -> Result<Connection> {
+    let connection = Connection::open_in_memory().map_err(federated)?;
+
+    fetch_extension(&connection, "azure")?;
+    for extension in extensions {
+        fetch_extension(&connection, extension)?;
+    }
+
+    let mut setup = String::new();
+    if let Some(schema) = schema {
+        setup.push_str(&format!(
+            "CREATE SCHEMA IF NOT EXISTS {};\nSET search_path = {};\n",
+            quote_identifier(schema),
+            quote_literal(schema)
+        ));
+    }
+
+    // A secret rather than a setting: it is scoped to the account named here, so
+    // the session can reach that one and no other. The token is the one the
+    // sign-in already holds — `PROVIDER access_token` wants an audience of
+    // `https://storage.azure.com`, which is what it was minted for.
+    setup.push_str(&format!(
+        "CREATE SECRET alkyon_azure (TYPE azure, PROVIDER access_token, \
+         ACCESS_TOKEN {}, ACCOUNT_NAME {});\n",
+        quote_literal(&access.token),
+        quote_literal(&access.account),
+    ));
+
+    setup.push_str(
+        "SET disabled_filesystems = 'LocalFileSystem';\n\
+         SET allow_community_extensions = false;\n\
+         SET allow_unsigned_extensions = false;\n\
+         SET autoinstall_known_extensions = false;\n\
+         SET autoload_known_extensions = false;\n\
+         SET lock_configuration = true;\n",
+    );
+
+    connection.execute_batch(&setup).map_err(|e| {
+        // Never the setup text: it carries the token.
+        Error::Federated(format!("could not secure the Azure DuckDB session: {e}"))
+    })?;
+    Ok(connection)
+}
+
 /// Open an in-memory DuckDB, confine it, then freeze the configuration.
 ///
 /// This matters more than it looks: DuckDB can read and write arbitrary files and
@@ -372,7 +483,26 @@ pub fn open_duckdb(sandbox: &Sandbox) -> Result<Connection> {
 /// configuration option, so setting it after `lock_configuration` is refused, and
 /// the schema has to exist before the search path may name it.
 pub fn open_duckdb_in(sandbox: &Sandbox, schema: Option<&str>) -> Result<Connection> {
+    open_duckdb_needing(sandbox, schema, &[])
+}
+
+/// [`open_duckdb_in`], having first fetched an extension the source cannot be read
+/// without — `delta`, today.
+///
+/// **Before** external access is turned off, which is the only order that works:
+/// `LOAD` needs it, and it cannot be turned back on once a database is running.
+/// Measured: the extension keeps working afterwards — a `delta_scan` still runs
+/// with the door shut — and a file outside the grant is still refused. So a Delta
+/// table costs no confinement.
+pub fn open_duckdb_needing(
+    sandbox: &Sandbox,
+    schema: Option<&str>,
+    extensions: &[&str],
+) -> Result<Connection> {
     let connection = Connection::open_in_memory().map_err(federated)?;
+    for extension in extensions {
+        fetch_extension(&connection, extension)?;
+    }
 
     // Before anything is locked down, and best effort: the `parquet` and `json`
     // Cargo features link these in, in which case they may already be registered

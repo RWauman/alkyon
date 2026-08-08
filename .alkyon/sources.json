@@ -1,0 +1,92 @@
+[
+  {
+    "id": "sample-csv",
+    "kind": "folder",
+    "path": "./sample-data/csv",
+    "options": {
+      "format": "csv"
+    },
+    "auth": {
+      "method": "none"
+    },
+    "tls": "prefer"
+  },
+  {
+    "id": "sample-csv-european",
+    "kind": "file",
+    "path": "./sample-data/csv-european/ventes.csv",
+    "options": {
+      "format": "csv",
+      "csv": {
+        "delimiter": ";",
+        "decimal": ",",
+        "encoding": "latin-1",
+        "skip": 2
+      }
+    },
+    "auth": {
+      "method": "none"
+    },
+    "tls": "prefer"
+  },
+  {
+    "id": "sample-delta",
+    "kind": "folder",
+    "path": "./sample-data/delta",
+    "options": {
+      "format": "delta"
+    },
+    "auth": {
+      "method": "none"
+    },
+    "tls": "prefer"
+  },
+  {
+    "id": "sample-excel",
+    "kind": "folder",
+    "path": "./sample-data/excel",
+    "options": {
+      "format": "excel"
+    },
+    "auth": {
+      "method": "none"
+    },
+    "tls": "prefer"
+  },
+  {
+    "id": "sample-json",
+    "kind": "folder",
+    "path": "./sample-data/json",
+    "options": {
+      "format": "json"
+    },
+    "auth": {
+      "method": "none"
+    },
+    "tls": "prefer"
+  },
+  {
+    "id": "sample-jsonl",
+    "kind": "folder",
+    "path": "./sample-data/jsonl",
+    "options": {
+      "format": "json_lines"
+    },
+    "auth": {
+      "method": "none"
+    },
+    "tls": "prefer"
+  },
+  {
+    "id": "sample-parquet",
+    "kind": "folder",
+    "path": "./sample-data/parquet",
+    "options": {
+      "format": "parquet"
+    },
+    "auth": {
+      "method": "none"
+    },
+    "tls": "prefer"
+  }
+]

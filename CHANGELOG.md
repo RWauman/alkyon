@@ -54,41 +54,75 @@ no binary yet.
 - **Azure storage is a source**: blob containers, ADLS Gen2 filesystems and Fabric
   OneLake, which are one API under three names. It reads as a folder source in
   every respect — catalogue, `public`, a table per root file, a subdirectory
-  unioned with `source_file`, spreadsheets per sheet, `@import`.
-- **It syncs rather than querying remotely**, because the sandboxed DuckDB has no
-  network access and can load no extension. Files are mirrored locally, kept
-  between runs, and re-fetched only when their ETag changes; there is no predicate
-  pushdown, and the guide says so plainly.
-- **Entra, Windows integrated and pasted tokens are no longer offered for
-  PostgreSQL and MySQL**, whose connectors have only ever accepted a password.
-- **A routing token is followed.** Azure SQL and Fabric answer the login by
-  pointing at the node that actually holds the database — for a Fabric endpoint,
-  every time — and that arrived as *Server requested a connection to an
-  alternative address*. The routed name is split on its backslash, as Microsoft's
-  own Go driver does: the host is dialled on the port the token carries, and the
-  instance is dropped rather than sent to a SQL Browser that is not there. One
-  redirect, never a loop.
+  unioned with `source_file`, `@import`.
+- **It reads where the data lies**, through DuckDB's `azure` extension: nothing is
+  copied to this machine, a parquet's schema is a range request for its footer,
+  and a `where` clause is pushed down. Alkyon lists the container once — that is
+  what the tables are — and every read after that is DuckDB's. The first Azure
+  source installs the extension from `extensions.duckdb.org`, about two megabytes,
+  once; the guide says so where the promise of a self-contained binary is made,
+  which is now stated as the preference it always was rather than a vow.
+- **An Azure session is confined the other way round.** A folder source runs with
+  external access off and one directory allowed; that is impossible here, because
+  an extension and a network read both need it. So the **local filesystem is shut**
+  instead, and the configuration locked — making the session tighter than a folder
+  source's, which can at least read a directory. The account is reached through a
+  secret scoped to it, built from the sign-in's own token.
+- **A secret too long for one keychain entry is split across several.** Windows
+  Credential Manager caps a credential at 2 560 *bytes* — 1 280 UTF-16 characters,
+  not the 2 560 its own error message names — and an Entra refresh token is longer,
+  so a source that tested fine could not be saved. A
+  secret that fits is still written exactly as before — one entry, the password
+  itself — so nothing already stored has to move. Parts never outlive the secret
+  that needed them, and a part that has gone missing is an error rather than a
+  shorter secret: half a token looks exactly like a wrong password.
+- **Delta tables are read through their log**, in a local folder and in Azure
+  storage alike. A table is a directory holding a `_delta_log`, and the log says
+  which parquet are live — so a file that was replaced or deleted stops being
+  rows, which unioning the directory could never do. Found by the log rather than
+  by an extension, since Delta is the one format that is not a file. It needs
+  DuckDB's `delta` extension, fetched once; a local Delta source keeps its
+  confinement, because the extension is loaded before external access is shut and
+  both still hold afterwards.
+- **Excel is not read over Azure storage**: calamine wants a local file, and there
+  is no longer one. The dialogue greys the option out and says why.
+- **The dialogue offers only the authentication methods an engine can use**, and
+  hides the rest rather than greying them: PostgreSQL and MySQL take a password
+  and nothing else, so a list of four where three could only fail read as a
+  choice nobody had made yet.
+- **A routing token is followed.** Azure SQL answers a login by pointing at the
+  node that actually holds the database, and that arrived as *Server requested a
+  connection to an alternative address*. The routed name is split on its
+  backslash, as Microsoft's own Go driver does: the host is dialled on the port
+  the token carries, and the instance is never sent to a SQL Browser that is not
+  there. One redirect, never a loop.
 - **A hostname in *Named instance* is refused with a sentence saying where it
   belongs.** Naming an instance sends the connection to the SQL Browser on UDP
   1434, which no cloud endpoint runs, so pasting a Fabric endpoint there produced
   a browser timeout accusing a host that answers perfectly well.
+- **A redirect carrying an instance is refused with the reason.** The routed name
+  `host\instance` needs its two halves sent to two different places — the host to
+  the socket and the certificate, the whole name to the login — and `tiberius`
+  takes one name for both. Saying so beats sending half of it and having the
+  connection closed without a word.
+- **A whole `abfss://` or `https://` path can be pasted into either box** of an
+  Azure storage source, and is taken apart. Fabric's *Copy ABFS path* puts the
+  container before the `@` and the portal puts it first in the path; neither is
+  worth unpicking by hand.
 
 ### What does not work
 
-- **A Fabric SQL endpoint still cannot be connected to**, and the guide has a
-  section saying why. The sign-in, the token and the first login all succeed;
-  the login on the node Fabric routes to does not. `tiberius` takes one field
-  for both the TLS name and the login name, and after a Fabric redirect those
-  have to differ — host for the certificate, host *and* instance for the login.
-  Azure SQL is unaffected: its redirects carry no instance. Until this is
-  settled, the same lakehouse is readable through an Azure storage source over
-  OneLake.
-- **A Delta table is read as a plain folder of parquet.** The `_delta_log` is
-  ignored, so a lakehouse's `Tables/` is right only for append-only tables and
-  wrong after an update or a delete. `Files/` is unaffected.
-- **The Azure storage path has not been run end to end** against a real account
-  — the parts are tested and the error paths were exercised against the live
-  service, but no query has yet come back from a mirrored blob.
+- **A Fabric SQL endpoint cannot be connected to**, and the guide lists what was
+  ruled out so nobody spends the afternoon on it again. Fabric accepts the first
+  login and routes it; the login on the node it routes to is refused. A patched
+  `tiberius` that sends both names was tried, and the server's answer did not
+  change by a character — so the missing name is necessary but not sufficient,
+  and the patch was dropped rather than kept for nothing. The same lakehouse is
+  readable through an Azure storage source over OneLake.
+
+- **The Azure storage path has not been run end to end** against a real account —
+  the parts are tested and the error paths were exercised against the live
+  service, but no query has yet come back from a container.
 
 ### The result grid
 
@@ -146,8 +180,11 @@ no binary yet.
   rather than resolving against wherever the server happened to start.
 - `python docker/seed/make-sample-files.py` writes a `sample-data/` tree to click
   around in: the same 250 customers and 1 500 orders as CSV, JSON, JSON lines,
-  parquet and Excel, a deliberately awkward European CSV, and two workbooks of one
-  shape in a directory to see a union.
+  parquet, Excel and Delta, a deliberately awkward European CSV, and two workbooks
+  of one shape in a directory to see a union. The Delta table disagrees with its
+  own directory on purpose — its log removes a parquet that is still there, so it
+  has 250 rows where a union would give 310, which is exactly what reading the log
+  is for.
 - Two real workbooks are committed under `tests/fixtures/`, so the Excel path is
   tested against files Excel produced rather than against a writer crate.
 

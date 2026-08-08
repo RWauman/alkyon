@@ -169,6 +169,11 @@ pub enum FileFormat {
     JsonLines,
     /// A spreadsheet. One table per sheet.
     Excel,
+    /// A Delta table: a **directory** of parquet plus a `_delta_log` saying which
+    /// of those files are live and what the columns are. Unlike every other
+    /// format it is not a file, which is why it has no extension and is found by
+    /// the log rather than by a name.
+    Delta,
 }
 
 impl FileFormat {
@@ -180,6 +185,9 @@ impl FileFormat {
             FileFormat::Json => &["json"],
             FileFormat::JsonLines => &["jsonl", "ndjson"],
             FileFormat::Excel => &["xlsx", "xlsm", "xlsb", "xls"],
+            // None: a Delta table is a directory, and `_delta_log` is what says
+            // so. Nothing is ever read as Delta because of its name.
+            FileFormat::Delta => &[],
         }
     }
 
@@ -189,6 +197,7 @@ impl FileFormat {
         FileFormat::Json,
         FileFormat::JsonLines,
         FileFormat::Excel,
+        FileFormat::Delta,
     ];
 
     /// The format an extension implies, or `None` for one alkyon does not read.
@@ -203,6 +212,20 @@ impl FileFormat {
     /// Whether the format is read by calamine rather than by DuckDB.
     pub fn is_excel(self) -> bool {
         matches!(self, FileFormat::Excel)
+    }
+
+    /// Whether one table is a directory rather than a file or a group of them.
+    pub fn is_delta(self) -> bool {
+        matches!(self, FileFormat::Delta)
+    }
+
+    /// The DuckDB extension this format needs installed, if any. `parquet` and
+    /// `json` are linked in; `delta` has to be fetched once.
+    pub fn extension(self) -> Option<&'static str> {
+        match self {
+            FileFormat::Delta => Some("delta"),
+            _ => None,
+        }
     }
 }
 

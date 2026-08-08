@@ -39,6 +39,15 @@ pub struct Location {
 /// data), and a DFS hostname. A full `https://…` URL is accepted for the host
 /// too, because that is what the portal's *Copy* button gives you.
 pub fn locate(host: &str, path: Option<&str>) -> Result<Location> {
+    // The whole location as one URL is what Fabric's *Copy ABFS path* and the
+    // portal's endpoint field both hand over, so accept it in either box rather
+    // than making someone take it apart by hand.
+    for typed in [host, path.unwrap_or_default()] {
+        if let Some(located) = from_url(typed.trim()) {
+            return located;
+        }
+    }
+
     let host = host
         .trim()
         .trim_start_matches("https://")
@@ -86,6 +95,68 @@ pub fn locate(host: &str, path: Option<&str>) -> Result<Location> {
         filesystem: filesystem.to_owned(),
         prefix: prefix.to_owned(),
     })
+}
+
+/// A whole location written as one URL, in either of the two spellings Azure
+/// hands out. `None` when it is not a URL at all, which is the ordinary case.
+///
+/// ```text
+/// abfss://<filesystem>@<host>/<path>   the ABFS driver's form, and Fabric's
+/// https://<host>/<filesystem>/<path>   the endpoint's own form
+/// ```
+///
+/// The filesystem moves from one side of the `@` to the front of the path
+/// between the two, which is exactly the sort of thing worth not doing by hand.
+fn from_url(typed: &str) -> Option<Result<Location>> {
+    let (scheme, rest) = typed.split_once("://")?;
+    let abfs = match scheme.to_ascii_lowercase().as_str() {
+        "abfss" | "abfs" => true,
+        "https" | "http" => false,
+        // Not a URL we know — say so, rather than reading it as a hostname.
+        other => {
+            return Some(Err(Error::BadRequest(format!(
+                "`{other}://` is not an address alkyon can read. Give an `abfss://` path, \
+                 an `https://` one, or just the account and the container."
+            ))))
+        }
+    };
+
+    let (authority, path) = match rest.split_once('/') {
+        Some((authority, path)) => (authority, path),
+        None => (rest, ""),
+    };
+
+    let (filesystem, host, prefix) = if abfs {
+        let (filesystem, host) = authority.split_once('@')?;
+        (filesystem, host, path)
+    } else {
+        // `https://<host>` and nothing else is a hostname someone copied with
+        // its scheme, not a location: the container is in the other box. Left to
+        // the plain path below rather than called an error.
+        if path.trim_matches('/').is_empty() {
+            return None;
+        }
+        // Otherwise the first path segment is the filesystem, and the rest is
+        // how far in.
+        let (filesystem, prefix) = match path.split_once('/') {
+            Some((filesystem, prefix)) => (filesystem, prefix),
+            None => (path, ""),
+        };
+        (filesystem, authority, prefix)
+    };
+
+    if host.is_empty() || filesystem.is_empty() {
+        return Some(Err(Error::BadRequest(format!(
+            "`{typed}` names no account and container — expected \
+             `abfss://<container>@<account>.dfs.core.windows.net/<folder>`"
+        ))));
+    }
+
+    Some(Ok(Location {
+        host: host.trim_end_matches('/').to_owned(),
+        filesystem: filesystem.to_owned(),
+        prefix: prefix.trim_matches('/').to_owned(),
+    }))
 }
 
 /// One file in the filesystem.
@@ -360,13 +431,67 @@ mod tests {
         assert_eq!(located.prefix, "Bronze.Lakehouse/Files/exports");
     }
 
+    /// What Fabric's *Copy ABFS path* button gives you, pasted straight in.
+    #[test]
+    fn an_abfss_url_is_taken_apart_rather_than_taken_literally() {
+        let url = "abfss://9c941a04-8002-496a-bb89-399b9ca8078e@onelake.dfs.fabric.microsoft.com\
+                   /4b764d50-3ea8-4003-a6d8-07c321ea354b/Files/exports";
+        let expected = Location {
+            host: "onelake.dfs.fabric.microsoft.com".to_owned(),
+            filesystem: "9c941a04-8002-496a-bb89-399b9ca8078e".to_owned(),
+            prefix: "4b764d50-3ea8-4003-a6d8-07c321ea354b/Files/exports".to_owned(),
+        };
+
+        // In either box: it is one string, and which field it lands in is not
+        // the user's problem.
+        assert_eq!(locate(url, None).unwrap(), expected);
+        assert_eq!(locate("", Some(url)).unwrap(), expected);
+        // And it does not matter if the other box was filled in first.
+        assert_eq!(locate("contoso", Some(url)).unwrap(), expected);
+    }
+
+    #[test]
+    fn an_https_url_puts_the_filesystem_first_instead() {
+        // The same location, spelled the way the endpoint itself is.
+        assert_eq!(
+            locate("https://contoso.dfs.core.windows.net/sales/exports/2026", None).unwrap(),
+            Location {
+                host: "contoso.dfs.core.windows.net".to_owned(),
+                filesystem: "sales".to_owned(),
+                prefix: "exports/2026".to_owned(),
+            }
+        );
+        // A container and nothing more is a whole filesystem.
+        assert_eq!(
+            locate("abfss://sales@contoso.dfs.core.windows.net", None)
+                .unwrap()
+                .prefix,
+            ""
+        );
+    }
+
+    #[test]
+    fn a_url_that_names_half_a_location_is_refused() {
+        // No container before the `@`.
+        assert!(locate("abfss://onelake.dfs.fabric.microsoft.com/ws", None).is_err());
+        // A scheme that means something else entirely.
+        assert!(locate("wasbs://sales@contoso.blob.core.windows.net", None).is_err());
+    }
+
     #[test]
     fn what_cannot_be_read_is_refused_rather_than_guessed() {
         assert!(locate("", Some("sales")).is_err());
         assert!(locate("contoso", None).is_err());
         assert!(locate("contoso", Some("  ")).is_err());
-        // The whole URL pasted into the host box, path and all.
-        assert!(locate("https://contoso.dfs.core.windows.net/sales", Some("x")).is_err());
+        // A host with a path but no scheme is still ambiguous enough to refuse:
+        // there is no telling the account from the container.
+        assert!(locate("contoso.dfs.core.windows.net/sales", Some("x")).is_err());
+
+        // But the whole URL in the host box is now read rather than refused —
+        // it is what the portal's copy button gives, path and all.
+        let pasted = locate("https://contoso.dfs.core.windows.net/sales", Some("x")).unwrap();
+        assert_eq!(pasted.filesystem, "sales");
+        assert_eq!(pasted.host, "contoso.dfs.core.windows.net");
     }
 
     #[test]

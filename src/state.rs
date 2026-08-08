@@ -145,7 +145,7 @@ impl AppState {
             mssql: MssqlConnector,
             mysql: MySqlConnector::default(),
             files: FilesConnector,
-            adls: AdlsConnector::new(std::env::temp_dir().join("alkyon-azure")),
+            adls: AdlsConnector,
         })
     }
 
@@ -196,10 +196,7 @@ impl AppState {
             mssql: MssqlConnector,
             mysql: MySqlConnector::default(),
             files: FilesConnector,
-            // Beside the registry rather than in the temp directory: the point
-            // of the mirror is that it survives a restart, and a cleaner that
-            // empties `%TEMP%` overnight would make every morning the first one.
-            adls: AdlsConnector::new(dir.join("azure-cache")),
+            adls: AdlsConnector,
         }))
     }
 

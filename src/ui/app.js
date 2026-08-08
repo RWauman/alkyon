@@ -1235,6 +1235,20 @@ function confirmAction({ title, detail = '', action = 'Remove' }) {
 const dialog = $('source-dialog');
 const form = $('source-form');
 
+/**
+ * The authentication methods each engine can actually use, in the order the
+ * dialogue should offer them.
+ *
+ * The backend is the authority — the PostgreSQL and MySQL connectors accept a
+ * password and refuse everything else — and this keeps the dialogue from
+ * offering a method whose only outcome is an error.
+ */
+const METHODS = {
+  postgres: ['password'],
+  my_sql: ['password'],
+  ms_sql: ['password', 'integrated', 'entra', 'aad_token'],
+};
+
 /** What each engine connects to when the Database field is left empty. */
 const DEFAULT_DATABASE = {
   ms_sql: 'master',
@@ -1262,12 +1276,25 @@ function syncDialogFields() {
     label.hidden = kind !== 'ms_sql';
   }
 
+  // Excel is read by calamine, in the server's own process and from a local
+  // file — so it is the one format an Azure source cannot offer, since nothing is
+  // copied here.
+  const excel = form.querySelector('option[value="excel"]');
+  excel.disabled = adls;
+  excel.textContent = adls ? 'Excel — not over Azure storage' : 'Excel';
+  if (adls && form.elements.format.value === 'excel') form.elements.format.value = '';
+
   // Only the chosen type's options. A delimiter means nothing to a parquet file,
   // and parquet and JSON have nothing to ask about at all — so until a type is
   // chosen, and for the types with no options, there is nothing to show.
   const format = server ? '' : form.elements.format.value;
   for (const element of form.querySelectorAll('.csv-only')) element.hidden = format !== 'csv';
   for (const element of form.querySelectorAll('.excel-only')) element.hidden = format !== 'excel';
+  // A Delta table is a directory, so there is no list of files to leave out and
+  // nothing to say about delimiters: the log describes the table.
+  for (const element of form.querySelectorAll('.folder-only.files')) {
+    element.hidden = element.hidden || format === 'delta';
+  }
   // Say what leaving it empty will actually connect to.
   $('database-field').placeholder = `optional — defaults to ${DEFAULT_DATABASE[kind] ?? 'the engine default'}`;
   // Azure storage has one way in, so it shows the sign-in without the choice of
@@ -1275,21 +1302,23 @@ function syncDialogFields() {
   for (const label of form.querySelectorAll('[class^="auth-"]')) {
     label.hidden = !(server || adls) || !label.classList.contains(`auth-${method}`);
   }
-  // Windows integrated authentication is a SQL Server concept, and so — as far
-  // as anything alkyon connects to goes — is an Entra token: the PostgreSQL and
-  // MySQL connectors take a password and nothing else, so offering either there
-  // was offering a method that could only fail.
-  const only = { integrated: 'ms_sql', entra: 'ms_sql', aad_token: 'ms_sql' };
-  let corrected = false;
-  for (const [value, wants] of Object.entries(only)) {
-    const option = form.querySelector(`option[value="${value}"]`);
-    option.disabled = kind !== wants;
-    if (option.disabled && form.elements.method.value === value) {
-      form.elements.method.value = 'password';
-      corrected = true;
-    }
+  // Only the methods this engine can actually use, and **hidden** rather than
+  // greyed: a disabled option still fills the list, and a list of four where
+  // three can only fail reads as a choice nobody has made yet.
+  //
+  // PostgreSQL and MySQL take a password and nothing else. Windows integrated
+  // authentication is a SQL Server concept, and so — as far as anything alkyon
+  // connects to is concerned — is an Entra token.
+  const usable = METHODS[kind] ?? ['password'];
+  for (const option of form.elements.method.options) {
+    const allowed = usable.includes(option.value);
+    option.hidden = !allowed;
+    option.disabled = !allowed;
   }
-  if (corrected) syncDialogFields();
+  if (!usable.includes(form.elements.method.value)) {
+    form.elements.method.value = usable[0];
+    syncDialogFields();
+  }
 }
 
 /**

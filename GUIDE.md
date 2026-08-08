@@ -54,10 +54,10 @@ tries the connection without registering it.
   leave **Port** empty. **Never put a hostname here**: no cloud endpoint runs a
   SQL Browser, so the connection times out against a host that answers perfectly
   well. Alkyon refuses a hostname in that field and says where it belongs.
-- **A Fabric SQL analytics endpoint or warehouse does not connect yet.** See
-  [What does not work](#what-does-not-work-yet). Its data is reachable today
-  through an [Azure storage source](#azure-storage-as-a-source) over OneLake,
-  which does not use SQL Server's protocol at all.
+- **A Fabric SQL analytics endpoint or warehouse does not connect.** See
+  [What does not work](#what-does-not-work-yet). Its data is reachable through an
+  [Azure storage source](#azure-storage-as-a-source) over OneLake, which does not
+  use SQL Server's protocol at all.
 - **Microsoft Entra — sign in** opens your browser and takes the sign-in from
   there; see [Sign in to Azure](#sign-in-to-azure). **Entra ID access token** is
   still there for a token pasted from
@@ -73,6 +73,11 @@ tries the connection without registering it.
 The password goes to the **OS keychain** (Credential Manager, Keychain, libsecret).
 Only the host, port, database and username are written to disk. Nothing that comes
 back out of the API ever contains a credential.
+
+A secret too long for one entry is split across several — Windows Credential
+Manager caps a credential at 2 560 bytes, which is 1 280 characters rather than
+the 2 560 its error message names, and an Entra refresh token is longer. They appear as `alkyon / <id>#1`, `#2` beside the source's own
+entry; deleting the source removes them all.
 
 Sources live in one of two registries, and both are listed with a badge saying
 which:
@@ -136,6 +141,39 @@ itself once the path and the type are in — tick a file and the source stops re
 it. Nothing else about the folder changes; a subdirectory left with no files simply
 stops being a table.
 
+### A Delta table is a directory
+
+**Delta is the one format that is not a file.** A table is a directory holding a
+`_delta_log`, and the log — not the directory listing — says which parquet inside
+it are live and what the columns are. So a Delta source finds its tables by the
+log: every directory holding one is a table named after itself, and what is inside
+belongs to the log rather than to alkyon.
+
+That matters for correctness, not neatness. Unioning the parquet in a Delta
+directory returns rows that were deleted and rows that were replaced. Reading the
+log returns the table.
+
+It works the same in a folder on this machine and in
+[Azure storage](#azure-storage-as-a-source) — a lakehouse's `Tables/` is exactly
+this shape:
+
+```text
+lake/                       type: Delta table    lake
+  sales/_delta_log/…     ┐
+  sales/part-0000.parquet ┴ →  public.sales
+  returns/_delta_log/…      →  public.returns
+```
+
+Reading one needs DuckDB's `delta` extension, which is fetched once from
+`extensions.duckdb.org` the first time a Delta source is opened — the same
+arrangement as the `azure` extension, and for the same reason. A local Delta
+source keeps its confinement intact: the extension is loaded *before* external
+access is shut, and both still hold afterwards — a `delta_scan` runs, and a file
+outside the granted directory is still refused.
+
+There is no **Leave out** list for Delta and no CSV options: the log describes the
+table, so there is nothing to tick or to sniff.
+
 ### Formats
 
 | Format | Extensions | Read by |
@@ -145,8 +183,12 @@ stops being a table.
 | JSON | `.json` | DuckDB (linked in) |
 | JSON lines | `.jsonl` `.ndjson` | DuckDB (linked in) |
 | Excel | `.xlsx` `.xlsm` `.xlsb` `.xls` | calamine, in this process |
+| Delta table | — a directory, not a file | DuckDB's `delta` extension, fetched once |
 
-Nothing is ever downloaded to read any of them.
+None of them needs anything downloaded. Alkyon leans that way throughout —
+a single binary, the readers linked in — but it is a preference, not a vow: an
+[Azure storage source](#azure-storage-as-a-source) fetches DuckDB's `azure`
+extension once, because reading a container is not otherwise possible.
 
 **Choosing the type** does two things: it narrows a folder to that format's own
 extensions — say Parquet and a stray `notes.csv` stops being data — and for a *file*
@@ -210,9 +252,17 @@ of its own, and orders in a `sales/` subdirectory — plus
 `excel/monthly/january.xlsx` and `february.xlsx`, two workbooks of one shape in one
 directory to see the union and the `source_file` column, and one deliberately
 awkward `csv-european/ventes.csv` that is semicolon-delimited, comma-decimal and
-Latin-1 with two lines of preamble. `.alkyon/sources.json` already registers them as
-**project** sources, so opening this repository as a folder is enough to see them.
-Parquet needs `pyarrow` and Excel needs `openpyxl`; each is skipped with a message
+Latin-1 with two lines of preamble.
+
+`delta/` holds two Delta tables, and `delta/customers` is deliberately at odds
+with its own directory: the log adds one parquet and **removes** another that is
+still sitting there. Read as Delta it has 250 rows; unioning the parquet the way a
+plain folder source would gives 310. That difference is the fixture's whole
+purpose — it is what [reading the log](#a-delta-table-is-a-directory) buys.
+
+`.alkyon/sources.json` already registers them all as **project** sources, so
+opening this repository as a folder is enough to see them.
+Parquet and Delta need `pyarrow`, Excel needs `openpyxl`; each is skipped with a message
 rather than failing the run.
 
 ## Sign in to Azure
@@ -252,43 +302,74 @@ error.
 ## Azure storage as a source
 
 One kind for three names: a **blob container**, an **ADLS Gen2 filesystem** and a
-**Fabric OneLake** workspace are the same API at three hostnames, and alkyon speaks
-the Data Lake Storage Gen2 endpoint to all of them.
+**Fabric OneLake** workspace are the same API at three hostnames.
 
 | Field | What goes in it |
 |---|---|
-| **Account** | `contoso`, `contoso.dfs.core.windows.net`, or `onelake.dfs.fabric.microsoft.com`. A blob hostname is accepted and quietly read as the DFS one — same data, and only that endpoint answers JSON |
-| **Container and folder** | the container or filesystem first, then how far in: `sales/exports/2026`, or `Workspace/Bronze.Lakehouse/Files/exports` for OneLake |
+| **Account** | `contoso`, `contoso.dfs.core.windows.net`, or `onelake.dfs.fabric.microsoft.com`. A blob hostname is accepted and read as the DFS one — same data, and only that endpoint answers JSON |
+| **Container and folder** | the container or filesystem first, then how far in: `sales/exports/2026`, or `Workspace/Lakehouse.Lakehouse/Files/exports` for OneLake |
 | **File type** | as for a folder source, and for the same reason: a subdirectory's files are read as one table, and files of two formats cannot be |
+
+**Or paste the whole thing in either box.** Fabric's *Copy ABFS path* and the
+portal's endpoint field give a URL, and both spellings are taken apart for you:
+
+```text
+abfss://<container>@<account>.dfs.core.windows.net/<folder>
+https://<account>.dfs.core.windows.net/<container>/<folder>
+```
+
+The container moves from one side of the `@` to the front of the path between the
+two, which is exactly the sort of thing not worth doing by hand.
 
 Once connected it **is** a folder source: same catalogue, same `public` schema, a
 file at the root is a table, a subdirectory is one table over its files with a
-`source_file` column, spreadsheets become one table per sheet, and it federates
-with `@import` like anything else.
+`source_file` column, and it federates with `@import` like anything else.
 
-**It syncs, it does not query remotely.** Alkyon's DuckDB runs with
-`enable_external_access = false` and may load no extension — that is what keeps a
-folder source from reading the rest of the machine — so it cannot open an
-`abfss://` URL at all. The files are copied to this machine first and read locally.
-The consequences are worth knowing before you point one at a lake:
+### It reads where the data lies
 
-- **No predicate pushdown.** A parquet file comes down whole the first time it is
-  seen; a `where` clause narrows it after it has arrived, not before it is sent.
-- **The copies are kept**, beside the registry rather than in a temp directory, and
-  re-fetched only when the service says the file's ETag changed. The download is
-  paid once per version of a file, not once per query.
-- **A file that disappears remotely stops being a table** on the next sync, so the
-  mirror never answers for something that is no longer there.
-- **The listing is re-read at most every 30 seconds**, so a query does not put an
-  internet round trip in front of every statement. A file dropped in the folder
-  shows up within that.
-- **Limits**: 200 files, and 4 GiB of new data in one sync. Past either it refuses
-  and says so rather than spending the afternoon. Point the source further in.
+DuckDB's `azure` extension opens an `abfss://` URL directly, so **nothing is
+copied to this machine**. A parquet's schema is a range request for its footer, a
+`where` clause is pushed down to the scan, and a container of a thousand files
+costs a listing rather than a download. Alkyon lists the container once when the
+connection opens — that is what the tables are — and every read after that is
+DuckDB's.
 
-**Permissions.** Reading needs the **Storage Blob Data Reader** role on the account
-or container. Owning the storage account is not the same thing — that grants
-management, not data — and it is the usual reason for a 403 that reads as a
-surprise.
+**The extension is fetched once.** It is not something alkyon can link in, so the
+first time you register an Azure source DuckDB installs it from
+`extensions.duckdb.org` into its own cache (`~/.duckdb`), about two megabytes,
+signed, and version-matched to the DuckDB inside alkyon. After that there is
+nothing to fetch. This is the one place alkyon reaches the network for something
+other than your data.
+
+### What the session may touch
+
+A folder source runs with external access **off** and one directory as the
+exception. An Azure session cannot: an extension and a network read both need
+external access. So it is confined the other way round — the **local filesystem
+is shut**:
+
+```text
+read a local file            → File system LocalFileSystem has been disabled
+reopen the local filesystem  → the configuration has been locked
+```
+
+Which makes it *tighter* than a folder source's session, not looser: that one can
+read a directory, this one can read nothing on this machine at all. The account is
+reached through a secret scoped to it, built from the sign-in's own token — so a
+session can read the one account it was opened for.
+
+### Limits
+
+- **Excel is not read over Azure storage.** Alkyon reads spreadsheets with
+  calamine, in its own process and from a local file, rather than through DuckDB.
+  Every other format is read where it lies. The dialogue greys the option out.
+- **5 000 files** per source become tables. Nothing is downloaded, so this is not
+  about bandwidth — it is what keeps the tree, and a snapshot that reads one
+  header per table, usable. Past it the extra files are left out and the log says
+  how many.
+- **Permissions**: reading needs the **Storage Blob Data Reader** role on the
+  account or container. Owning the storage account is not the same thing — that
+  grants management, not data — and it is the usual reason for a surprising 403.
 
 ## What does not work yet
 
@@ -296,42 +377,40 @@ Written down because finding it out twice is worse than reading it once.
 
 ### Fabric SQL endpoints and warehouses
 
-**A Fabric SQL analytics endpoint or warehouse cannot be connected to over
-TDS.** Everything up to the last step works: the Entra sign-in, the token, the
-first login, and the routing token Fabric answers with. What fails is the login
-on the node it routes to.
+**A Fabric SQL analytics endpoint or warehouse cannot be connected to.**
+Everything up to the last step works: the Entra sign-in, the token, the first
+login — which Fabric *accepts*, then answers with a routing token naming the node
+that holds the warehouse. It is the login on that node that fails.
 
-The cause is in the driver, not in Fabric. Fabric routes a login to the node
-holding the warehouse and names it `cluster.pbidedicated.windows.net\WORKSPACE-dw`.
-The two halves of that name do different jobs — the host is what the socket and
-the certificate are for, the whole name is what the login packet has to carry —
-and `tiberius` derives both from a single field. Sending the host alone gets the
-connection closed without a word; sending the whole name means the TLS handshake
-goes out with a placeholder name, and the login is refused with error 18456.
-Microsoft's own clients send host and full name separately, which is why SSMS
-connects to the same endpoint with the same account.
+The routed name is `cluster.pbidedicated.windows.net\WORKSPACE-dw`, and its two
+halves do different jobs: the host is what the socket and the certificate are
+for, the whole name is what the login packet has to carry, or the server does not
+know which warehouse is meant. `tiberius`, the TDS driver alkyon uses, takes one
+name for both, so it cannot send them. Rather than send half of it and get the
+connection closed without explanation, alkyon refuses the redirect and says why.
+
+Ruled out along the way, so that nobody spends the afternoon on them again: the
+capacity being paused, a transient fault, the token's audience, the application
+the token was issued to, the tenant, the TLS server name, the FEDAUTH encoding,
+and the `FEDAUTHINFO` round trip. A patched `tiberius` that sends both names was
+tried, and the server's answer did not change by a character — so the missing
+name is *necessary* (without it the connection is closed silently) but not
+*sufficient*, and what else the node wants is not yet known. Finding out means
+reading what a working client sends, which means putting a TDS proxy in front of
+SSMS.
 
 **Azure SQL is unaffected**: its redirects name a host and a port and no
-instance, so the two names agree and there is nothing to split.
+instance, so the two names agree and the redirect is followed normally.
 
-**What to use instead, today**: an [Azure storage source](#azure-storage-as-a-source)
-reads the same lakehouse over OneLake, and answers DuckDB SQL. Point it at
-`onelake.dfs.fabric.microsoft.com` and `<Workspace>/<Lakehouse>.Lakehouse/Files/…`.
-
-### Delta tables
-
-An Azure storage source reads a folder of files. A Delta table is a folder of
-parquet **plus** a `_delta_log` recording what has been rewritten or deleted,
-and that log is not read. Under a lakehouse's `Tables/`, the union of the parquet
-files is therefore right only for a table that has only ever been appended to,
-and wrong after any update or delete. `Files/` has no such problem.
+**What to use instead**: an [Azure storage source](#azure-storage-as-a-source)
+reads the same lakehouse over OneLake and answers DuckDB SQL.
 
 ### Azure storage, end to end
 
-The connector's parts are covered by tests, and its errors have been exercised
-against the live service — but the whole path, from a signed-in account through
-a sync to a query, has not yet been run against a real storage account. Expect
-the first attempt to turn something up.
+The parts are covered by tests and the error paths have been exercised against
+the live service, but the whole path — a signed-in account, the extension
+installing itself, a listing, and a query coming back — has not yet been run
+against a real storage account. Expect the first attempt to turn something up.
 
 ## Run a query
 

@@ -1105,3 +1105,76 @@ async fn a_folder_source_is_persisted_without_a_credential() {
         .await
         .expect("a folder source works after a restart with an empty vault");
 }
+
+/// A Delta table, written by hand: two parquet files, one of which the log says
+/// was replaced. `delta_scan` must read the live one and ignore the other.
+///
+/// Written rather than generated because that is the whole point — a directory of
+/// parquet unioned blindly gives four rows, and the log is what makes it two.
+fn delta_fixture(dir: &Path) -> std::io::Result<()> {
+    let table = dir.join("sales");
+    std::fs::create_dir_all(table.join("_delta_log"))?;
+
+    // Two parquet, written with the DuckDB inside alkyon so the schema is real.
+    let connection = duckdb::Connection::open_in_memory().unwrap();
+    for (file, values) in [("old.parquet", "(1, 'stale'), (2, 'stale')"), ("new.parquet", "(1, 'live'), (2, 'live')")] {
+        let to = table.join(file).to_string_lossy().replace(char::from(92), "/");
+        connection
+            .execute_batch(&format!(
+                "COPY (SELECT * FROM (VALUES {values}) AS t(id, note)) TO '{to}' (FORMAT parquet)"
+            ))
+            .unwrap();
+    }
+
+    let size = |file: &str| std::fs::metadata(table.join(file)).unwrap().len();
+    let schema = r#"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"note\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}"#;
+    // One JSON document per line, which is what a Delta commit is.
+    let protocol = r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#;
+    let metadata = format!(
+        r#"{{"metaData":{{"id":"alkyon-test","format":{{"provider":"parquet","options":{{}}}},"schemaString":"{schema}","partitionColumns":[],"configuration":{{}},"createdTime":0}}}}"#
+    );
+    let added = format!(
+        r#"{{"add":{{"path":"new.parquet","size":{},"partitionValues":{{}},"modificationTime":1,"dataChange":true}}}}"#,
+        size("new.parquet")
+    );
+    // Present on disk, absent from the table: this is what the log is for.
+    let removed = format!(
+        r#"{{"remove":{{"path":"old.parquet","size":{},"partitionValues":{{}},"deletionTimestamp":2,"dataChange":true}}}}"#,
+        size("old.parquet")
+    );
+    let log = format!("{protocol}\n{metadata}\n{added}\n{removed}\n");
+    std::fs::write(table.join("_delta_log/00000000000000000000.json"), log)
+}
+
+#[tokio::test]
+async fn a_delta_table_is_read_through_its_log() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("lake");
+    std::fs::create_dir_all(&root).unwrap();
+    delta_fixture(&root).expect("a hand-written Delta table");
+
+    let state = AppState::new();
+    state
+        .register(source("lake", "folder", &root, json!({ "format": "delta" })))
+        .await
+        .expect("registering a Delta folder");
+
+    // The directory holding `_delta_log` is the table, named after itself.
+    let connection = state.open("lake", None).await.unwrap();
+    let tables = connection.list_tables("lake").await.unwrap();
+    assert_eq!(
+        tables.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(),
+        ["sales"],
+        "one table, not one per parquet"
+    );
+
+    let (columns, rows) = query(&state, "lake", "select note, count(*) as n from sales group by note")
+        .await
+        .expect("querying a Delta table");
+    assert_eq!(columns, ["note", "n"]);
+    assert_eq!(
+        rows,
+        [[json!("live"), json!(2)]],
+        "the removed file must not be read: a blind union would give 'stale' too"
+    );
+}

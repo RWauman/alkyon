@@ -33,7 +33,7 @@ use futures::stream::BoxStream;
 use super::{Connection, Connector};
 use crate::error::{Error, Result};
 use crate::federation::{
-    self, open_duckdb_in, quote_identifier, quote_literal, Materialised, Sandbox,
+    self, quote_identifier, quote_literal, Materialised, Sandbox,
 };
 use crate::model::{
     ColumnInfo, ColumnMeta, CsvOptions, Dialect, FileFormat, FileOptions, LogicalType, RowBatch,
@@ -65,9 +65,15 @@ fn reader(format: FileFormat) -> Option<&'static str> {
         // array of documents or one per line. The formats stay separate anyway,
         // because declaring which you have is how a `.txt` full of JSON gets read.
         FileFormat::Json | FileFormat::JsonLines => Some("read_json"),
+        // A directory, not a list of files, and the `delta` extension works out
+        // which parquet inside it are live by reading `_delta_log`.
+        FileFormat::Delta => Some("delta_scan"),
         FileFormat::Excel => None,
     }
 }
+
+/// The name `_delta_log` — the only thing that makes a directory a Delta table.
+const DELTA_LOG: &str = "_delta_log";
 
 pub(crate) fn reader_for(path: &Path) -> Option<&'static str> {
     let extension = path.extension()?.to_string_lossy().into_owned();
@@ -139,7 +145,12 @@ struct DataSet {
     /// or the file's stem for a file source.
     name: String,
     /// Every file it unions, alphabetical. Exactly one for a file source.
-    files: Vec<PathBuf>,
+    ///
+    /// An **address**, not a path: a local file with forward slashes, or an
+    /// `abfss://` URL when the source is a storage account. Everything below
+    /// hands it to DuckDB as a literal, which is what lets one piece of code
+    /// serve a folder on this machine and a container in Azure.
+    files: Vec<String>,
     format: FileFormat,
     /// Which sheet, for spreadsheets. `None` for every other format, and for a
     /// workbook whose sheets could not be listed.
@@ -160,14 +171,21 @@ impl DataSet {
     /// materialised instead.
     fn query(&self, options: &FileOptions) -> Option<String> {
         let function = reader(self.format)?;
-        let paths: Vec<String> = self
-            .files
-            .iter()
-            // Forward slashes because that is what DuckDB normalises paths to when
-            // it checks them against the sandbox, so the literal and the
-            // permission are written the same way.
-            .map(|path| quote_literal(&path.to_string_lossy().replace('\\', "/")))
-            .collect();
+
+        // A Delta table is one directory handed to `delta_scan`, and the log
+        // inside it says which files are live. There is nothing to union and no
+        // `filename` argument to ask for.
+        if self.format.is_delta() {
+            let directory = self.files.first()?;
+            return Some(format!(
+                "SELECT * FROM {function}({})",
+                quote_literal(directory)
+            ));
+        }
+        // Forward-slashed already, when the address was made: that is what DuckDB
+        // normalises paths to when it checks them against the sandbox, so the
+        // literal and the permission are written the same way.
+        let paths: Vec<String> = self.files.iter().map(|file| quote_literal(file)).collect();
 
         let mut arguments = vec![if self.tagged {
             format!("[{}]", paths.join(", "))
@@ -204,11 +222,11 @@ impl DataSet {
     /// What to name in an error: the one file, or the directory holding them.
     fn label(&self) -> String {
         match self.files.as_slice() {
-            [only] => only.display().to_string(),
+            [only] => only.clone(),
             files => files
                 .first()
-                .and_then(|file| file.parent())
-                .map(|directory| format!("{} ({} files)", directory.display(), files.len()))
+                .and_then(|file| file.rsplit_once('/'))
+                .map(|(directory, _)| format!("{directory} ({} files)", files.len()))
                 .unwrap_or_else(|| self.name.clone()),
         }
     }
@@ -218,7 +236,8 @@ impl DataSet {
 struct Directory {
     /// Relative to the source root, with forward slashes. Empty at the root.
     relative: String,
-    files: Vec<PathBuf>,
+    /// Addresses, in the sense [`DataSet::files`] means.
+    files: Vec<String>,
 }
 
 /// What `root` holds, as tables.
@@ -228,6 +247,9 @@ struct Directory {
 /// `parquet.public.parquet` says nothing twice. **A subdirectory is one table** over
 /// every file in it, which is where a folder of monthly exports belongs.
 fn walk(root: &Path, format: FileFormat, options: &FileOptions) -> Vec<DataSet> {
+    if format.is_delta() {
+        return delta_tables(root, options);
+    }
     let mut directories = Vec::new();
     let mut count = 0;
     collect(
@@ -239,7 +261,147 @@ fn walk(root: &Path, format: FileFormat, options: &FileOptions) -> Vec<DataSet> 
         &mut directories,
         &mut count,
     );
+    name_sets(directories, format, options)
+}
 
+/// The Delta tables a remote listing implies.
+///
+/// `_delta_log/…` inside a directory is what says the directory is a table, so
+/// the tables are the parents of those logs — deduplicated, because a log holds
+/// many files and each one names the same table.
+fn delta_from_listing(listing: &[(String, String)], options: &FileOptions) -> Vec<DataSet> {
+    let mut taken: HashSet<String> = HashSet::new();
+    let mut found: Vec<(String, String)> = Vec::new();
+
+    for (relative, address) in listing {
+        // Everything before `/_delta_log/`: the table, relative to the prefix.
+        let marker = format!("{DELTA_LOG}/");
+        let Some(cut) = relative.find(&marker) else {
+            continue;
+        };
+        let table = relative[..cut].trim_end_matches('/').to_owned();
+        if options
+            .exclude
+            .iter()
+            .any(|left_out| left_out.eq_ignore_ascii_case(&table))
+        {
+            continue;
+        }
+        // The same cut on the address, so the URL names the directory and not the
+        // log file inside it.
+        let Some(at) = address.find(&marker) else {
+            continue;
+        };
+        let directory = address[..at].trim_end_matches('/').to_owned();
+
+        if !found.iter().any(|(seen, _)| *seen == table) {
+            found.push((table, directory));
+        }
+    }
+
+    let mut sets: Vec<DataSet> = found
+        .into_iter()
+        .map(|(relative, address)| DataSet {
+            name: if relative.is_empty() {
+                stem_for(&address, &mut taken)
+            } else {
+                name_for(&relative, &mut taken)
+            },
+            files: vec![address],
+            format: FileFormat::Delta,
+            sheet: None,
+            tagged: false,
+        })
+        .collect();
+    sets.sort_by(|a, b| a.name.cmp(&b.name));
+    sets
+}
+
+/// Every Delta table under `root`: each directory holding a `_delta_log`.
+///
+/// A different shape of walk from the one below, because a Delta table is a
+/// directory rather than a group of files, and the directory holding it is not to
+/// be descended into — the parquet inside are the table's business, not ours.
+fn delta_tables(root: &Path, options: &FileOptions) -> Vec<DataSet> {
+    let mut found = Vec::new();
+    find_delta(root, root, 0, &options.exclude, &mut found);
+
+    let mut taken: HashSet<String> = HashSet::new();
+    let mut sets: Vec<DataSet> = found
+        .into_iter()
+        .map(|(relative, address)| DataSet {
+            // The root itself is a table when it is one, and takes the source's
+            // own name the way a root file does.
+            name: if relative.is_empty() {
+                stem_for(&address, &mut taken)
+            } else {
+                name_for(&relative, &mut taken)
+            },
+            files: vec![address],
+            format: FileFormat::Delta,
+            sheet: None,
+            tagged: false,
+        })
+        .collect();
+    sets.sort_by(|a, b| a.name.cmp(&b.name));
+    sets
+}
+
+fn find_delta(
+    root: &Path,
+    directory: &Path,
+    depth: usize,
+    excluded: &[String],
+    out: &mut Vec<(String, String)>,
+) {
+    if depth > MAX_DEPTH || out.len() >= MAX_FILES {
+        return;
+    }
+    let Ok(children) = std::fs::read_dir(directory) else {
+        return;
+    };
+
+    let mut subdirectories = Vec::new();
+    let mut is_table = false;
+    for child in children.flatten() {
+        let name = child.file_name().to_string_lossy().into_owned();
+        if !child.file_type().is_ok_and(|kind| kind.is_dir()) {
+            continue;
+        }
+        if name == DELTA_LOG {
+            is_table = true;
+        } else if !name.starts_with('.') && !crate::workspace::SKIP.contains(&name.as_str()) {
+            subdirectories.push(child.path());
+        }
+    }
+
+    let relative = relative_of(root, directory);
+    if is_table {
+        // A table is a leaf: what is inside belongs to the log, and a Delta table
+        // nested in another is not a thing.
+        if !excluded.iter().any(|left_out| left_out.eq_ignore_ascii_case(&relative)) {
+            out.push((relative, address_of(directory)));
+        }
+        return;
+    }
+
+    subdirectories.sort();
+    for subdirectory in subdirectories {
+        find_delta(root, &subdirectory, depth + 1, excluded, out);
+    }
+}
+
+/// Turn grouped directories into named tables.
+///
+/// Split from [`walk`] because the grouping is the same wherever the files are:
+/// a storage account is listed over HTTP rather than walked, and then wants
+/// exactly these rules — the root's files under their own names, a subdirectory
+/// under its own, and a spreadsheet expanded per sheet.
+fn name_sets(
+    mut directories: Vec<Directory>,
+    format: FileFormat,
+    options: &FileOptions,
+) -> Vec<DataSet> {
     let mut taken: HashSet<String> = HashSet::new();
     let mut sets = Vec::new();
 
@@ -291,13 +453,13 @@ pub fn candidates(root: &Path, options: &FileOptions) -> Vec<String> {
     let mut out: Vec<String> = directories
         .into_iter()
         .flat_map(|directory| {
-            directory.files.into_iter().filter_map(move |file| {
-                let name = file.file_name()?.to_string_lossy().into_owned();
-                Some(if directory.relative.is_empty() {
+            directory.files.into_iter().map(move |file| {
+                let name = filename_of(&file).to_owned();
+                if directory.relative.is_empty() {
                     name
                 } else {
                     format!("{}/{name}", directory.relative)
-                })
+                }
             })
         })
         .collect();
@@ -337,7 +499,9 @@ fn collect(
             }
         } else if kind.is_file() && *count < MAX_FILES && keeps(root, &path, format, excluded) {
             *count += 1;
-            files.push(path);
+            // Forward-slashed here, once, so that everything downstream can treat
+            // a local file and a remote URL as the same kind of string.
+            files.push(address_of(&path));
         }
     }
 
@@ -402,19 +566,31 @@ fn relative_of(root: &Path, path: &Path) -> String {
 /// A stem already claimed keeps the whole filename instead of vanishing — which is
 /// how `notes.csv` and `notes.txt`, both CSV as far as the source is concerned, can
 /// both be there.
-fn stem_for(path: &Path, taken: &mut HashSet<String>) -> String {
-    let stem = path
-        .file_stem()
-        .map(|stem| stem.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "data".to_owned());
-    if taken.insert(stem.clone()) {
-        return stem;
+fn stem_for(address: &str, taken: &mut HashSet<String>) -> String {
+    let filename = filename_of(address);
+    let stem = match filename.rsplit_once('.') {
+        // A leading dot is a name, not an extension: `.gitignore` has no stem.
+        Some((stem, _)) if !stem.is_empty() => stem,
+        _ => filename,
+    };
+    let stem = if stem.is_empty() { "data" } else { stem };
+
+    if taken.insert(stem.to_owned()) {
+        return stem.to_owned();
     }
-    let filename = path
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or(stem);
-    unique(filename, taken)
+    unique(filename.to_owned(), taken)
+}
+
+/// The last segment of an address. Addresses are forward-slashed wherever they
+/// came from, which is what makes this one line rather than two platforms.
+fn filename_of(address: &str) -> &str {
+    address.rsplit('/').next().unwrap_or(address)
+}
+
+/// A local path as an address: forward slashes, because that is what DuckDB
+/// normalises to and what a remote URL uses anyway.
+fn address_of(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
 }
 
 /// The table name for one subdirectory: its own name.
@@ -483,7 +659,7 @@ fn expand_sheets(sets: Vec<DataSet>, options: &FileOptions) -> Vec<DataSet> {
         let sheets = set
             .files
             .first()
-            .map(|file| crate::federation::excel::sheet_names(file));
+            .map(|file| crate::federation::excel::sheet_names(Path::new(file)));
         match sheets {
             Some(Ok(sheets)) if sheets.len() == 1 => out.push(DataSet {
                 sheet: Some(sheets[0].clone()),
@@ -568,8 +744,7 @@ impl Connector for FilesConnector {
         }
 
         Ok(Box::new(FilesConnection {
-            root,
-            single,
+            where_: Place::Local { root, single },
             options,
         }))
     }
@@ -580,55 +755,155 @@ impl Connector for FilesConnector {
 }
 
 pub struct FilesConnection {
-    /// The folder, or the single file the source points at.
-    root: PathBuf,
-    single: bool,
+    where_: Place,
     options: FileOptions,
 }
 
+/// Where a source's files are, and therefore what sort of session reads them.
+///
+/// The only thing that differs between the two: what the tables are worked out
+/// from, and how the DuckDB session is confined. Everything after that — the
+/// tree, the columns, the unions, the `source_file` column, `@import` — is the
+/// same code, because by then a file is just an address in a literal.
+enum Place {
+    /// A folder, or one file, on the machine running alkyon.
+    Local { root: PathBuf, single: bool },
+    /// A container in Azure storage: listed over HTTPS when the connection is
+    /// opened, then read where it lies by DuckDB's `azure` extension. Nothing is
+    /// copied here.
+    Azure {
+        access: crate::federation::AzureAccess,
+        /// Worked out at connect time from the listing, because a listing is a
+        /// network round trip and the tree asks for the tables repeatedly.
+        sets: Vec<DataSet>,
+    },
+}
+
 impl FilesConnection {
-    /// Read `root` as a folder of data files.
+    /// Read `root` as a folder of data files, with no path from a person to
+    /// check first.
     ///
-    /// For the Azure source, which mirrors a remote folder into a local one and
-    /// then is a folder source in every respect that matters. Local folder
-    /// sources come through [`FilesConnector::connect`], which has a path from a
-    /// person to check first.
+    /// Only the tests use it today — [`FilesConnector::connect`] is the way in
+    /// for a source someone registered. Kept because it is the honest
+    /// constructor for "this directory, as tables", and because it is what the
+    /// grouping is tested through.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn over(root: PathBuf, options: FileOptions) -> Self {
         FilesConnection {
-            root,
-            single: false,
+            where_: Place::Local {
+                root,
+                single: false,
+            },
             options,
+        }
+    }
+
+    /// A container in Azure storage, from a listing of it.
+    ///
+    /// `listing` pairs each file's path **below the source's prefix** — which is
+    /// what the tables are named from — with the address DuckDB will read. The
+    /// grouping is then the same one a folder gets, which is the point: a
+    /// directory in a container is one table over its files, exactly as on disk.
+    pub(crate) fn in_azure(
+        access: crate::federation::AzureAccess,
+        listing: &[(String, String)],
+        format: FileFormat,
+        options: FileOptions,
+    ) -> Self {
+        // A Delta table is a directory, and the listing names files inside it —
+        // so the tables are the directories holding a `_delta_log`, taken once
+        // each rather than one per file.
+        if format.is_delta() {
+            return FilesConnection {
+                where_: Place::Azure {
+                    access,
+                    sets: delta_from_listing(listing, &options),
+                },
+                options,
+            };
+        }
+
+        let mut directories: Vec<Directory> = Vec::new();
+        for (relative, address) in listing {
+            let folder = match relative.rsplit_once('/') {
+                Some((folder, _)) => folder,
+                None => "",
+            };
+            match directories.iter_mut().find(|d| d.relative == folder) {
+                Some(directory) => directory.files.push(address.clone()),
+                None => directories.push(Directory {
+                    relative: folder.to_owned(),
+                    files: vec![address.clone()],
+                }),
+            }
+        }
+        // Alphabetical, so a union's row order and the tree are stable rather than
+        // whatever order the service listed them in.
+        for directory in &mut directories {
+            directory.files.sort();
+        }
+        directories.sort_by(|a, b| a.relative.cmp(&b.relative));
+
+        FilesConnection {
+            where_: Place::Azure {
+                access,
+                sets: name_sets(directories, format, &options),
+            },
+            options,
+        }
+    }
+
+    /// How to open a session for this source, as something owned.
+    ///
+    /// Owned because every read happens on a blocking worker — DuckDB is
+    /// synchronous — and a worker cannot borrow the connection it was spawned
+    /// from.
+    fn recipe(&self) -> Recipe {
+        // Only what this source cannot be read without: `delta` is fetched once,
+        // and every other format is already linked in.
+        let needs = self
+            .options
+            .format
+            .and_then(FileFormat::extension)
+            .map(str::to_owned);
+        match &self.where_ {
+            Place::Local { .. } => Recipe::Confined(self.sandbox(), needs),
+            Place::Azure { access, .. } => Recipe::Azure(access.clone(), needs),
         }
     }
 
     /// A single file is granted as a file, not as its directory — pointing a
     /// source at one spreadsheet should not hand over everything beside it.
     fn sandbox(&self) -> Sandbox {
-        if self.single {
-            Sandbox::file(self.root.clone())
-        } else {
-            Sandbox::directory(self.root.clone())
+        match &self.where_ {
+            Place::Local { root, single: true } => Sandbox::file(root.clone()),
+            Place::Local { root, .. } => Sandbox::directory(root.clone()),
+            // Nothing on this machine is granted, because nothing on it is read.
+            Place::Azure { .. } => Sandbox::default(),
         }
     }
 
     fn sets(&self) -> Vec<DataSet> {
-        if self.single {
-            let extension = self
-                .root
-                .extension()
-                .map(|e| e.to_string_lossy().into_owned());
+        let (root, single) = match &self.where_ {
+            // Listed when the connection opened; a network round trip is not a
+            // thing to repeat for every question about the tree.
+            Place::Azure { sets, .. } => return sets.clone(),
+            Place::Local { root, single } => (root, *single),
+        };
+
+        if single {
+            let extension = root.extension().map(|e| e.to_string_lossy().into_owned());
             let Some(format) = self.options.format_for(extension.as_deref()) else {
                 return Vec::new();
             };
-            let name = self
-                .root
+            let name = root
                 .file_stem()
                 .map(|stem| stem.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "data".to_owned());
             return expand_sheets(
                 vec![DataSet {
                     name,
-                    files: vec![self.root.clone()],
+                    files: vec![address_of(root)],
                     format,
                     sheet: None,
                     tagged: false,
@@ -641,7 +916,7 @@ impl FilesConnection {
         let Some(format) = self.options.format else {
             return Vec::new();
         };
-        walk(&self.root, format, &self.options)
+        walk(root, format, &self.options)
     }
 
     /// The tables whose name appears anywhere in `sql`.
@@ -751,7 +1026,7 @@ fn materialise_excel(connection: &duckdb::Connection, set: &DataSet) -> Result<(
     let mut rows: Vec<Vec<Option<String>>> = Vec::new();
 
     for file in &set.files {
-        let read = crate::federation::excel::read(file, set.sheet.as_deref())?;
+        let read = crate::federation::excel::read(Path::new(file), set.sheet.as_deref())?;
         match &columns {
             None => columns = Some(read.columns.clone()),
             Some(first) => {
@@ -759,7 +1034,7 @@ fn materialise_excel(connection: &duckdb::Connection, set: &DataSet) -> Result<(
                     return Err(Error::Federated(format!(
                         "{}: its columns are {} where the other files in {} have {}. \
                          Every file in one folder must have the same columns.",
-                        file.display(),
+                        file,
                         names_of(&read.columns),
                         set.name,
                         names_of(first),
@@ -768,10 +1043,11 @@ fn materialise_excel(connection: &duckdb::Connection, set: &DataSet) -> Result<(
             }
         }
 
-        let stem = file
-            .file_stem()
-            .map(|stem| stem.to_string_lossy().into_owned())
-            .unwrap_or_default();
+        let name = filename_of(file);
+        let stem = match name.rsplit_once('.') {
+            Some((stem, _)) if !stem.is_empty() => stem.to_owned(),
+            _ => name.to_owned(),
+        };
         for mut row in read.rows {
             if set.tagged {
                 row.push(Some(stem.clone()));
@@ -830,7 +1106,7 @@ fn describe(
             .files
             .first()
             .ok_or_else(|| Error::BadRequest(format!("`{}` has no files", set.name)))?;
-        let read = crate::federation::excel::read(file, set.sheet.as_deref())?;
+        let read = crate::federation::excel::read(Path::new(file), set.sheet.as_deref())?;
         let mut columns = read.columns;
         if set.tagged {
             columns.push(file_column());
@@ -875,6 +1151,33 @@ fn federated(e: duckdb::Error) -> Error {
     Error::Federated(e.to_string())
 }
 
+/// How to open a session, carried by value into a blocking worker.
+enum Recipe {
+    /// External access off, one path granted, plus any extension the format needs
+    /// — loaded before the door is shut, which is the only order that works.
+    Confined(Sandbox, Option<String>),
+    /// External access left on for one storage account, the local filesystem
+    /// shut. See [`crate::federation::open_duckdb_azure`].
+    Azure(crate::federation::AzureAccess, Option<String>),
+}
+
+impl Recipe {
+    fn open(&self) -> Result<duckdb::Connection> {
+        let (Recipe::Confined(_, needs) | Recipe::Azure(_, needs)) = self;
+        let needs: Vec<&str> = needs.as_deref().into_iter().collect();
+        match self {
+            Recipe::Confined(sandbox, _) => {
+                crate::federation::open_duckdb_needing(sandbox, Some(ROOT_SCHEMA), &needs)
+            }
+            // Fetching the extension is allowed here: the source cannot be read
+            // at all without it, and registering one is the consent.
+            Recipe::Azure(access, _) => {
+                crate::federation::open_duckdb_azure(access, Some(ROOT_SCHEMA), &needs)
+            }
+        }
+    }
+}
+
 #[async_trait]
 impl Connection for FilesConnection {
     /// A folder source has exactly one catalogue, and it is shown under the name
@@ -882,14 +1185,19 @@ impl Connection for FilesConnection {
     /// explorer tree keeps its shape, and `parquet → public → customers` is what
     /// that shape is worth saying.
     async fn list_databases(&self) -> Result<Vec<String>> {
-        Ok(vec![crate::model::catalogue_name(
-            if self.single {
-                SourceKind::File
-            } else {
-                SourceKind::Folder
-            },
-            &self.root,
-        )])
+        Ok(vec![match &self.where_ {
+            Place::Local { root, single } => crate::model::catalogue_name(
+                if *single {
+                    SourceKind::File
+                } else {
+                    SourceKind::Folder
+                },
+                root,
+            ),
+            // The container and how far into it, which is what identifies one
+            // Azure source against another.
+            Place::Azure { access, .. } => access.catalogue.clone(),
+        }])
     }
 
     async fn list_tables(&self, _db: &str) -> Result<Vec<TableInfo>> {
@@ -914,11 +1222,11 @@ impl Connection for FilesConnection {
             .ok_or_else(|| {
                 Error::BadRequest(format!("no table `{schema}.{table}` in this source"))
             })?;
-        let sandbox = self.sandbox();
+        let session = self.recipe();
         let options = self.options.clone();
 
         tokio::task::spawn_blocking(move || {
-            let connection = open_duckdb_in(&sandbox, Some(ROOT_SCHEMA))?;
+            let connection = session.open()?;
             describe(&connection, &set, &options)
         })
         .await
@@ -927,11 +1235,11 @@ impl Connection for FilesConnection {
 
     async fn snapshot(&self, _db: &str) -> Result<Vec<TableSchema>> {
         let sets = self.sets();
-        let sandbox = self.sandbox();
+        let session = self.recipe();
         let options = self.options.clone();
 
         tokio::task::spawn_blocking(move || {
-            let connection = open_duckdb_in(&sandbox, Some(ROOT_SCHEMA))?;
+            let connection = session.open()?;
             let mut tables = Vec::new();
             for set in &sets {
                 // One unreadable table must not cost you the schema of the rest.
@@ -956,7 +1264,7 @@ impl Connection for FilesConnection {
     fn execute<'a>(&'a self, sql: &'a str) -> BoxStream<'a, Result<RowBatch>> {
         Box::pin(try_stream! {
             let sets = self.referenced(sql);
-            let sandbox = self.sandbox();
+            let session = self.recipe();
             let options = self.options.clone();
             let sql = sql.to_owned();
             let (sink, mut source) = tokio::sync::mpsc::channel::<Result<RowBatch>>(4);
@@ -964,7 +1272,7 @@ impl Connection for FilesConnection {
             // DuckDB is synchronous, so it gets its own thread rather than
             // stalling the runtime for the length of the query.
             let worker = tokio::task::spawn_blocking(move || -> Result<()> {
-                let connection = open_duckdb_in(&sandbox, Some(ROOT_SCHEMA))?;
+                let connection = session.open()?;
                 define(&connection, &sets, &options)?;
                 federation::run(&connection, &sql, &sink)
             });
@@ -1025,15 +1333,15 @@ mod tests {
         );
     }
 
-    /// The Azure source mirrors a remote folder and then hands it to
-    /// [`FilesConnection::over`], so a mirror has to become the same tables a
-    /// local folder of the same shape would.
+    /// A folder handed straight to [`FilesConnection::over`], without a path from
+    /// a person to check first — the shape the Azure source used to take, and the
+    /// one `@import` still does.
     #[test]
-    fn a_mirrored_folder_reads_as_the_folder_it_mirrors() {
+    fn a_folder_given_directly_reads_as_a_folder_source() {
         let dir = fixture();
-        let mirrored = FilesConnection::over(dir.path().to_path_buf(), csv());
+        let over = FilesConnection::over(dir.path().to_path_buf(), csv());
 
-        let found: Vec<(String, usize, bool)> = mirrored
+        let found: Vec<(String, usize, bool)> = over
             .sets()
             .iter()
             .map(|set| (set.name.clone(), set.files.len(), set.tagged))
@@ -1044,7 +1352,57 @@ mod tests {
         );
         // A folder, never a single file: the sandbox has to grant the directory,
         // or the union across `sales` could not be read.
-        assert!(!mirrored.single);
+        assert!(matches!(
+            over.where_,
+            Place::Local { single: false, .. }
+        ));
+    }
+
+    /// A container in Azure becomes the same tables a folder of the same shape
+    /// would, from a listing alone — no file is opened to work that out.
+    #[test]
+    fn a_listing_becomes_the_same_tables_a_folder_would() {
+        let listing = vec![
+            (
+                "customers.csv".to_owned(),
+                "abfss://fs@acct.dfs.core.windows.net/customers.csv".to_owned(),
+            ),
+            (
+                "sales/orders.csv".to_owned(),
+                "abfss://fs@acct.dfs.core.windows.net/sales/orders.csv".to_owned(),
+            ),
+            (
+                "sales/refunds.csv".to_owned(),
+                "abfss://fs@acct.dfs.core.windows.net/sales/refunds.csv".to_owned(),
+            ),
+        ];
+        let azure = FilesConnection::in_azure(
+            crate::federation::AzureAccess {
+                account: "acct".to_owned(),
+                token: "t".to_owned(),
+                catalogue: "fs".to_owned(),
+            },
+            &listing,
+            FileFormat::Csv,
+            csv(),
+        );
+
+        let found: Vec<(String, usize, bool)> = azure
+            .sets()
+            .iter()
+            .map(|set| (set.name.clone(), set.files.len(), set.tagged))
+            .collect();
+        assert_eq!(
+            found,
+            [("customers".to_owned(), 1, false), ("sales".to_owned(), 2, true)],
+            "the root's file is its own table, the subdirectory is one over both"
+        );
+
+        // And the SQL reads the URLs where they are, rather than anything local.
+        let sales = azure.sets().into_iter().find(|s| s.name == "sales").unwrap();
+        let query = sales.query(&csv()).unwrap();
+        assert!(query.contains("abfss://fs@acct.dfs.core.windows.net/sales/orders.csv"), "{query}");
+        assert!(query.contains("read_csv"), "{query}");
     }
 
     /// A root file and a subdirectory of the same name both survive.
@@ -1122,7 +1480,7 @@ mod tests {
 
         let one = DataSet {
             name: "customers".to_owned(),
-            files: vec![dir.path().join("customers.csv")],
+            files: vec![address_of(&dir.path().join("customers.csv"))],
             format: FileFormat::Csv,
             sheet: None,
             tagged: false,
@@ -1157,11 +1515,7 @@ mod tests {
     #[test]
     fn only_named_tables_are_defined() {
         let dir = fixture();
-        let connection = FilesConnection {
-            root: dir.path().to_path_buf(),
-            single: false,
-            options: csv(),
-        };
+        let connection = FilesConnection::over(dir.path().to_path_buf(), csv());
         let referenced = connection.referenced("select * from sales");
         assert_eq!(referenced.len(), 1);
         assert_eq!(referenced[0].name, "sales");
