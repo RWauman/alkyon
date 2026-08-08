@@ -1,5 +1,6 @@
 pub mod adls;
 pub mod files;
+pub mod mongo;
 pub mod mssql;
 pub mod mysql;
 pub mod postgres;

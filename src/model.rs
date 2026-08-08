@@ -33,6 +33,12 @@ pub enum SourceKind {
     Postgres,
     MsSql,
     MySql,
+    /// A MongoDB deployment. Reached like a server — host, port, a login — and
+    /// then queried in **DuckDB SQL**: alkyon reads the documents and DuckDB
+    /// answers, because MongoDB has no SQL of its own outside Atlas Data
+    /// Federation and translating into aggregation pipelines would be a promise
+    /// this project does not make.
+    Mongo,
     /// A folder of data files on the machine running alkyon, read by DuckDB. It
     /// has a `path` instead of a host, and no credential.
     Folder,
@@ -85,6 +91,7 @@ impl SourceKind {
             SourceKind::Postgres => 5432,
             SourceKind::MsSql => 1433,
             SourceKind::MySql => 3306,
+            SourceKind::Mongo => 27017,
             // Not a port at all. Reported as 0 and hidden by the UI, rather than
             // making every summary carry an `Option` for one kind's sake.
             SourceKind::Folder | SourceKind::File | SourceKind::Adls => 0,
@@ -97,8 +104,9 @@ impl SourceKind {
             SourceKind::MsSql => "dbo",
             // MySQL has no schema layer: a schema *is* a database. There is
             // therefore no default to give, and the connector reads an empty
-            // schema as "the database this call names".
-            SourceKind::MySql => "",
+            // schema as "the database this call names". MongoDB is the same shape:
+            // a database holds collections and there is no level between them.
+            SourceKind::MySql | SourceKind::Mongo => "",
             // Every table a folder or file source exposes. `public` rather than
             // DuckDB's own `main`, because that is the name a SQL user expects.
             SourceKind::Folder | SourceKind::File | SourceKind::Adls => "public",
@@ -127,6 +135,9 @@ impl SourceKind {
             // Readable by everyone and always present, and privilege-filtered by
             // the server so it shows only what this login may see.
             SourceKind::MySql => "information_schema",
+            // The one database every deployment has and every login can reach.
+            // Not where anyone's data is, which is why the dialogue says so.
+            SourceKind::Mongo => "admin",
             // What DuckDB itself calls an in-memory catalogue. Only the fallback
             // for a path with no name of its own — see [`catalogue_name`].
             SourceKind::Folder | SourceKind::File | SourceKind::Adls => "memory",

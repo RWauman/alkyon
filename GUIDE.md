@@ -38,6 +38,7 @@ tries the connection without registering it.
 | PostgreSQL | PL/pgSQL | 5432 |
 | SQL Server | T-SQL | 1433 |
 | MySQL / MariaDB | MySQL | 3306 |
+| **MongoDB** | DuckDB — see [below](#mongodb-queried-in-sql) | 27017 |
 | **Folder of data files** | DuckDB | — |
 | **One data file** | DuckDB | — |
 | **Azure storage** — Blob, ADLS Gen2, OneLake | DuckDB | — |
@@ -66,6 +67,9 @@ tries the connection without registering it.
 - **Entra, integrated and pasted tokens are SQL Server only.** The PostgreSQL and
   MySQL connectors take a password and nothing else, so the dialogue no longer
   offers a method those engines could only refuse.
+- **MongoDB** takes a login and password, checked against `admin` — which is
+  where a root user lives. A user created inside another database has to be given
+  there. Left empty, **Database** is `admin`, which is not where anyone's data is.
 - **MySQL** has no schema layer — a schema *is* a database. The explorer shows the
   database twice for that reason, and identifiers are quoted with backticks,
   because `"orders"` in MySQL is the *text* `orders`, not the table.
@@ -265,6 +269,82 @@ opening this repository as a folder is enough to see them.
 Parquet and Delta need `pyarrow`, Excel needs `openpyxl`; each is skipped with a message
 rather than failing the run.
 
+## MongoDB, queried in SQL
+
+**MongoDB has no SQL of its own.** `$sql` exists, but only inside Atlas Data
+Federation — a separate paid service, unreachable from a self-hosted deployment
+and from a plain Atlas cluster. So alkyon does not translate SQL into aggregation
+pipelines and hope: it reads the documents itself and lets **DuckDB** answer, the
+same arrangement a spreadsheet already gets.
+
+Each collection is a view over its documents as JSON, which is the part worth
+having:
+
+```sql
+select address.city, unnest(tags) as tag, count(*)
+from customer
+group by all
+order by 3 desc;
+```
+
+**Nesting survives.** DuckDB infers the shapes rather than being handed a
+flattened table, so a sub-document is a `STRUCT` and an array is a `LIST`:
+
+```text
+address    struct(city varchar, postcode varchar, region struct(code varchar, name varchar))
+tags       varchar[]
+loyalty    struct(points bigint, since timestamp)
+```
+
+Three things follow from documents not being rows, and each is a deliberate
+answer rather than an accident:
+
+- **A field absent from a document is `NULL`** on that row — not `false`, not
+  zero. "Not shipped" and "not recorded" stay different facts.
+- **A field holding several types across a collection becomes `JSON`**, not the
+  type of the first document. `json_type(value)` tells you which is which.
+- **A `Decimal128` arrives as text.** Money, exactly: turning it into a float to
+  make the column numeric would lose cents. Cast it —
+  `cast(credit as decimal(18,2))` — and it sums to the cent.
+
+**The columns are a sample.** A collection has no schema, so the tree and
+autocompletion are built from the first 200 documents. A field that first appears
+in the ten-thousandth is not in them; it is still queryable, it just is not
+offered.
+
+### What it costs
+
+**Documents arrive before they are filtered.** There is no pushdown: a `where`
+clause narrows rows that have already been read. Only the collections your SQL
+*names* are read — a query against one does not fetch the others — but that one is
+read whole.
+
+The defences are a cap and an escape hatch:
+
+- **200 000 documents** per collection, after which the query is refused rather
+  than truncated, because a join quietly missing half its rows is worse than a
+  query that failed. Raise it with `ALKYON_MONGO_MAX_DOCS`.
+- **`@import` for the times the server should do the work**, written as a real
+  aggregation pipeline — nothing is translated, and only the result travels:
+
+  ```text
+  -- @duckdb
+  -- @import top = mongo-dev/alkyon_demo : [{"$group": {"_id": "$sku", "n": {"$sum": 1}}}]
+  select * from top order by n desc limit 10;
+  ```
+
+### Something to try it on
+
+```sh
+docker compose -f docker/compose.dev.yml up -d mongo
+```
+
+Port 57017, login `alkyon` / `alkyon-dev`, database `alkyon_demo`, and a seed that
+is document-shaped on purpose: nested addresses that go deeper on some documents,
+a `loyalty` field on every third one, `Decimal128` money, and an `awkward`
+collection where one field is in turn an integer, a string, a double, a document
+and an array.
+
 ## Sign in to Azure
 
 **Microsoft Entra — sign in** is the authentication method for Azure SQL, and the
@@ -379,6 +459,14 @@ session can read the one account it was opened for.
 ## What does not work yet
 
 Written down because finding it out twice is worse than reading it once.
+
+### An INTERVAL column
+
+The DuckDB crate cannot represent one — mapping its Arrow type panics inside the
+driver — so a query selecting an `INTERVAL` fails with an error naming it. The
+session survives, which is the part that matters, and `cast(gap as varchar)` reads
+fine. Not ours to fix, and pinned by a test so that it stays a contained error
+rather than becoming a crash.
 
 ### Fabric SQL endpoints and warehouses
 

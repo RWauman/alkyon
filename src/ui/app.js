@@ -1246,12 +1246,14 @@ const form = $('source-form');
 const METHODS = {
   postgres: ['password'],
   my_sql: ['password'],
+  mongo: ['password'],
   ms_sql: ['password', 'integrated', 'entra', 'aad_token'],
 };
 
 /** What each engine connects to when the Database field is left empty. */
 const DEFAULT_DATABASE = {
   ms_sql: 'master',
+  mongo: 'admin',
   my_sql: 'information_schema',
   postgres: 'postgres',
 };

@@ -34,6 +34,45 @@ no binary yet.
 - `GET /files?path=&format=` lists what a folder holds, which is what fills the
   dialogue's list.
 
+### MongoDB
+
+- **MongoDB is a source, queried in DuckDB SQL.** It has no SQL of its own —
+  `$sql` exists only inside Atlas Data Federation, a separate paid service that a
+  self-hosted deployment cannot reach — so alkyon reads the documents and DuckDB
+  answers, rather than translating SQL into aggregation pipelines and being wrong
+  in the interesting cases.
+- **Nesting survives.** Each collection is a view over its documents as JSON, so a
+  sub-document is a `STRUCT` and an array is a `LIST`: `select address.city,
+  unnest(tags) from customer` works. A field absent from a document is `NULL` on
+  that row, and a field holding several types across a collection becomes `JSON`
+  rather than the type of whichever document came first.
+- **A `Decimal128` arrives as text**, so no cent is lost on the way to a float.
+  `cast(credit as decimal(18,2))` sums exactly.
+- **Documents arrive before they are filtered** — there is no pushdown. Only the
+  collections a query names are read, and a collection past 200 000 documents is
+  refused rather than truncated (`ALKYON_MONGO_MAX_DOCS`). `@import` takes a real
+  aggregation pipeline for the times the server should do the work.
+- The columns in the tree are inferred from the first 200 documents, because a
+  collection has no schema. The guide says so plainly.
+- `docker compose -f docker/compose.dev.yml up -d mongo` brings up MongoDB 8 on
+  port 57017 with a deliberately document-shaped seed: nested addresses of
+  differing depth, fields absent from some documents, `Decimal128` money, and a
+  collection where one field is in turn an integer, a string, a double, a document
+  and an array.
+
+### Fixed
+
+- **Dates, decimals, structs and lists coming out of a DuckDB source were Rust's
+  `Debug` output.** A date read as `Date32(20455)`, a total as `Decimal(Decimal {
+  width: 38, scale: 2, value: 41948375 })`, a struct as `Struct(OrderedMap([…]))`.
+  It hid because the formats alkyon reads mostly carry dates as text; MongoDB, whose
+  documents are full of timestamps and sub-documents, made it the first thing you
+  saw. Now: exact digits for a decimal, ISO-8601 for a date or timestamp, and real
+  JSON arrays and objects for lists and structs.
+- **An `INTERVAL` column is a clean error rather than a panic.** The DuckDB crate
+  cannot map its Arrow type and panics; the query worker contains it, so the
+  session survives. `cast(gap as varchar)` reads fine, and a test pins both halves.
+
 ### Azure
 
 - **Sign in to Microsoft Entra from the dialogue.** *Sign in…* opens the browser,

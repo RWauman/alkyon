@@ -6,7 +6,11 @@
     "port": 55432,
     "database": "alkyon_demo",
     "tls": "disable",
-    "auth": { "method": "password", "username": "postgres", "password": "alkyon-dev" }
+    "auth": {
+      "method": "password",
+      "username": "postgres",
+      "password": "alkyon-dev"
+    }
   },
   {
     "id": "mysql-dev",
@@ -15,7 +19,11 @@
     "port": 53306,
     "database": "sales",
     "tls": "prefer",
-    "auth": { "method": "password", "username": "root", "password": "alkyon-dev" }
+    "auth": {
+      "method": "password",
+      "username": "root",
+      "password": "alkyon-dev"
+    }
   },
   {
     "id": "mssql-dev",
@@ -24,6 +32,23 @@
     "port": 51433,
     "database": "alkyon_demo",
     "tls": "trust_certificate",
-    "auth": { "method": "password", "username": "sa", "password": "Alkyon-dev-1" }
+    "auth": {
+      "method": "password",
+      "username": "sa",
+      "password": "Alkyon-dev-1"
+    }
+  },
+  {
+    "id": "mongo-dev",
+    "kind": "mongo",
+    "host": "127.0.0.1",
+    "port": 57017,
+    "database": "alkyon_demo",
+    "tls": "disable",
+    "auth": {
+      "method": "password",
+      "username": "alkyon",
+      "password": "alkyon-dev"
+    }
   }
 ]

@@ -41,6 +41,25 @@ services:
       retries: 40
       start_period: 15s
 
+  # Document-shaped on purpose: nested documents, arrays, absent fields and one
+  # collection where the same field holds four different types. See the seed.
+  mongo:
+    image: mongo:8
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: alkyon
+      MONGO_INITDB_ROOT_PASSWORD: alkyon-dev
+      # The database the init scripts run against, and the one the demo lives in.
+      MONGO_INITDB_DATABASE: alkyon_demo
+    ports:
+      - "57017:27017"
+    volumes:
+      - ./seed/mongo:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
   mssql:
     image: mcr.microsoft.com/mssql/server:2022-latest
     environment:

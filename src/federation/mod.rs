@@ -357,6 +357,41 @@ impl Sandbox {
     }
 }
 
+/// The columns DuckDB reports for a relation, whatever built it.
+///
+/// A `DESCRIBE` and nothing more, shared because two connectors ask the same
+/// question of the same engine: a folder source about a `read_csv`, a MongoDB
+/// source about a view over NDJSON. Neither has constraints to report — a
+/// document may be missing any field, and nothing is a key.
+pub(crate) fn describe_view(
+    connection: &Connection,
+    schema: &str,
+    relation: &str,
+) -> Result<Vec<crate::model::ColumnInfo>> {
+    let sql = format!(
+        "DESCRIBE SELECT * FROM {}.{}",
+        quote_identifier(schema),
+        quote_identifier(relation)
+    );
+    let mut statement = connection.prepare(&sql).map_err(federated)?;
+    let mut rows = statement.query([]).map_err(federated)?;
+
+    let mut columns = Vec::new();
+    let mut ordinal = 1;
+    while let Some(row) = rows.next().map_err(federated)? {
+        columns.push(crate::model::ColumnInfo {
+            name: row.get::<_, String>(0).map_err(federated)?,
+            ordinal,
+            data_type: row.get::<_, String>(1).map_err(federated)?.to_lowercase(),
+            nullable: true,
+            is_primary_key: false,
+            default: None,
+        });
+        ordinal += 1;
+    }
+    Ok(columns)
+}
+
 /// Install and load an extension that is not linked in.
 ///
 /// `LOAD` first: after the first time there is nothing to fetch. `INSTALL`
@@ -792,12 +827,171 @@ fn cell_to_json(row: &duckdb::Row<'_>, index: usize) -> Value {
         // sixty was displayed as `HugeInt(60)`.
         Ok(ValueRef::HugeInt(v)) => hugeint(i64::try_from(v).ok(), v.to_string()),
         Ok(ValueRef::UHugeInt(v)) => hugeint(i64::try_from(v).ok(), v.to_string()),
-        // Decimals, dates, intervals, lists, structs: rendered by DuckDB itself so
-        // the exact digits survive, exactly as `numeric` does on the native path.
-        Ok(other) => match duckdb::types::Value::from(other) {
-            duckdb::types::Value::Null => Value::Null,
-            value => Value::String(format!("{value:?}")),
-        },
+        // Decimals, dates, intervals, lists, structs.
+        Ok(other) => value_to_json(&duckdb::types::Value::from(other)),
+    }
+}
+
+/// A DuckDB value as JSON, including the ones that are not scalars.
+///
+/// This used to be `format!("{value:?}")`, which is Rust's derived `Debug` and not
+/// a rendering of anything: a date came out as `Date32(20455)`, a total as
+/// `Decimal(Decimal { width: 38, scale: 2, value: 41948375 })`, and a struct as
+/// `Struct(OrderedMap([…]))`. It went unnoticed because the formats alkyon reads
+/// mostly carry dates as text — and then a MongoDB source, whose documents are
+/// full of timestamps and sub-documents, made it the first thing you saw.
+///
+/// The rules:
+///
+/// - a **decimal** is its exact digits as a string, the way `numeric` already
+///   travels from PostgreSQL. Turning it into a float to make it a JSON number is
+///   the one thing this codebase refuses to do to a number
+/// - a **date, time or timestamp** is ISO-8601 text, which is what every native
+///   connector sends
+/// - a **list, array or struct** is a JSON array or object, so the grid can show
+///   structure rather than a debug dump — and `unnest` and `.field` still work in
+///   SQL either way
+fn value_to_json(value: &duckdb::types::Value) -> Value {
+    use duckdb::types::Value as Duck;
+
+    match value {
+        Duck::Null => Value::Null,
+        Duck::Boolean(b) => Value::Bool(*b),
+        Duck::TinyInt(v) => Value::from(*v),
+        Duck::SmallInt(v) => Value::from(*v),
+        Duck::Int(v) => Value::from(*v),
+        Duck::BigInt(v) => Value::from(*v),
+        Duck::UTinyInt(v) => Value::from(*v),
+        Duck::USmallInt(v) => Value::from(*v),
+        Duck::UInt(v) => Value::from(*v),
+        Duck::UBigInt(v) => Value::from(*v),
+        Duck::Float(v) => Value::from(*v),
+        Duck::Double(v) => Value::from(*v),
+        Duck::HugeInt(v) => hugeint(i64::try_from(*v).ok(), v.to_string()),
+        Duck::UHugeInt(v) => hugeint(i64::try_from(*v).ok(), v.to_string()),
+        Duck::Text(s) | Duck::Enum(s) => Value::String(s.clone()),
+        Duck::Blob(bytes) | Duck::Geometry(bytes) => Value::String(format!("\\x{}", hex(bytes))),
+        // `Display`, not `Debug`: the scaled integer and its scale, rendered.
+        Duck::Decimal(d) => Value::String(d.to_string()),
+        Duck::Date32(days) => Value::String(date_text(*days)),
+        Duck::Timestamp(unit, v) => Value::String(timestamp_text(*unit, *v)),
+        Duck::Time64(unit, v) => Value::String(time_text(*unit, *v)),
+        Duck::Interval {
+            months,
+            days,
+            nanos,
+        } => Value::String(interval_text(*months, *days, *nanos)),
+        Duck::List(items) | Duck::Array(items) => {
+            Value::Array(items.iter().map(value_to_json).collect())
+        }
+        Duck::Struct(fields) => Value::Object(
+            fields
+                .iter()
+                .map(|(key, value)| (key.clone(), value_to_json(value)))
+                .collect(),
+        ),
+        // A map's keys need not be strings, so it cannot be a JSON object without
+        // inventing something. Pairs say what it is.
+        Duck::Map(entries) => Value::Array(
+            entries
+                .iter()
+                .map(|(key, value)| {
+                    Value::Object(
+                        [
+                            ("key".to_owned(), value_to_json(key)),
+                            ("value".to_owned(), value_to_json(value)),
+                        ]
+                        .into_iter()
+                        .collect(),
+                    )
+                })
+                .collect(),
+        ),
+        Duck::Union(inner) => value_to_json(inner),
+        // The enum is `#[non_exhaustive]`: a DuckDB upgrade may add a type this
+        // was never told about. Debug output is a poor cell, but it is visible and
+        // reports what the value is, which beats an empty one — and the compiler
+        // stops warning about exactly the case we would want to be warned about.
+        other => Value::String(format!("{other:?}")),
+    }
+}
+
+/// Seconds and nanoseconds since the epoch, from one of DuckDB's four precisions.
+fn split_unit(unit: duckdb::types::TimeUnit, value: i64) -> (i64, u32) {
+    use duckdb::types::TimeUnit;
+    let per_second: i64 = match unit {
+        TimeUnit::Second => 1,
+        TimeUnit::Millisecond => 1_000,
+        TimeUnit::Microsecond => 1_000_000,
+        TimeUnit::Nanosecond => 1_000_000_000,
+    };
+    // Euclidean, so a timestamp before 1970 does not round the wrong way.
+    let seconds = value.div_euclid(per_second);
+    let fraction = value.rem_euclid(per_second) * (1_000_000_000 / per_second);
+    (seconds, fraction as u32)
+}
+
+fn date_text(days: i32) -> String {
+    match chrono::DateTime::from_timestamp(i64::from(days) * 86_400, 0) {
+        Some(when) => when.date_naive().to_string(),
+        // Outside what a calendar can hold: the number is better than nothing.
+        None => days.to_string(),
+    }
+}
+
+fn timestamp_text(unit: duckdb::types::TimeUnit, value: i64) -> String {
+    let (seconds, nanos) = split_unit(unit, value);
+    match chrono::DateTime::from_timestamp(seconds, nanos) {
+        Some(when) => when
+            .naive_utc()
+            .format("%Y-%m-%d %H:%M:%S%.f")
+            .to_string(),
+        None => value.to_string(),
+    }
+}
+
+fn time_text(unit: duckdb::types::TimeUnit, value: i64) -> String {
+    let (seconds, nanos) = split_unit(unit, value);
+    match u32::try_from(seconds)
+        .ok()
+        .and_then(|s| chrono::NaiveTime::from_num_seconds_from_midnight_opt(s, nanos))
+    {
+        Some(time) => time.format("%H:%M:%S%.f").to_string(),
+        None => value.to_string(),
+    }
+}
+
+/// Months, days and nanoseconds, said in words rather than as three numbers.
+///
+/// Months and days stay separate from the clock part on purpose: a month is not
+/// 30 days and a day is not always 24 hours, and flattening them would be
+/// inventing an answer.
+fn interval_text(months: i32, days: i32, nanos: i64) -> String {
+    let mut parts = Vec::new();
+    if months != 0 {
+        parts.push(format!("{months} month{}", plural(months.into())));
+    }
+    if days != 0 {
+        parts.push(format!("{days} day{}", plural(days.into())));
+    }
+    if nanos != 0 || parts.is_empty() {
+        let (seconds, fraction) = (nanos.div_euclid(1_000_000_000), nanos.rem_euclid(1_000_000_000));
+        let (hours, rest) = (seconds / 3_600, seconds % 3_600);
+        let clock = format!("{hours:02}:{:02}:{:02}", rest / 60, rest % 60);
+        parts.push(if fraction == 0 {
+            clock
+        } else {
+            format!("{clock}.{:09}", fraction).trim_end_matches('0').to_owned()
+        });
+    }
+    parts.join(" ")
+}
+
+fn plural(n: i64) -> &'static str {
+    if n.abs() == 1 {
+        ""
+    } else {
+        "s"
     }
 }
 

@@ -449,9 +449,13 @@ async fn websocket_cancels_a_running_query() {
             // DuckDB has no sleep, and anything slow enough to race here would
             // keep burning a thread for the rest of the suite: the blocking
             // worker only learns of the cancel when it next tries to send.
+            // DuckDB answers for these, and it has no sleep — anything slow
+            // enough to race here would keep burning a thread for the rest of
+            // the suite.
             alkyon::model::SourceKind::Folder
             | alkyon::model::SourceKind::File
-            | alkyon::model::SourceKind::Adls => continue,
+            | alkyon::model::SourceKind::Adls
+            | alkyon::model::SourceKind::Mongo => continue,
         };
 
         let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws/query"))

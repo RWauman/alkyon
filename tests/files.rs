@@ -1178,3 +1178,87 @@ async fn a_delta_table_is_read_through_its_log() {
         "the removed file must not be read: a blind union would give 'stale' too"
     );
 }
+
+/// Every DuckDB type a source can return, as the grid receives it.
+///
+/// This is a regression test for output that was Rust's `Debug`: a date arrived as
+/// `Date32(20455)`, a total as `Decimal(Decimal { width: 38, scale: 2, value: … })`
+/// and a struct as `Struct(OrderedMap([…]))`. It went unnoticed because the sample
+/// data carries its dates as text.
+#[tokio::test]
+async fn every_duckdb_type_arrives_as_something_readable() {
+    let dir = fixture();
+    let state = AppState::new();
+    state
+        .register(folder_source("data", &root(&dir)))
+        .await
+        .unwrap();
+
+    let (columns, rows) = query(
+        &state,
+        "data",
+        "select cast(1234.56 as decimal(18,2)) as money,
+                date '2026-01-02' as day,
+                timestamp '2026-01-02 03:04:05.5' as moment,
+                time '03:04:05' as clock,
+                [10, 20] as list,
+                {'city': 'Brussels', 'zip': 1000} as nested,
+                cast(9223372036854775808 as hugeint) as beyond_i64",
+    )
+    .await
+    .expect("a query returning one of everything");
+
+    assert_eq!(
+        columns,
+        ["money", "day", "moment", "clock", "list", "nested", "beyond_i64"]
+    );
+    let row = &rows[0];
+    // Exact digits, as a string — the same way `numeric` travels from PostgreSQL.
+    assert_eq!(row[0], json!("1234.56"));
+    assert_eq!(row[1], json!("2026-01-02"));
+    // The fraction keeps the precision the value has, and is absent when there is
+    // none — no trailing `.000000` on a whole second.
+    assert_eq!(row[2], json!("2026-01-02 03:04:05.500"));
+    assert_eq!(row[3], json!("03:04:05"));
+    // Structure, not a debug dump — and still `unnest`-able in SQL.
+    assert_eq!(row[4], json!([10, 20]));
+    assert_eq!(row[5], json!({ "city": "Brussels", "zip": 1000 }));
+    // Past what a JSON number holds, so the digits go as text rather than drift.
+    assert_eq!(row[6], json!("9223372036854775808"));
+
+    let (_, rows) = query(&state, "data", "select timestamp '2026-01-02 03:04:05' as t")
+        .await
+        .unwrap();
+    assert_eq!(rows[0][0], json!("2026-01-02 03:04:05"));
+}
+
+/// `INTERVAL` is the one type the DuckDB crate cannot hand back: mapping its Arrow
+/// type panics inside the driver with `not implemented: Interval(MonthDayNano)`.
+///
+/// Pinned rather than fixed, because the fix is not ours to make. What matters is
+/// that it stays *contained* — an error for that query, not a process that dies
+/// with the rest of the session in it. Cast it and it reads fine.
+#[tokio::test]
+async fn an_interval_column_fails_without_taking_the_session_down() {
+    let dir = fixture();
+    let state = AppState::new();
+    state
+        .register(folder_source("data", &root(&dir)))
+        .await
+        .unwrap();
+
+    let error = query(&state, "data", "select interval '1 month' as gap")
+        .await
+        .expect_err("the driver cannot represent an interval");
+    assert!(error.to_string().contains("Interval"), "{error}");
+
+    // The session is still there, and the way round it works.
+    let (_, rows) = query(
+        &state,
+        "data",
+        "select cast(interval '1 month 3 days' as varchar) as gap",
+    )
+    .await
+    .expect("cast to text and it is readable");
+    assert_eq!(rows[0][0], json!("1 month 3 days"));
+}

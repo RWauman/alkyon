@@ -64,6 +64,10 @@ tiberius = { version = "0.12", default-features = false, features = [
 ] }
 tokio-util = { version = "0.7", features = ["compat"] }
 
+# The official driver. Its defaults are rustls and a DNS resolver, which is what
+# `mongodb+srv://` needs and what the rest of the binary already speaks.
+mongodb = "3"
+
 directories = "6"
 portable-pty = "0.9"
 

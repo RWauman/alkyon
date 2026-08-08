@@ -7,6 +7,7 @@ use tokio::sync::RwLock;
 use crate::azure::entra;
 use crate::connectors::adls::AdlsConnector;
 use crate::connectors::files::FilesConnector;
+use crate::connectors::mongo::MongoConnector;
 use crate::connectors::mssql::MssqlConnector;
 use crate::connectors::mysql::MySqlConnector;
 use crate::connectors::postgres::PgConnector;
@@ -112,6 +113,7 @@ pub struct AppState {
     postgres: PgConnector,
     mssql: MssqlConnector,
     mysql: MySqlConnector,
+    mongo: MongoConnector,
     files: FilesConnector,
     adls: AdlsConnector,
 }
@@ -144,6 +146,7 @@ impl AppState {
             postgres: PgConnector::default(),
             mssql: MssqlConnector,
             mysql: MySqlConnector::default(),
+            mongo: MongoConnector,
             files: FilesConnector,
             adls: AdlsConnector,
         })
@@ -195,6 +198,7 @@ impl AppState {
             postgres: PgConnector::default(),
             mssql: MssqlConnector,
             mysql: MySqlConnector::default(),
+            mongo: MongoConnector,
             files: FilesConnector,
             adls: AdlsConnector,
         }))
@@ -378,6 +382,7 @@ impl AppState {
             SourceKind::Postgres => &self.postgres,
             SourceKind::MsSql => &self.mssql,
             SourceKind::MySql => &self.mysql,
+            SourceKind::Mongo => &self.mongo,
             SourceKind::Folder | SourceKind::File => &self.files,
             SourceKind::Adls => &self.adls,
         }
@@ -689,7 +694,13 @@ fn write_scope(file: &Path, sources: &BTreeMap<String, SourceRecord>, scope: Sco
         std::fs::create_dir_all(parent)?;
     }
     let temporary = file.with_extension("json.tmp");
-    std::fs::write(&temporary, serde_json::to_string_pretty(&records)?)?;
+    // With a trailing newline: `.alkyon/sources.json` is committed, and a file that
+    // ends mid-line shows up as a change in every diff that touches it.
+    std::fs::write(
+        &temporary,
+        format!("{}
+", serde_json::to_string_pretty(&records)?),
+    )?;
     std::fs::rename(&temporary, file)?;
     Ok(())
 }
