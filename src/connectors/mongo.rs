@@ -46,11 +46,6 @@ use crate::model::{
     ColumnInfo, Dialect, RowBatch, SourceConfig, TableInfo, TableKind, TableSchema, TlsMode,
 };
 
-/// The schema every collection lands in on the DuckDB side. The database is the
-/// schema as far as the explorer is concerned — as with MySQL — but a view has to
-/// live somewhere, and `public` is the name a SQL user expects.
-const ROOT_SCHEMA: &str = "public";
-
 /// How many documents are read to work out a collection's columns.
 ///
 /// A collection has no schema, so this is a sample and nothing more: a field that
@@ -206,13 +201,40 @@ impl Drop for Scratch {
 
 impl MongoConnection {
     fn database_of(&self, db: &str) -> mongodb::Database {
-        self.client
-            .database(if db.is_empty() { &self.database } else { db })
+        self.client.database(self.name_of(db))
+    }
+
+    /// The database a request means: the one it names, or the source's own.
+    fn name_of<'a>(&'a self, db: &'a str) -> &'a str {
+        if db.is_empty() {
+            &self.database
+        } else {
+            db
+        }
+    }
+
+    /// The schema the collections of `db` land in on the DuckDB side, which is
+    /// **the database's own name**.
+    ///
+    /// Not a fixed `public`: the explorer qualifies a table with the schema it was
+    /// listed under, so a view created under any other name is a table that cannot
+    /// be clicked —
+    ///
+    /// ```text
+    /// SELECT * FROM "alkyon_demo"."order_line"
+    ///   → schema "alkyon_demo" does not exist
+    /// ```
+    ///
+    /// The database is the schema here as it is for MySQL, and one string has to
+    /// serve both halves or they drift apart.
+    fn schema_of(&self, db: &str) -> String {
+        self.name_of(db).to_owned()
     }
 
     /// The collections and views in `db`.
     async fn collections(&self, db: &str) -> Result<Vec<TableInfo>> {
         let database = self.database_of(db);
+        let schema = self.schema_of(db);
         let mut cursor = database.list_collections().await.map_err(explain)?;
 
         let mut out = Vec::new();
@@ -222,9 +244,10 @@ impl MongoConnection {
                 continue;
             }
             out.push(TableInfo {
-                // The database is the schema, as with MySQL: it keeps the tree and
-                // the qualified name the explorer inserts both correct.
-                schema: db.to_owned(),
+                // The database is the schema, as with MySQL — and the resolved name
+                // rather than the one asked for, so that the qualified name the
+                // explorer inserts is one [`MongoConnection::session`] has built.
+                schema: schema.clone(),
                 name: spec.name,
                 kind: match spec.collection_type {
                     mongodb::results::CollectionType::View => TableKind::View,
@@ -284,22 +307,25 @@ impl MongoConnection {
         })
     }
 
-    /// A DuckDB session with one view per dumped collection.
-    fn session(&self, dumped: &[Ndjson]) -> Result<duckdb::Connection> {
+    /// A DuckDB session with one view per dumped collection, in `schema`.
+    ///
+    /// `schema` is on the search path, so a bare `order_line` and a qualified
+    /// `"alkyon_demo"."order_line"` both find the same view.
+    fn session(&self, schema: &str, dumped: &[Ndjson]) -> Result<duckdb::Connection> {
         let sandbox = Sandbox {
             directories: Vec::new(),
             // Each file by name: the session is granted the documents of this
             // query and nothing else on the machine.
             files: dumped.iter().map(|d| d.file.clone()).collect(),
         };
-        let connection = open_duckdb_in(&sandbox, Some(ROOT_SCHEMA))?;
+        let connection = open_duckdb_in(&sandbox, Some(schema))?;
 
         for dump in dumped {
             let address = dump.file.to_string_lossy().replace('\\', "/");
             connection
                 .execute_batch(&format!(
                     "CREATE OR REPLACE VIEW {}.{} AS SELECT * FROM read_json({});",
-                    quote_identifier(ROOT_SCHEMA),
+                    quote_identifier(schema),
                     quote_identifier(&dump.name),
                     quote_literal(&address),
                 ))
@@ -423,14 +449,16 @@ impl Connection for MongoConnection {
 
     async fn list_columns(&self, db: &str, _schema: &str, table: &str) -> Result<Vec<ColumnInfo>> {
         let scratch = Scratch::new()?;
+        let schema = self.schema_of(db);
         let dumped = self.dump(&scratch, db, table, Some(SAMPLE)).await?;
-        let connection = self.session(std::slice::from_ref(&dumped))?;
-        federation::describe_view(&connection, ROOT_SCHEMA, &dumped.name)
+        let connection = self.session(&schema, std::slice::from_ref(&dumped))?;
+        federation::describe_view(&connection, &schema, &dumped.name)
     }
 
     async fn snapshot(&self, db: &str) -> Result<Vec<TableSchema>> {
         let collections = self.collections(db).await?;
         let scratch = Scratch::new()?;
+        let schema = self.schema_of(db);
 
         let mut tables = Vec::new();
         for info in collections {
@@ -442,8 +470,8 @@ impl Connection for MongoConnection {
                     continue;
                 }
             };
-            let connection = self.session(std::slice::from_ref(&dumped))?;
-            match federation::describe_view(&connection, ROOT_SCHEMA, &dumped.name) {
+            let connection = self.session(&schema, std::slice::from_ref(&dumped))?;
+            match federation::describe_view(&connection, &schema, &dumped.name) {
                 Ok(columns) => tables.push(TableSchema {
                     schema: info.schema,
                     name: info.name,
@@ -472,7 +500,7 @@ impl Connection for MongoConnection {
                 dumped.push(self.dump(&scratch, &db, &name, None).await?);
             }
 
-            let connection = self.session(&dumped)?;
+            let connection = self.session(&db, &dumped)?;
             let sql = sql.to_owned();
             let (sink, mut source) = tokio::sync::mpsc::channel::<Result<RowBatch>>(4);
 

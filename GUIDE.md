@@ -312,6 +312,10 @@ autocompletion are built from the first 200 documents. A field that first appear
 in the ten-thousandth is not in them; it is still queryable, it just is not
 offered.
 
+**The database is the schema**, as it is for MySQL — so `customer` and
+`"alkyon_demo"."customer"` name the same collection, the second being what the
+explorer inserts when you click one.
+
 ### What it costs
 
 **Documents arrive before they are filtered.** There is no pushdown: a `where`
@@ -673,6 +677,7 @@ the second part is one.
 | PostgreSQL, default schema | `"pg".warehouse.customer` | db `warehouse`, then `customer` |
 | SQL Server | `"mssql".alkyon_demo.sales.customer` | db `alkyon_demo`, then `sales.customer` |
 | MySQL | `"mysql".sales.customer` | db `sales`, then `customer` — a MySQL schema *is* a database |
+| MongoDB | `"mongo".alkyon_demo.customer` | db `alkyon_demo`, then the collection — the database is the schema, as MySQL |
 | folder, subdirectory | `"taxi-data"."2022"` | the folder, then the `2022` directory's table |
 | folder, at the root | `"taxi-data".zones` | the folder, then `zones.parquet`'s table |
 

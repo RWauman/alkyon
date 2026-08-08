@@ -55,6 +55,45 @@ async fn a_collection_is_a_table() {
     assert_eq!(rows, [[Value::from(250)]]);
 }
 
+/// The explorer qualifies a table with the schema it listed it under, and clicking
+/// one runs exactly that text. So the name the tree hands the editor has to be a
+/// name DuckDB has.
+///
+/// The bug this pins: the views were created in a fixed `public` while the tree
+/// said `alkyon_demo`, so clicking a collection answered
+/// `schema "alkyon_demo" does not exist` — the source was browsable and none of it
+/// was clickable.
+#[tokio::test]
+async fn the_name_the_explorer_inserts_is_a_name_duckdb_has() {
+    let Some(state) = mongo().await else {
+        eprintln!("skipped: no {SOURCE} in ALKYON_SOURCES");
+        return;
+    };
+    let connection = state.open(SOURCE, None).await.unwrap();
+
+    let tables = connection.list_tables("alkyon_demo").await.unwrap();
+    assert!(
+        tables.iter().all(|table| table.schema == "alkyon_demo"),
+        "the database is the schema: {tables:?}"
+    );
+
+    // Character for character what the explorer builds for a click, `previewSql`
+    // and all.
+    let (_, rows) = query(
+        &state,
+        "SELECT * FROM \"alkyon_demo\".\"order_line\" LIMIT 10000;",
+    )
+    .await
+    .expect("the qualified name the tree inserts");
+    assert_eq!(rows.len(), 1500);
+
+    // And the bare name still works, because the schema is on the search path.
+    let (_, rows) = query(&state, "select count(*) as n from order_line")
+        .await
+        .expect("an unqualified name");
+    assert_eq!(rows[0][0], Value::from(1500));
+}
+
 /// The point of reading documents as JSON rather than flattening them: a
 /// sub-document is a struct and an array is a list, so SQL can reach into both.
 #[tokio::test]

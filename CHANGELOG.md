@@ -54,6 +54,9 @@ no binary yet.
   aggregation pipeline for the times the server should do the work.
 - The columns in the tree are inferred from the first 200 documents, because a
   collection has no schema. The guide says so plainly.
+- **The database is the schema**, as with MySQL, so the name the explorer inserts
+  when you click a collection is one the query engine has: `"alkyon_demo"."customer"`
+  and a bare `customer` are the same view.
 - `docker compose -f docker/compose.dev.yml up -d mongo` brings up MongoDB 8 on
   port 57017 with a deliberately document-shaped seed: nested addresses of
   differing depth, fields absent from some documents, `Decimal128` money, and a
