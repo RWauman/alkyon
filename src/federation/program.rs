@@ -166,18 +166,40 @@ pub fn parse(buffer: &str) -> Result<Program> {
         )));
     }
 
-    // Blank lines rather than a stripped prefix: the query keeps the line numbers
-    // it has in the editor, so DuckDB's complaints point at the right place.
     let body = &buffer[scanner.at..];
-    let skipped = buffer[..scanner.at].matches('\n').count();
-    let sql = format!("{}{body}", "\n".repeat(skipped));
-
-    if sql.trim().is_empty() {
+    if body.trim().is_empty() {
         return Err(Error::BadRequest(
             "EVALUATE needs a query after it".to_owned(),
         ));
     }
+
+    // Blank lines rather than a stripped prefix: the query keeps the line numbers
+    // it has in the editor, so DuckDB's complaints point at the right place.
+    let skipped = buffer[..scanner.at].matches('\n').count();
+    let sql = match bare_name(body) {
+        Some(name) => format!("{}select * from {name};", "\n".repeat(skipped)),
+        None => format!("{}{body}", "\n".repeat(skipped)),
+    };
     Ok(Program { imports, sql })
+}
+
+/// `EVALUATE s1` — a name and nothing else, which means *return that table*.
+///
+/// DAX's own shorthand, and the thing a hand trained on DAX types first. Alkyon
+/// answers it with `select * from s1`, which is what it meant. Anything with a
+/// space, a bracket or a keyword in it is a query and is left alone; a dotted name
+/// is allowed because `s2.sales.order_line` is a table too.
+fn bare_name(body: &str) -> Option<&str> {
+    let name = body.trim().trim_end_matches(';').trim_end();
+    if name.is_empty() {
+        return None;
+    }
+    let usable = name.split('.').all(|part| {
+        !part.is_empty()
+            && !part.starts_with(|c: char| c.is_ascii_digit())
+            && part.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    });
+    usable.then_some(name)
 }
 
 fn annotate(error: Error, line: usize) -> Error {
@@ -555,6 +577,42 @@ mod tests {
         assert_eq!(program.sql, "\n\n\n\nselect 1;");
         assert_eq!(program.sql.trim(), "select 1;");
         assert_eq!(program.sql.lines().count(), 5);
+    }
+
+    /// `EVALUATE s1` is what a hand trained on DAX types, and it means the table.
+    #[test]
+    fn a_bare_name_after_evaluate_means_select_star() {
+        let program =
+            parse("DEFINE\n  ATTACH pg = pg-dev\nEVALUATE\n    s1").unwrap();
+        assert_eq!(program.sql.trim(), "select * from s1;");
+
+        // A trailing semicolon is still just a name.
+        assert_eq!(
+            parse("EVALUATE s1;").unwrap().sql.trim(),
+            "select * from s1;"
+        );
+        // And a dotted one, because an attached catalogue holds tables too.
+        assert_eq!(
+            parse("EVALUATE pg.sales.customer").unwrap().sql.trim(),
+            "select * from pg.sales.customer;"
+        );
+    }
+
+    /// Anything that is a query stays exactly as written — the shorthand must not
+    /// start rewriting SQL.
+    #[test]
+    fn anything_that_is_a_query_is_left_alone() {
+        for query in [
+            "select * from s1",
+            "select 1",
+            "s1 join s2 on s1.id = s2.id",
+            "(select 1)",
+            "\"s 1\"",
+            "select * from s1; select * from s2;",
+        ] {
+            let sql = parse(&format!("EVALUATE\n{query}")).unwrap().sql;
+            assert_eq!(sql.trim(), query, "{query}");
+        }
     }
 
     /// A buffer with nothing to declare is still a federated one.

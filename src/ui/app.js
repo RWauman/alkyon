@@ -3,6 +3,7 @@ import { createBuffers } from './buffers.js';
 import { looksFederated, previewSql, quoteFor } from './dialect.js';
 import { createEditor } from './editor.js';
 import { createExplorer } from './explorer.js';
+import { declarations } from './federation.js';
 import { createPanes } from './panes.js';
 import { canSaveInPlace, download, openFiles, pickSaveTarget, writeFile } from './files.js';
 import { ResultGrid } from './grid.js';
@@ -276,16 +277,29 @@ addEventListener('beforeunload', (event) => {
 
 /** Reflect the buffer's mode in the chrome. Called on every edit and tab switch. */
 function paintMode() {
-  const federated = looksFederated(editor.text());
+  const text = editor.text();
+  const federated = looksFederated(text);
   $('toggle-duckdb').setAttribute('aria-pressed', String(federated));
   document.body.classList.toggle('federated', federated);
+
+  // Completion follows the declarations rather than whichever source is selected.
+  // Debounced, because this runs on every keystroke and a changed block means a
+  // schema fetch.
+  if (federated) {
+    clearTimeout(federatedSchema.pending);
+    federatedSchema.pending = setTimeout(() => loadFederatedSchema(text), 250);
+  } else if (federatedSchema.key !== null) {
+    // Back to one source: put its own schema back.
+    federatedSchema.key = null;
+    loadSchema();
+  }
 
   // In federated mode there is no single source: the imports name their own, so
   // these pickers do not apply.
   for (const id of ['source-select', 'database-select']) {
     $(id).disabled = federated;
     $(id).title = federated
-      ? 'not used in DuckDB mode — each @import names its own source'
+      ? 'not used in DuckDB mode — each declaration names its own source'
       : '';
   }
   // CodeMirror has no DuckDB mode; the generic SQL one is the closest fit.
@@ -329,6 +343,85 @@ function loadSchema({ refresh = false } = {}) {
     })
     .catch((e) => status(`schema: ${e.message}`, true));
 }
+
+/**
+ * Fill completion from what a federated buffer declared.
+ *
+ * In this mode there is no selected source, so the schema the editor holds is
+ * whichever one happened to be picked last — it offers `sales.customer` from a
+ * server the buffer never mentions, and knows nothing about the names it does.
+ *
+ * What is knowable without running anything:
+ *
+ * - **`ATTACH pg = src/db`** — every table of that database, under `pg.schema.table`
+ *   with its columns. Alkyon already caches that snapshot.
+ * - **`IMPORT s = src AS ( select * from x )`** — the columns of `x`, for the same
+ *   reason: the query is the table.
+ * - **anything else** — the alias, so `from s` completes, with no columns to
+ *   promise.
+ */
+async function loadFederatedSchema(text) {
+  const wanted = declarations(text);
+  const key = JSON.stringify(wanted);
+  // Nothing changed in the block, so nothing to fetch. Typing in the query below
+  // it is the common case, and it must not re-read a schema per keystroke.
+  if (key === federatedSchema.key) return;
+  federatedSchema.key = key;
+
+  const map = {};
+  // alias → the source's own schema, for completing the SQL inside its brackets.
+  const inside = {};
+  for (const { kind, alias, source, database, table, columns } of wanted) {
+    const resolved = resolveSourceKey(source);
+    if (!resolved) {
+      // Not a source alkyon knows — still offer the name it was given.
+      map[alias] = [];
+      continue;
+    }
+    let snapshot = null;
+    try {
+      snapshot = await api.schema(resolved, database || undefined);
+    } catch {
+      // A server that is down must not take the rest of the block's completion
+      // with it.
+    }
+    // The block may have been rewritten while this was in flight.
+    if (key !== federatedSchema.key) return;
+
+    // What the source itself holds, for the SQL written inside `AS ( … )`.
+    if (snapshot) {
+      inside[alias] = Object.fromEntries(
+        snapshot.tables.map((t) => [`${t.schema}.${t.name}`, t.columns.map((c) => c.name)]),
+      );
+    }
+
+    if (kind === 'ATTACH') {
+      for (const remote of snapshot?.tables ?? []) {
+        map[`${alias}.${remote.schema}.${remote.name}`] = remote.columns.map((c) => c.name);
+      }
+      continue;
+    }
+    // One alias, one table: whatever the import will produce. Its own select list
+    // is the first answer — the names are written there — and a bare
+    // `select * from x` falls back to what that table holds.
+    const named = table?.toLowerCase();
+    const match = snapshot?.tables.find(
+      (t) =>
+        `${t.schema}.${t.name}`.toLowerCase() === named || t.name.toLowerCase() === named,
+    );
+    map[alias] = columns ?? (match ? match.columns.map((c) => c.name) : []);
+  }
+
+  editor.setSchema(map, wanted.map((d) => d.alias), inside);
+  detail(
+    wanted.length
+      ? `${wanted.length} declared — ${Object.keys(map).length} names`
+      : 'federated',
+  );
+}
+
+/** The block the completion map was built from, so it is rebuilt only when it changes. */
+const federatedSchema = { key: null, pending: null };
 
 const search = createSearch(
   {

@@ -1012,9 +1012,28 @@ whatever the open folder holds. That is also what the **⌗** button in the tool
 writes: it wraps the buffer you already have, because what you had *was* the thing
 to return.
 
+**`EVALUATE s1`** — a name and nothing else — means `select * from s1`, the way it
+does in DAX. Anything with a space or a bracket in it is a query and is left
+exactly as written.
+
 A name is claimed once, whichever keyword claims it, and the block is code rather
 than commentary: it is highlighted as code, `--` comments work inside it, and after
 `ATTACH x =` the completion offers the sources you have registered and nothing else.
+
+**Completion follows the declarations.** Below `EVALUATE`, the names on offer are
+the ones the block declared rather than whichever source happens to be selected:
+
+- an **`ATTACH pg = src/db`** brings every table of that database, as
+  `pg.schema.table`, with its columns — the snapshot alkyon already caches.
+- an **`IMPORT`** brings the columns its query will produce, read off its own
+  select list: `select id, name, 'x' as tab` gives `id`, `name`, `tab`. A bare
+  `select * from x` falls back to what that table holds. What cannot be named — a
+  `*`, an unaliased `count(*)` — is left out rather than guessed.
+- the status line says what it found — `2 declared — 4 names`.
+
+**Inside `AS ( … )` it switches sources.** There you are writing that source's own
+SQL, so its tables and columns are what is offered — not the aliases the buffer
+declares, which the source has never heard of.
 
 > **This replaced a set of `-- @import` comments, and they no longer work.** Those
 > kept the file a valid `.sql` that psql would parse, which was worth something;

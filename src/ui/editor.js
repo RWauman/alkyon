@@ -3,6 +3,7 @@
 
 import { cteColumns, mask as maskLiterals, referencedTables } from './cte.js';
 import { dialectForMime, qualifyLoosely } from './dialect.js';
+import { importAt } from './federation.js';
 import { targetAt } from './target.js';
 
 /**
@@ -167,7 +168,7 @@ function columnScope(cm, tables) {
  * All of this only while the word being typed has no dot in it — after a dot the
  * addon already knows what to do.
  */
-function byBareName(cm, result, tables, inScope) {
+function byBareName(cm, result, tables, inScope, aliases) {
   const typed = cm.getRange(result.from, result.to);
   if (typed.includes('.') || typed.includes('"') || typed.includes('`')) {
     return { tables: [], columns: [], shadowed: new Set() };
@@ -196,11 +197,13 @@ function byBareName(cm, result, tables, inScope) {
         matched.push(candidate(qualified, table, schema, 'table'));
       }
     } else if (qualified.toLowerCase().startsWith(prefix)) {
-      // An unqualified entry is a CTE. The addon offers it too, as a bare string
-      // with nothing to say about it, so this one *replaces* that rather than
-      // stepping aside for it — otherwise the row that wins is the one that does
-      // not mention it is a CTE at all.
-      matched.push(candidate(qualified, qualified, 'CTE', 'table'));
+      // An unqualified entry is a CTE — or, in a federated buffer, a name the
+      // DEFINE block declared, which is a different thing and should not be
+      // called a CTE. The addon offers it too, as a bare string with nothing to
+      // say about it, so this one *replaces* that rather than stepping aside for
+      // it: otherwise the row that wins is the one that says nothing at all.
+      const what = aliases?.has(qualified) ? 'declared' : 'CTE';
+      matched.push(candidate(qualified, qualified, what, 'table'));
       shadowed.add(qualified);
     }
 
@@ -259,11 +262,26 @@ function quotingSqlHint(cm, options) {
   const declaring = declarationCompletions(cm, options.sources ?? []);
   if (declaring) return declaring;
 
+  // Which schema is in scope here.
+  //
+  // Inside `IMPORT s = src AS ( … )` the SQL belongs to `src`, so it is that
+  // source's tables that mean anything — offering the buffer's own aliases there
+  // would be offering names the source has never heard of. Everywhere else it is
+  // the buffer's own map.
+  //
+  // Only the *map* changes. Everything below — bare names, columns, quoting — runs
+  // either way, and the first version of this returned the addon's answer straight
+  // from here, which quietly gave up all of it: typing `na` inside the brackets
+  // offered nothing, because the addon only ever matches a qualified name.
+  const inside = importAt(cm.getValue(), cm.indexFromPos(cm.getCursor()));
+  const native = inside ? options.inside?.[inside.alias] : null;
+
   // CTEs are read from the buffer *here* rather than kept in step on every
   // keystroke: the parse is cheap, it only matters while the list is open, and
-  // nothing can go stale if there is nothing to invalidate.
-  const schema = options.tables ?? {};
-  const withCtes = { ...schema, ...cteColumns(cm.getValue(), schema) };
+  // nothing can go stale if there is nothing to invalidate. A declaration's own
+  // SQL has no CTEs of the outer buffer's in scope.
+  const schema = native ?? options.tables ?? {};
+  const withCtes = native ? schema : { ...schema, ...cteColumns(cm.getValue(), schema) };
 
   // The addon resolves `alias.` against its own `tables`, so it has to see the
   // CTEs too or `c.` after `with c as (…)` offers nothing.
@@ -273,7 +291,7 @@ function quotingSqlHint(cm, options) {
   const dialect = dialectForMime(cm.getOption('mode'));
   const reserved = CodeMirror.resolveMode(cm.getOption('mode'))?.keywords;
 
-  const extra = byBareName(cm, result, withCtes, columnScope(cm, withCtes));
+  const extra = byBareName(cm, result, withCtes, columnScope(cm, withCtes), options.aliases);
   const kept = result.list.filter(
     (item) => !extra.shadowed.has(typeof item === 'string' ? item : item.text),
   );
@@ -329,6 +347,10 @@ export function createEditor(element, { onRun, onOpen, onSave, onSaveAs, onNew, 
   let tables = {};
   // Registered source names, for completing a TARGET directive.
   let sources = [];
+  // Names a federated buffer declared, which are neither tables nor CTEs.
+  let aliases = new Set();
+  // alias → that source's own schema, for completing the SQL inside its brackets.
+  let inside = {};
 
   const editor = CodeMirror(element, {
     value: [
@@ -340,6 +362,23 @@ export function createEditor(element, { onRun, onOpen, onSave, onSaveAs, onNew, 
     mode: 'text/x-sql',
     theme: 'night-owl',
     lineNumbers: true,
+    // Enter keeps the indentation of the line above instead of asking the SQL
+    // mode where the line "should" go.
+    //
+    // The mode's answer is bracket depth plus one unit, which is not how anyone
+    // writes SQL: clauses are aligned under each other by hand, and a `WHERE`
+    // typed under a `FROM` inside `AS (` came out two columns further in every
+    // time. Copying the previous line is both predictable and what was meant.
+    smartIndent: false,
+    // Four, because that is what the buffers people write already use — the
+    // default two left Tab and the existing indentation disagreeing.
+    indentUnit: 4,
+    tabSize: 4,
+    // A real tab character, not four spaces pretending to be one. Asked for, and
+    // it is the honest reading of pressing Tab. Existing lines keep whatever they
+    // were written with: Enter copies the characters above it rather than
+    // reformatting them, so nothing already indented with spaces is disturbed.
+    indentWithTabs: true,
     matchBrackets: true,
     autoCloseBrackets: true,
     lineWrapping: true,
@@ -387,7 +426,7 @@ export function createEditor(element, { onRun, onOpen, onSave, onSaveAs, onNew, 
       'Alt-N': onNew,
       'Alt-W': onClose,
     },
-    hintOptions: { tables, sources, completeSingle: false, hint: quotingSqlHint },
+    hintOptions: { tables, sources, aliases, inside, completeSingle: false, hint: quotingSqlHint },
   });
 
   // Pop the completion list up while typing a word or just after a dot, rather
@@ -402,7 +441,14 @@ export function createEditor(element, { onRun, onOpen, onSave, onSaveAs, onNew, 
   if (onChange) editor.on('changes', () => onChange());
 
   function refreshHints() {
-    editor.setOption('hintOptions', { tables, sources, completeSingle: false, hint: quotingSqlHint });
+    editor.setOption('hintOptions', {
+      tables,
+      sources,
+      aliases,
+      inside,
+      completeSingle: false,
+      hint: quotingSqlHint,
+    });
   }
 
   return {
@@ -488,9 +534,14 @@ export function createEditor(element, { onRun, onOpen, onSave, onSaveAs, onNew, 
     /**
      * Replace the whole completion map at once. Feeding a full snapshot through
      * `addColumns` would call `setOption` once per table.
+     *
+     * `declared` names the entries that came from a federated buffer's DEFINE
+     * block, so the list can say what they are rather than calling them CTEs.
      */
-    setSchema(map) {
+    setSchema(map, declared = [], within = {}) {
       tables = map;
+      aliases = new Set(declared);
+      inside = within;
       refreshHints();
     },
 

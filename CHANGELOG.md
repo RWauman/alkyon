@@ -93,6 +93,32 @@ no binary yet.
 - The parser is a real scanner, because it has to be: `AS ( select 'a)b' )` must not
   end at the bracket inside the string, and neither must one in a `--` comment, a
   `/* */` block, a quoted identifier or a T-SQL `[bracket]`. A test covers each.
+- **`EVALUATE s1` means `select * from s1`**, the way it does in DAX. Anything with
+  a space or a bracket in it is a query and is left exactly as written.
+- **Completion follows the declarations.** Below `EVALUATE` the names on offer are
+  the ones the block declared, not whichever source happens to be selected: an
+  `ATTACH` brings every table of its database as `alias.schema.table` with columns,
+  and an `IMPORT … AS ( select * from x )` brings the columns of `x` — both from
+  the snapshot alkyon already caches, so nothing is run to find out. Any other
+  query still offers the alias, with no columns invented for it. A declared name is
+  labelled *declared* rather than *CTE*, which is what it used to be called.
+- **Inside `AS ( … )` the completion switches sources.** There you are writing the
+  *source's* SQL, so its tables and columns are what mean anything — offering the
+  buffer's own aliases would be offering names that source has never heard of. A
+  scanner finds which declaration's brackets the cursor is in, including while they
+  are still unclosed, which is most of the time you are typing in them. Only the
+  *map* changes: bare names, columns and quoting all still work there, which the
+  first version of this quietly gave up by answering from the addon directly.
+- **An import's columns are read off its own select list.** `select id, name,
+  'x' as tab` produces `id`, `name`, `tab`, and those are what the query below
+  `EVALUATE` completes from — no describing, no running. A bare `select * from x`
+  still falls back to what that table holds, and what cannot be named — a `*`, an
+  unaliased `count(*)` — is left out rather than guessed.
+- **Tab inserts a tab.** It was inserting four spaces.
+- **Enter keeps the indentation of the line above.** The SQL mode's answer is
+  bracket depth plus one unit, which is not how anyone writes SQL — a `WHERE` typed
+  under a `FROM` inside `AS (` came out two columns further in, every time. The
+  indent unit is 4 now, which is what the buffers people write already use.
 
 ### Editing a source
 
