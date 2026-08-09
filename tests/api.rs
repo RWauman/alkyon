@@ -458,6 +458,11 @@ async fn websocket_cancels_a_running_query() {
         let sql = match source.kind {
             alkyon::model::SourceKind::Postgres => "SELECT pg_sleep(30)",
             alkyon::model::SourceKind::MsSql => "WAITFOR DELAY '00:00:30'",
+            // The same T-SQL, but the statement is handed to DuckDB's extension,
+            // which holds the session's mutex until the server answers — so the
+            // cancel would find nothing to interrupt and the thread would keep
+            // burning for the rest of the suite.
+            alkyon::model::SourceKind::Fabric => continue,
             alkyon::model::SourceKind::MySql => "SELECT SLEEP(30)",
             // DuckDB has no sleep, and anything slow enough to race here would
             // keep burning a thread for the rest of the suite: the blocking

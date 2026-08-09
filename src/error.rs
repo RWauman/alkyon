@@ -43,6 +43,15 @@ pub enum Error {
     #[error("sql server: {0}")]
     MsSql(#[from] tiberius::error::Error),
 
+    /// What a server said, when its driver's own error type cannot be carried.
+    ///
+    /// The DuckDB-backed SQL Server path is the caller: its failures arrive as
+    /// DuckDB strings with the server's words inside them, and the connector has
+    /// already pulled those out. A gateway error like the others — the request was
+    /// fine, the far end was not.
+    #[error("{0}")]
+    Remote(String),
+
     /// Anything the MongoDB driver reports.
     ///
     /// Its own variant for one reason: what the *server* says belongs in the same
@@ -69,7 +78,9 @@ impl Error {
             Error::DuplicateSource(_) => StatusCode::CONFLICT,
             Error::BadRequest(_) | Error::Unsupported(_) => StatusCode::BAD_REQUEST,
             Error::MissingSecret(_) => StatusCode::PRECONDITION_FAILED,
-            Error::Sqlx(_) | Error::MsSql(_) | Error::Mongo(_) => StatusCode::BAD_GATEWAY,
+            Error::Sqlx(_) | Error::MsSql(_) | Error::Mongo(_) | Error::Remote(_) => {
+                StatusCode::BAD_GATEWAY
+            }
             // A federated failure is usually the user's SQL, not a broken server.
             Error::Federated(_) => StatusCode::BAD_REQUEST,
             Error::Io(_)

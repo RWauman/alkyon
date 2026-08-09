@@ -32,6 +32,19 @@ impl Dialect {
 pub enum SourceKind {
     Postgres,
     MsSql,
+    /// A SQL Server reached **through DuckDB's `mssql` extension** rather than
+    /// through `tiberius` — which is what makes it a different kind rather than an
+    /// option on [`SourceKind::MsSql`].
+    ///
+    /// It exists for one reason: a Fabric SQL analytics endpoint answers the first
+    /// login with a routing token that `tiberius` cannot follow, so the ordinary
+    /// SQL Server source cannot connect to one at all. This path speaks its own
+    /// TDS and takes the same Entra sign-in.
+    ///
+    /// **The dialect is still T-SQL.** The extension's `mssql_scan` runs a query
+    /// verbatim on the server, so `top`, `sys.*` and window functions all arrive
+    /// as written — this is not a DuckDB source wearing a SQL Server label.
+    Fabric,
     MySql,
     /// A MongoDB deployment. Reached like a server — host, port, a login — and
     /// then queried in **DuckDB SQL**: alkyon reads the documents and DuckDB
@@ -89,7 +102,7 @@ impl SourceKind {
     pub fn default_port(self) -> u16 {
         match self {
             SourceKind::Postgres => 5432,
-            SourceKind::MsSql => 1433,
+            SourceKind::MsSql | SourceKind::Fabric => 1433,
             SourceKind::MySql => 3306,
             SourceKind::Mongo => 27017,
             // Not a port at all. Reported as 0 and hidden by the UI, rather than
@@ -101,7 +114,7 @@ impl SourceKind {
     pub fn default_schema(self) -> &'static str {
         match self {
             SourceKind::Postgres => "public",
-            SourceKind::MsSql => "dbo",
+            SourceKind::MsSql | SourceKind::Fabric => "dbo",
             // MySQL has no schema layer: a schema *is* a database. There is
             // therefore no default to give, and the connector reads an empty
             // schema as "the database this call names". MongoDB is the same shape:
@@ -120,7 +133,7 @@ impl SourceKind {
     /// a PostgreSQL server that is not Azure's.
     pub fn entra_resource(self) -> Option<crate::azure::entra::Resource> {
         match self {
-            SourceKind::MsSql => Some(crate::azure::entra::Resource::AzureSql),
+            SourceKind::MsSql | SourceKind::Fabric => Some(crate::azure::entra::Resource::AzureSql),
             SourceKind::Adls => Some(crate::azure::entra::Resource::Storage),
             _ => None,
         }
@@ -131,7 +144,7 @@ impl SourceKind {
     pub fn default_database(self) -> &'static str {
         match self {
             SourceKind::Postgres => "postgres",
-            SourceKind::MsSql => "master",
+            SourceKind::MsSql | SourceKind::Fabric => "master",
             // Readable by everyone and always present, and privilege-filtered by
             // the server so it shows only what this login may see.
             SourceKind::MySql => "information_schema",
@@ -775,14 +788,14 @@ pub enum TableKind {
     View,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct TableInfo {
     pub schema: String,
     pub name: String,
     pub kind: TableKind,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ColumnInfo {
     pub name: String,
     pub ordinal: i32,
@@ -794,7 +807,7 @@ pub struct ColumnInfo {
 }
 
 /// A table with its columns — one entry of a schema snapshot.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct TableSchema {
     pub schema: String,
     pub name: String,

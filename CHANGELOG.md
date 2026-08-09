@@ -63,6 +63,26 @@ no binary yet.
   collection where one field is in turn an integer, a string, a double, a document
   and an array.
 
+### A Fabric SQL endpoint in the explorer
+
+- **New source kind: *Microsoft Fabric SQL endpoint — via DuckDB*.** It reaches the
+  same endpoint the ordinary SQL Server source cannot, because it does not use
+  `tiberius` at all: DuckDB's community `mssql` extension speaks its own TDS and
+  takes the same Entra sign-in. Tree, autocompletion and `Ctrl+K` all work.
+- **Still T-SQL.** `mssql_scan` runs a query on the server verbatim, so `top`,
+  `sys.*`, window functions and `@@VERSION` arrive as written — this is not a DuckDB
+  source wearing a SQL Server label. The explorer's metadata is the *same T-SQL* the
+  native connector uses, and a test asserts the two describe a real server
+  identically: same views marked as views, same composite keys, same
+  `decimal(12,4)`.
+- What it gives up, all of it in the guide: it **reads** (writes are refused with a
+  sentence saying so), one result set per run, about a second to open every query,
+  and a running query cannot be cancelled. If the ordinary SQL Server source can
+  connect, prefer it.
+- Tested against the dev SQL Server container rather than Fabric — a Fabric endpoint
+  is not something a suite can conjure, so what is proven is everything except the
+  login on a routed node.
+
 ### Federation
 
 - **`@attach` — let DuckDB read the server itself.** `-- @attach pg = pg-prod/warehouse`

@@ -1249,11 +1249,15 @@ const METHODS = {
   my_sql: ['password'],
   mongo: ['password'],
   ms_sql: ['password', 'integrated', 'entra', 'aad_token'],
+  // No `integrated`: the extension's Kerberos/SSPI path is not one alkyon
+  // drives, and a cloud endpoint has no domain to be integrated with anyway.
+  fabric: ['entra', 'aad_token', 'password'],
 };
 
 /** What each engine connects to when the Database field is left empty. */
 const DEFAULT_DATABASE = {
   ms_sql: 'master',
+  fabric: 'master',
   mongo: 'admin',
   my_sql: 'information_schema',
   postgres: 'postgres',

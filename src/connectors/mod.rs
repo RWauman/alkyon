@@ -1,4 +1,5 @@
 pub mod adls;
+pub mod fabric;
 pub mod files;
 pub mod mongo;
 pub mod mssql;

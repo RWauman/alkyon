@@ -37,6 +37,7 @@ tries the connection without registering it.
 |---|---|---|
 | PostgreSQL | PL/pgSQL | 5432 |
 | SQL Server | T-SQL | 1433 |
+| **Microsoft Fabric SQL endpoint** — via DuckDB | T-SQL — see [below](#microsoft-fabric-sql-endpoint--via-duckdb) | 1433 |
 | MySQL / MariaDB | MySQL | 3306 |
 | **MongoDB** | DuckDB — see [below](#mongodb-queried-in-sql) | 27017 |
 | **Folder of data files** | DuckDB | — |
@@ -55,11 +56,11 @@ tries the connection without registering it.
   leave **Port** empty. **Never put a hostname here**: no cloud endpoint runs a
   SQL Browser, so the connection times out against a host that answers perfectly
   well. Alkyon refuses a hostname in that field and says where it belongs.
-- **A Fabric SQL analytics endpoint or warehouse does not connect** through this
-  dialogue. See [What does not work](#what-does-not-work-yet). Its data is reachable
-  two other ways: `@attach` in a [federated buffer](#attach--let-duckdb-read-the-server-itself),
-  which uses a different TDS implementation and the same sign-in, or an
-  [Azure storage source](#azure-storage-as-a-source) over OneLake.
+- **A Fabric SQL analytics endpoint does not connect as *SQL Server*.** Pick
+  **Microsoft Fabric SQL endpoint — via DuckDB** instead: same host, same sign-in,
+  a different TDS implementation, and still T-SQL. See
+  [What does not work](#what-does-not-work-yet) for why the ordinary one stops, and
+  what the other one gives up.
 - **Microsoft Entra — sign in** opens your browser and takes the sign-in from
   there; see [Sign in to Azure](#sign-in-to-azure). **Entra ID access token** is
   still there for a token pasted from
@@ -500,19 +501,51 @@ SSMS.
 **Azure SQL is unaffected**: its redirects name a host and a port and no
 instance, so the two names agree and the redirect is followed normally.
 
-**What to use instead.** Two things, and the first is new:
+**What to use instead**: the *Microsoft Fabric SQL endpoint* source below, which is
+the same endpoint reached by another road — explorer included, T-SQL included. Or
+an [Azure storage source](#azure-storage-as-a-source), which reads the same
+lakehouse over OneLake and answers DuckDB SQL.
 
-- **`@attach` in a federated buffer.** DuckDB's community `mssql` extension speaks
-  TDS itself and takes the same Entra bearer token, so it does not go through
-  `tiberius` and does not hit this wall. It has not been run against a real Fabric
-  endpoint yet — if you have one, `-- @attach fab = <your source>` is the thing to
-  try, and it costs one line. See [`@attach`](#attach--let-duckdb-read-the-server-itself)
-  for what it is and what it gives up.
-- An [Azure storage source](#azure-storage-as-a-source) reads the same lakehouse
-  over OneLake and answers DuckDB SQL.
+### Microsoft Fabric SQL endpoint — via DuckDB
 
-Either way the *native* path — the explorer, the tree, T-SQL typed against the
-endpoint — stays blocked until the missing piece of the login is found.
+A second kind of SQL Server source, and it exists for exactly one reason: it does
+not use `tiberius`, so it does not hit the wall above. DuckDB's community `mssql`
+extension speaks its own TDS and takes the **same Entra sign-in** — sign in as
+usual, and the bearer token alkyon already mints is handed over.
+
+**It is not a DuckDB source wearing a SQL Server label.** The extension's
+`mssql_scan` runs a query on the server verbatim, so what you type is what the
+server gets:
+
+```sql
+SELECT TOP 10 name, ROW_NUMBER() OVER (ORDER BY id) AS rn FROM sales.customer;
+SELECT @@VERSION;
+```
+
+`top`, `sys.*`, window functions, `@@VERSION` — all of it. The explorer's tree is
+built from the same T-SQL the ordinary SQL Server source uses, so the two describe
+one server identically: same schemas, same views marked as views, same composite
+primary keys, same `decimal(12,4)`. A test asserts that equality column by column
+against a real server.
+
+What it gives up, and it is worth knowing before you pick it:
+
+- **It reads.** `mssql_scan` binds a result set, and the connection is read-only
+  besides, so `insert`, `update` and DDL are refused with a sentence saying so. For
+  a SQL *analytics endpoint*, which is read-only anyway, that costs nothing; for a
+  warehouse you mean to write to, use an ordinary SQL Server source.
+- **One result set per run.** A batch of several statements gives back the first.
+- **About a second to open**, spent in the extension's catalogue round trip, and
+  paid by every query. Noticeable in the explorer, not painful.
+- **A query cannot be cancelled** once the server has it: the *Cancel* button stops
+  alkyon waiting, not the server working.
+- **Third-party code**, and encryption without certificate validation — both
+  covered under [`@attach`](#sql-server-and-the-community-extension), and both apply
+  here. A source set to *Require* is refused rather than quietly weakened.
+
+It works against any SQL Server, not only Fabric — but if the ordinary source can
+connect, prefer it: it writes, it cancels, it opens instantly, and it validates
+certificates.
 
 ## Run a query
 

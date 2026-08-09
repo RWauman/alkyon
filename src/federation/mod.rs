@@ -437,7 +437,11 @@ pub(crate) fn describe_view(
 /// reaches `extensions.duckdb.org` and writes to DuckDB's own extension
 /// directory, which is why it happens for a source that cannot be read without it
 /// and never as a side effect of anything else.
-fn fetch_extension(connection: &Connection, name: &str, repository: Option<&str>) -> Result<()> {
+pub(crate) fn fetch_extension(
+    connection: &Connection,
+    name: &str,
+    repository: Option<&str>,
+) -> Result<()> {
     if connection.execute_batch(&format!("LOAD {name};")).is_ok() {
         return Ok(());
     }

@@ -71,7 +71,7 @@ impl Engine {
         match kind {
             SourceKind::Postgres => Some(Engine::Postgres),
             SourceKind::MySql => Some(Engine::MySql),
-            SourceKind::MsSql => Some(Engine::MsSql),
+            SourceKind::MsSql | SourceKind::Fabric => Some(Engine::MsSql),
             _ => None,
         }
     }
@@ -107,7 +107,7 @@ impl Engine {
     /// validates. So *Require*, which promises validation, is refused instead of
     /// being quietly downgraded — that downgrade is precisely the trade this
     /// codebase refuses everywhere else.
-    fn tls(self, mode: TlsMode, alias: &str) -> Result<String> {
+    fn tls(self, mode: TlsMode, context: &str) -> Result<String> {
         Ok(match self {
             Engine::Postgres => format!(
                 "SSLMODE {}",
@@ -132,7 +132,7 @@ impl Engine {
                 TlsMode::Prefer | TlsMode::TrustCertificate => "USE_ENCRYPT true".to_owned(),
                 TlsMode::Require => {
                     return Err(Error::BadRequest(format!(
-                        "@attach {alias}: this source is set to *Require*, which means validate \
+                        "{context}: this source is set to *Require*, which means validate \
                          the certificate — and DuckDB's `mssql` extension encrypts without ever \
                          checking one. Rather than quietly hand you a weaker connection than you \
                          asked for: import it with `@import`, which connects the way alkyon does, \
@@ -145,7 +145,7 @@ impl Engine {
     }
 
     /// The credential, as secret parameters. Not every engine takes every method.
-    fn credential(self, auth: &AuthConfig, alias: &str) -> Result<String> {
+    fn credential(self, auth: &AuthConfig, context: &str) -> Result<String> {
         match (self, auth) {
             (_, AuthConfig::Password { username, password }) => Ok(format!(
                 "USER {}, PASSWORD {}",
@@ -159,7 +159,7 @@ impl Engine {
                 Ok(format!("ACCESS_TOKEN {}", quote_literal(token)))
             }
             (_, other) => Err(Error::BadRequest(format!(
-                "@attach {alias}: DuckDB opens its own connection, and its {} extension cannot \
+                "{context}: DuckDB opens its own connection, and its {} extension cannot \
                  use `{}`. Import the source instead: `@import` connects the way alkyon does.",
                 self.extension(),
                 other.method()
@@ -220,9 +220,18 @@ impl Attachment {
 /// echoed, rather than inside a string that shows up in every error message
 /// DuckDB writes about the attachment.
 pub fn plan(alias: &str, config: &SourceConfig) -> Result<Attachment> {
+    plan_for(&format!("@attach {alias}"), alias, config)
+}
+
+/// [`plan`], for a caller that is not a `@attach` line.
+///
+/// `context` opens every message this can produce. The Fabric connector attaches
+/// the same way a federated buffer does but has no directive to name, and an error
+/// reading `@attach server: …` in a connection dialogue would be a puzzle.
+pub fn plan_for(context: &str, alias: &str, config: &SourceConfig) -> Result<Attachment> {
     let engine = Engine::of(config.kind).ok_or_else(|| {
         Error::BadRequest(format!(
-            "@attach {alias}: this source cannot be attached — {}. Import it instead: \
+            "{context}: this source cannot be attached — {}. Import it instead: \
              `@import {alias} = … : <sql>` runs your SQL on the source and brings back the \
              answer.",
             unattachable(config.kind)
@@ -231,10 +240,9 @@ pub fn plan(alias: &str, config: &SourceConfig) -> Result<Attachment> {
 
     if engine.repository().is_some() && !community_allowed() {
         return Err(Error::BadRequest(format!(
-            "@attach {alias}: attaching {} needs DuckDB's community `{}` extension, and \
+            "{context}: this needs DuckDB's community `{}` extension, and \
              ALKYON_COMMUNITY_EXTENSIONS is off — community extensions are third-party code \
              running inside alkyon. Unset it to allow them, or use `@import`.",
-            engine.extension(),
             engine.extension(),
         )));
     }
@@ -248,8 +256,8 @@ pub fn plan(alias: &str, config: &SourceConfig) -> Result<Attachment> {
         host = quote_literal(&config.host),
         port = config.port(),
         database = quote_literal(config.database()),
-        credential = engine.credential(&config.auth, alias)?,
-        tls = engine.tls(config.tls, alias)?,
+        credential = engine.credential(&config.auth, context)?,
+        tls = engine.tls(config.tls, context)?,
     );
 
     // READ_ONLY without an opt-out. A federated buffer is for reading, and an

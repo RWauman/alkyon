@@ -254,20 +254,20 @@ pub struct MssqlConnection {
     cfg: SourceConfig,
 }
 
-const LIST_DATABASES: &str = "\
+pub(crate) const LIST_DATABASES: &str = "\
 SELECT name
 FROM sys.databases
 WHERE state = 0 AND HAS_DBACCESS(name) = 1
 ORDER BY name";
 
-const LIST_TABLES: &str = "\
+pub(crate) const LIST_TABLES: &str = "\
 SELECT s.name AS [schema], o.name AS [name], o.type AS [kind]
 FROM sys.objects o
 JOIN sys.schemas s ON s.schema_id = o.schema_id
 WHERE o.type IN ('U', 'V')
 ORDER BY s.name, o.name";
 
-const LIST_COLUMNS: &str = "\
+pub(crate) const LIST_COLUMNS: &str = "\
 SELECT c.name        AS [name],
        c.column_id   AS [ordinal],
        t.name        AS [type_name],
@@ -294,7 +294,7 @@ ORDER BY c.column_id";
 
 /// `LIST_COLUMNS` widened to the whole database, carrying the object type so a
 /// snapshot costs one round trip rather than one per table.
-const SNAPSHOT: &str = "\
+pub(crate) const SNAPSHOT: &str = "\
 SELECT s.name        AS [schema],
        o.name        AS [table_name],
        o.type        AS [kind],
@@ -463,7 +463,7 @@ impl Connection for MssqlConnection {
 
 /// Rebuild the type as a T-SQL author would write it: `nvarchar(50)`,
 /// `decimal(18,2)`, `varbinary(max)`.
-fn spell_type(name: &str, max_length: i16, precision: u8, scale: u8) -> String {
+pub(crate) fn spell_type(name: &str, max_length: i16, precision: u8, scale: u8) -> String {
     let length = |halved: bool| -> String {
         if max_length < 0 {
             "max".to_owned()
