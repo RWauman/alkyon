@@ -1,5 +1,17 @@
 [
   {
+    "id": "psql-dev",
+    "kind": "postgres",
+    "host": "127.0.0.1",
+    "port": 55432,
+    "database": "alkyon_demo",
+    "auth": {
+      "method": "password",
+      "username": "postgres"
+    },
+    "tls": "prefer"
+  },
+  {
     "id": "sample-csv",
     "kind": "folder",
     "path": "./sample-data/csv",

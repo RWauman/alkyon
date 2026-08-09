@@ -490,20 +490,213 @@ async fn an_attached_session_is_still_confined() {
     assert_eq!(rows[0][0], Value::from(250));
 }
 
-/// For SQL Server and MongoDB there is no core extension, so the error has to send
-/// you to `@import` — which is not a workaround but the supported path.
+/// The question a community extension raises: alkyon loaded third-party native code
+/// into this process, so can a *query* now load some of its own?
+///
+/// It must not. Alkyon decides what is loaded, before the session is frozen; after
+/// that, `LOAD` is refused outright — including for the very extension already in
+/// the session, and including any attempt to reopen the door.
 #[tokio::test]
-async fn an_engine_that_cannot_be_attached_says_what_to_do_instead() {
+async fn a_query_cannot_load_native_code_of_its_own() {
     let Some(state) = seeded().await else {
         eprintln!("skipped: ALKYON_SOURCES is not set");
         return;
     };
-    for source in ["mssql-dev", "mongo-dev"] {
-        let sql = format!("-- @duckdb\n-- @attach x = {source}\nselect 1;");
-        let error = run(&state, &sql).await.expect_err(source).to_string();
-        assert!(error.contains("@import"), "{source}: {error}");
-        assert!(error.contains("core extension"), "{source}: {error}");
+    for attempt in [
+        // A *different* extension — the one that would actually be new code.
+        "load postgres",
+        "install postgres",
+        "install mssql from community",
+        "set allow_community_extensions = true",
+    ] {
+        // In a session that already has the community extension loaded, which is
+        // the permissive case.
+        let sql = format!("-- @duckdb\n-- @attach ms = mssql-dev/alkyon_demo\n{attempt};");
+        assert!(
+            run(&state, &sql).await.is_err(),
+            "`{attempt}` should have been refused"
+        );
     }
+
+    // `load mssql` is the exception, and it is not a hole: the extension is already
+    // in the process, so re-issuing the statement loads nothing. What matters is
+    // that nothing *new* can arrive, which is what the list above asserts.
+    let already = run(
+        &state,
+        "-- @duckdb\n-- @attach ms = mssql-dev/alkyon_demo\nload mssql;",
+    )
+    .await;
+    assert!(already.is_ok(), "{already:?}");
+
+    // And in a session that asked for nothing, even that is refused.
+    assert!(run(&state, "-- @duckdb\nload mssql;").await.is_err());
+}
+
+/// **A gap, pinned so it cannot be forgotten**: once the community `mssql`
+/// extension is in the session, a buffer's own `ATTACH` reaches the network even
+/// though external access is off.
+///
+/// The core `postgres` extension refuses the same thing — `an_attached_session_is_still_confined`
+/// asserts that — so this is a difference between DuckDB's own code and a
+/// third party's, not something alkyon chose. Files stay shut either way; it is
+/// outbound connections that leak.
+///
+/// It is written down rather than papered over because it changes what a federated
+/// buffer is: with this extension loaded, a `.sql` file someone sends you can open
+/// a connection alkyon never approved. `ALKYON_COMMUNITY_EXTENSIONS=off` is the way
+/// back. The test asserts today's behaviour so that the day it starts being refused,
+/// this fails and the guide gets corrected.
+#[tokio::test]
+async fn a_community_extension_lets_a_buffer_reach_the_network_itself() {
+    let Some(state) = seeded().await else {
+        eprintln!("skipped: ALKYON_SOURCES is not set");
+        return;
+    };
+
+    let sneaky = run(
+        &state,
+        "-- @duckdb\n\
+         -- @attach ms = mssql-dev/alkyon_demo\n\
+         attach 'mssql://sa:Alkyon-dev-1@127.0.0.1:51433?database=alkyon_demo' as sneaky (type mssql);",
+    )
+    .await;
+    assert!(
+        sneaky.is_ok(),
+        "if this now fails, the extension started honouring enable_external_access \
+         — delete this test and the caveat in the guide: {sneaky:?}"
+    );
+
+    // The disk stays shut, which is the half that did hold.
+    assert!(run(
+        &state,
+        "-- @duckdb\n\
+         -- @attach ms = mssql-dev/alkyon_demo\n\
+         select * from read_csv('C:/Windows/win.ini');",
+    )
+    .await
+    .is_err());
+}
+
+/// SQL Server, through a **community** extension — third-party code, fetched
+/// because the buffer asked for it.
+///
+/// Worth its own test beyond "it answers": this is the engine whose native path
+/// cannot reach a Fabric SQL endpoint, so the federated one carrying a bearer token
+/// is not a convenience but a way in.
+#[tokio::test]
+async fn sql_server_attaches_through_the_community_extension() {
+    let Some(state) = seeded().await else {
+        eprintln!("skipped: ALKYON_SOURCES is not set");
+        return;
+    };
+
+    let (columns, rows) = run(
+        &state,
+        "-- @duckdb\n\
+         -- @attach ms = mssql-dev/alkyon_demo\n\
+         select count(*) as n from ms.sales.customer;",
+    )
+    .await
+    .expect("an attached sql server answers");
+    assert_eq!(columns, ["n"]);
+    assert_eq!(rows[0][0], Value::from(250));
+
+    // A remote view, and a date that stayed a date rather than becoming text.
+    let (_, rows) = run(
+        &state,
+        "-- @duckdb\n\
+         -- @attach ms = mssql-dev/alkyon_demo\n\
+         select typeof(shipped_on) as kind from ms.sales.order_line limit 1;",
+    )
+    .await
+    .expect("types survive the attachment");
+    assert_eq!(rows[0][0], Value::from("DATE"));
+}
+
+/// The filter reaches SQL Server. Its plan prints no `Filters:` line — unlike
+/// PostgreSQL's — so the only thing that settles it is how many rows the scan
+/// actually produced.
+#[tokio::test]
+async fn a_filter_reaches_sql_server_even_though_the_plan_is_quiet_about_it() {
+    let Some(state) = seeded().await else {
+        eprintln!("skipped: ALKYON_SOURCES is not set");
+        return;
+    };
+
+    let (_, rows) = run(
+        &state,
+        "-- @duckdb\n\
+         -- @attach ms = mssql-dev/alkyon_demo\n\
+         explain analyze select count(*) from ms.sales.customer where country = 'BE';",
+    )
+    .await
+    .expect("an analysed plan");
+    let plan = rows
+        .iter()
+        .filter_map(|row| row.last().and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(plan.contains("MSSQL_CATALOG_SCAN"), "{plan}");
+    // The seed has 83 Belgian customers out of 250. If the scan reports 250, the
+    // filter was applied here and every row crossed the wire for nothing.
+    assert!(
+        plan.contains("83 rows"),
+        "the scan should have produced only the matching rows:\n{plan}"
+    );
+    assert!(!plan.contains("250 rows"), "{plan}");
+}
+
+/// `Require` means *validate the certificate*, and this extension never does —
+/// measured: no secret or DSN parameter changes it, and a certificate that cannot
+/// match the host is accepted anyway. So it is refused rather than downgraded.
+#[tokio::test]
+async fn sql_server_refuses_require_rather_than_quietly_weakening_it() {
+    let Some(state) = seeded().await else {
+        eprintln!("skipped: ALKYON_SOURCES is not set");
+        return;
+    };
+    let mut config: Vec<alkyon::model::SourceConfig> = serde_json::from_str(
+        &std::fs::read_to_string(std::env::var_os("ALKYON_SOURCES").unwrap()).unwrap(),
+    )
+    .unwrap();
+    let Some(strict) = config
+        .iter_mut()
+        .find(|source| source.kind == alkyon::model::SourceKind::MsSql)
+    else {
+        eprintln!("skipped: no SQL Server source");
+        return;
+    };
+    strict.id = "mssql-strict".into();
+    strict.tls = alkyon::model::TlsMode::Require;
+    let strict = strict.clone();
+    state.import(vec![strict]).await.unwrap();
+
+    let error = run(
+        &state,
+        "-- @duckdb\n-- @attach ms = mssql-strict\nselect 1;",
+    )
+    .await
+    .expect_err("Require cannot be honoured here")
+    .to_string();
+    assert!(error.contains("without ever checking"), "{error}");
+    assert!(error.contains("@import"), "{error}");
+}
+
+/// MongoDB has a community extension, but not one published for every DuckDB build
+/// — and alkyon reads MongoDB itself anyway. The error says both.
+#[tokio::test]
+async fn mongodb_says_why_it_cannot_be_attached() {
+    let Some(state) = seeded().await else {
+        eprintln!("skipped: ALKYON_SOURCES is not set");
+        return;
+    };
+    let error = run(&state, "-- @duckdb\n-- @attach x = mongo-dev\nselect 1;")
+        .await
+        .expect_err("no mongo extension")
+        .to_string();
+    assert!(error.contains("@import"), "{error}");
+    assert!(error.contains("not published"), "{error}");
 }
 
 #[tokio::test]

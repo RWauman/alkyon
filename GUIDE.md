@@ -55,10 +55,11 @@ tries the connection without registering it.
   leave **Port** empty. **Never put a hostname here**: no cloud endpoint runs a
   SQL Browser, so the connection times out against a host that answers perfectly
   well. Alkyon refuses a hostname in that field and says where it belongs.
-- **A Fabric SQL analytics endpoint or warehouse does not connect.** See
-  [What does not work](#what-does-not-work-yet). Its data is reachable through an
-  [Azure storage source](#azure-storage-as-a-source) over OneLake, which does not
-  use SQL Server's protocol at all.
+- **A Fabric SQL analytics endpoint or warehouse does not connect** through this
+  dialogue. See [What does not work](#what-does-not-work-yet). Its data is reachable
+  two other ways: `@attach` in a [federated buffer](#attach--let-duckdb-read-the-server-itself),
+  which uses a different TDS implementation and the same sign-in, or an
+  [Azure storage source](#azure-storage-as-a-source) over OneLake.
 - **Microsoft Entra — sign in** opens your browser and takes the sign-in from
   there; see [Sign in to Azure](#sign-in-to-azure). **Entra ID access token** is
   still there for a token pasted from
@@ -499,8 +500,19 @@ SSMS.
 **Azure SQL is unaffected**: its redirects name a host and a port and no
 instance, so the two names agree and the redirect is followed normally.
 
-**What to use instead**: an [Azure storage source](#azure-storage-as-a-source)
-reads the same lakehouse over OneLake and answers DuckDB SQL.
+**What to use instead.** Two things, and the first is new:
+
+- **`@attach` in a federated buffer.** DuckDB's community `mssql` extension speaks
+  TDS itself and takes the same Entra bearer token, so it does not go through
+  `tiberius` and does not hit this wall. It has not been run against a real Fabric
+  endpoint yet — if you have one, `-- @attach fab = <your source>` is the thing to
+  try, and it costs one line. See [`@attach`](#attach--let-duckdb-read-the-server-itself)
+  for what it is and what it gives up.
+- An [Azure storage source](#azure-storage-as-a-source) reads the same lakehouse
+  over OneLake and answers DuckDB SQL.
+
+Either way the *native* path — the explorer, the tree, T-SQL typed against the
+endpoint — stays blocked until the missing piece of the login is found.
 
 ## Run a query
 
@@ -980,11 +992,50 @@ select p.name, a.total
 from pg.sales.customer p join agg a on a.customer_id = p.id;
 ```
 
-**Only PostgreSQL and MySQL.** They are the engines DuckDB has a **core** extension
-for. SQL Server and MongoDB have *community* extensions, which this session refuses
-to load — community code is third-party native code in this process, which is a
-different promise from the one alkyon makes. `@attach` on either says so and points
-at `@import`, which is not a workaround there but the supported path.
+**Which engines, and whose code.** PostgreSQL and MySQL use DuckDB's own **core**
+extensions. SQL Server uses a **community** one — third-party native code, fetched
+once and run inside alkyon. That distinction is real and is covered below.
+
+MongoDB is not offered: its community extension is not published for every DuckDB
+build, and alkyon reads MongoDB itself anyway — see [MongoDB, queried in
+SQL](#mongodb-queried-in-sql). `@attach` on one says so and points at `@import`,
+which for it is not a workaround but the supported path.
+
+#### SQL Server, and the community extension
+
+This is the interesting one, because it is a way into a place alkyon's own SQL
+Server path cannot reach:
+
+```sql
+-- @duckdb
+-- @attach fab = fabric-endpoint
+select top_customers.name from fab.dbo.top_customers;
+```
+
+The extension speaks TDS natively and takes an **Entra bearer token**, which is
+exactly what the browser sign-in already mints — so a Fabric or Azure SQL endpoint
+that the native connector cannot log into is worth trying here. Sign the source in
+as usual; `@attach` hands the token over. Filters reach the server: measured on the
+demo schema, `where country = 'BE'` produced 83 rows at the scan rather than 250.
+
+Three things to know before relying on it.
+
+- **It is not DuckDB's code.** It is fetched from the community repository the first
+  time a buffer asks for it, and it runs in this process with everything this
+  process can reach. `ALKYON_COMMUNITY_EXTENSIONS=off` restores the older stance —
+  nothing but DuckDB's own signed extensions — at the cost of this feature.
+- **It encrypts but never validates the certificate.** Measured: no secret or
+  connection-string parameter changes that, and a certificate that cannot match the
+  host is accepted anyway. So a source set to *Require*, which means *validate*, is
+  **refused** rather than quietly given a weaker connection than it asked for. Use
+  `@import` for it, or set the source to *Trust certificate* if that is genuinely
+  acceptable there.
+- **A buffer can open its own connection.** Once the extension is in the session,
+  an `ATTACH` written in your SQL reaches the network even though external access is
+  off — the core `postgres` extension refuses the same thing. Files stay shut either
+  way. It matters because a `.sql` someone sends you could then connect somewhere
+  alkyon never approved; a test pins the behaviour so the day it changes, the guide
+  gets corrected.
 
 **It is READ_ONLY, with no opt-out.** `@import` cannot write at all, so this would
 otherwise be the one path in the program that mutates a production server. An
@@ -1001,7 +1052,9 @@ what a federated session normally has shut. The order is what makes it work:
 attach first, grant the open folder, *then* shut the door and lock it. Measured: a
 remote count, a pushed-down filter and even a self-join all still answer afterwards,
 while `read_csv` on an ungranted local file is refused — and so is a second
-`ATTACH` of your own choosing.
+`ATTACH` of your own choosing, and so is loading any extension the buffer did not
+already get. (The last two hold for the core extensions; the SQL Server one is the
+exception noted above.)
 
 ### Importing files without copying them
 
@@ -1112,6 +1165,7 @@ The theme button cycles Auto → Light → Dark and remembers your choice.
 | `ALKYON_TERMINAL` | loopback only | `always` to expose the terminal elsewhere |
 | `ALKYON_PAGE_ROWS` | `50000` | rows in one page of a result |
 | `ALKYON_IMPORT_MAX_ROWS` | — | opt-in ceiling on one federated `@import` |
+| `ALKYON_COMMUNITY_EXTENSIONS` | on | `off` refuses DuckDB community extensions, and with them `@attach` on SQL Server |
 | `ALKYON_LOG` | `alkyon=info` | `tracing` filter |
 
 `ALKYON_CONFIG_DIR` is what makes a container or a portable install work — the

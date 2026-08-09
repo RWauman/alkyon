@@ -10,9 +10,9 @@
 //! - **`@attach`** hands DuckDB the live server and lets its planner generate the
 //!   remote query. Projections and filters are pushed down; **aggregations and
 //!   joins are not** — see [`attach`] for the measurements. What you get instead
-//!   is a whole catalogue you can browse and join without writing SQL per engine,
-//!   and only for PostgreSQL and MySQL, which are the engines DuckDB has a core
-//!   extension for.
+//!   is a whole catalogue you can browse and join without writing SQL per engine.
+//!   PostgreSQL, MySQL and SQL Server — the last through a **community**
+//!   extension, which is third-party code and says so.
 //!
 //! Neither path has a row cap. An import used to buffer every cell as a `String`
 //! in this process, which is why it did: the limit was really a memory limit
@@ -77,9 +77,10 @@ const DECIMAL_SCALE: u8 = 9;
 /// Extensions linked in by the `parquet` and `json` Cargo features, so reaching
 /// them costs nothing and touches no network. CSV needs nothing — it is core.
 ///
-/// Anything absent here stays unavailable on purpose: `delta` and `iceberg` would
-/// have to be downloaded at runtime, and community extensions are refused
-/// outright.
+/// Anything absent here is fetched only when a source cannot be read without it —
+/// `delta`, `azure`, and the engine extensions an `@attach` needs. Never as a side
+/// effect of anything else, and never by a user's query: by the time the buffer
+/// runs, loading an extension is refused outright.
 const STATIC_EXTENSIONS: &[&str] = &["parquet", "json"];
 
 fn duckdb_type(logical: LogicalType) -> String {
@@ -436,16 +437,38 @@ pub(crate) fn describe_view(
 /// reaches `extensions.duckdb.org` and writes to DuckDB's own extension
 /// directory, which is why it happens for a source that cannot be read without it
 /// and never as a side effect of anything else.
-fn fetch_extension(connection: &Connection, name: &str) -> Result<()> {
+fn fetch_extension(connection: &Connection, name: &str, repository: Option<&str>) -> Result<()> {
     if connection.execute_batch(&format!("LOAD {name};")).is_ok() {
         return Ok(());
     }
-    tracing::info!(extension = name, "installing a DuckDB extension");
+    let from = match repository {
+        // Third-party native code in this process. It happens because a buffer
+        // asked for it, and it is said out loud rather than slipped in.
+        Some(repository) => {
+            tracing::warn!(
+                extension = name,
+                repository,
+                "installing a community DuckDB extension — third-party code, not DuckDB's own"
+            );
+            format!(" FROM {repository}")
+        }
+        None => {
+            tracing::info!(extension = name, "installing a DuckDB extension");
+            String::new()
+        }
+    };
     connection
-        .execute_batch(&format!("INSTALL {name}; LOAD {name};"))
+        .execute_batch(&format!("INSTALL {name}{from}; LOAD {name};"))
         .map_err(|e| {
+            let note = if repository.is_some() {
+                " It is a community extension, so it may not be published for this DuckDB \
+                 version and platform."
+            } else {
+                ""
+            };
             Error::Federated(format!(
-                "cannot install DuckDB's `{name}` extension, which is what reads this source: {e}"
+                "cannot install DuckDB's `{name}` extension, which is what reads this source: \
+                 {e}{note}"
             ))
         })
 }
@@ -499,9 +522,9 @@ pub fn open_duckdb_azure(
 ) -> Result<Connection> {
     let connection = Connection::open_in_memory().map_err(federated)?;
 
-    fetch_extension(&connection, "azure")?;
+    fetch_extension(&connection, "azure", None)?;
     for extension in extensions {
-        fetch_extension(&connection, extension)?;
+        fetch_extension(&connection, extension, None)?;
     }
 
     let mut setup = String::new();
@@ -626,10 +649,14 @@ pub fn open_duckdb_with(setup: Setup<'_>) -> Result<Connection> {
     } = setup;
     let connection = Connection::open_in_memory().map_err(federated)?;
     for extension in extensions {
-        fetch_extension(&connection, extension)?;
+        fetch_extension(&connection, extension, None)?;
     }
     for attachment in attachments {
-        fetch_extension(&connection, attachment.engine.extension())?;
+        fetch_extension(
+            &connection,
+            attachment.engine.extension(),
+            attachment.engine.repository(),
+        )?;
         for statement in attachment.statements() {
             connection.execute_batch(statement).map_err(|e| {
                 // Never the statement: the secret is in it. The alias is enough to

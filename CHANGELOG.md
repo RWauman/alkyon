@@ -71,9 +71,23 @@ no binary yet.
   **aggregations and joins are not**, measured with `pg_debug_show_queries` and
   written into the guide, because that is what decides which directive to reach for.
   `@import` stays the right one whenever the remote engine should do the work.
-- PostgreSQL and MySQL only — the engines DuckDB has a **core** extension for. SQL
-  Server and MongoDB have community ones, which this session refuses to load;
-  `@attach` on either says so and points at `@import`.
+- **PostgreSQL, MySQL and SQL Server.** The first two through DuckDB's own core
+  extensions; SQL Server through a **community** one, which is third-party native
+  code fetched on first use and run inside alkyon. `ALKYON_COMMUNITY_EXTENSIONS=off`
+  restores the older stance and gives up that engine.
+- **A Fabric SQL endpoint is worth trying again.** The `mssql` extension speaks TDS
+  itself and takes the Entra bearer token the browser sign-in already mints, so it
+  does not go through `tiberius` and does not hit the routing wall documented in the
+  guide. Untested against a real endpoint — one `@attach` line will tell.
+- **SQL Server refuses *Require* rather than weakening it.** That extension encrypts
+  but never validates a certificate — measured: no parameter changes it, and a
+  certificate that cannot match the host is accepted anyway. So a source that asked
+  for validation is refused, with the two ways forward named.
+- **A gap, written down and pinned by a test**: with that extension loaded, an
+  `ATTACH` written in your own SQL reaches the network even though external access
+  is off. The core extensions refuse the same thing. Files stay shut either way.
+- MongoDB is not attachable: its community extension is not published for every
+  DuckDB build, and alkyon reads MongoDB itself. The error says so.
 - **READ_ONLY with no opt-out**, since it would otherwise be the one path in the
   program that can write to a production server. The credential goes into a DuckDB
   secret rather than an ATTACH string, and your encryption choice carries over —
