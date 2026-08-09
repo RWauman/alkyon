@@ -8,7 +8,7 @@ than an evening spent reading diffs.
 Dates are the day the tag was cut. Anything under **Unreleased** is on `dev` and in
 no binary yet.
 
-## Unreleased
+## 0.2.0 — 2026-08-09
 
 ### Folder sources, rebuilt around directories
 
@@ -119,6 +119,15 @@ no binary yet.
   bracket depth plus one unit, which is not how anyone writes SQL — a `WHERE` typed
   under a `FROM` inside `AS (` came out two columns further in, every time. The
   indent unit is 4 now, which is what the buffers people write already use.
+
+### The DuckDB plan
+
+- **ᵊb shows the execution plan** of a federated buffer, in the result pane and
+  in monospace, because a plan is a drawing rather than a table. `EXPLAIN` is
+  inserted right after `EVALUATE`, so the line numbers below it do not move.
+- **Shift runs it for real** — `EXPLAIN ANALYZE`, with actual rows and a time per
+  operator. The status line says which of the two you got, since one is estimates
+  and the other cost a real execution.
 
 ### Editing a source
 

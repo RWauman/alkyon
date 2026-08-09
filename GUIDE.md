@@ -1031,6 +1031,18 @@ the ones the block declared rather than whichever source happens to be selected:
   `*`, an unaliased `count(*)` — is left out rather than guessed.
 - the status line says what it found — `2 declared — 4 names`.
 
+### The plan
+
+**ᵊb** in the toolbar, in a federated buffer, shows what DuckDB is going to do.
+The word `EXPLAIN` goes in right after `EVALUATE`, so every line below keeps the
+number it has in the editor, and the answer takes the result pane — a plan is a
+drawing made of box characters, not a table, and a grid cell would ellipsise it.
+
+**Hold Shift and it runs the query**, as `EXPLAIN ANALYZE`: actual rows and a time
+per operator instead of estimates. That is the one worth reading, and the only one
+that answers *did my filter really reach the server* — the plan of an attached SQL
+Server prints no `Filters:` line, so the row count at the scan is the evidence.
+
 **Inside `AS ( … )` it switches sources.** There you are writing that source's own
 SQL, so its tables and columns are what is offered — not the aliases the buffer
 declares, which the source has never heard of.

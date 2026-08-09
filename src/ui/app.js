@@ -28,6 +28,8 @@ const state = {
   inFlight: false,
   /** id → { ok, detail }, filled in by the explorer's probes. */
   health: new Map(),
+  /** `plan` or `analyze` while an EXPLAIN is on its way, else null. */
+  plan: null,
 };
 
 // ------------------------------------------------------------------- status
@@ -115,6 +117,22 @@ const buffers = createBuffers($('tab-bar'), {
     }
   },
 });
+
+/**
+ * Put a plan on screen where the grid usually is.
+ *
+ * A plan is a drawing made of box characters, not a table: pushed through the
+ * grid it becomes one cell with the whole thing inside it, ellipsised. So the grid
+ * gives up the pane for it, and gets it back on the next ordinary run.
+ */
+function showPlan(text) {
+  grid.destroy();
+  const pane = $('grid');
+  const pre = document.createElement('pre');
+  pre.className = 'plan';
+  pre.textContent = text || 'the plan came back empty';
+  pane.replaceChildren(pre);
+}
 
 /** The start screen owns the editor pane whenever no tab is open. */
 function paintStart() {
@@ -306,6 +324,31 @@ function paintMode() {
   if (federated) editor.setDialect('text/x-sql');
   else editor.setDialect(state.source?.editor_mime);
 }
+
+/**
+ * Ask DuckDB what it is going to do, without the buffer having to say `EXPLAIN`.
+ *
+ * The word goes in right after `EVALUATE` rather than in front of the query, so
+ * every line below keeps the number it has in the editor — the same reason the
+ * declarations are blanked rather than stripped.
+ *
+ * With Shift it is `EXPLAIN ANALYZE`, which **runs the query** and reports what
+ * each operator actually did. That is the one worth reading when the question is
+ * why something is slow, or whether a filter really reached the server: an
+ * estimate cannot answer either.
+ */
+function explain(analyze) {
+  const text = editor.text();
+  const at = text.search(/^[ 	]*EVALUATE\b/im);
+  if (at === -1) return status('a plan needs a federated buffer — DEFINE … EVALUATE', true);
+
+  const keyword = text.slice(at).match(/^[ 	]*EVALUATE/i)[0];
+  const cut = at + keyword.length;
+  state.plan = analyze ? 'analyze' : 'plan';
+  stream(`${text.slice(0, cut)} EXPLAIN${analyze ? ' ANALYZE' : ''}${text.slice(cut)}`);
+}
+
+$('explain').addEventListener('click', (event) => explain(event.shiftKey));
 
 $('toggle-duckdb').addEventListener('click', () => {
   editor.setFederated(!looksFederated(editor.text()));
@@ -1053,6 +1096,11 @@ function stream(sql) {
   let rows = 0;
   let sawColumns = false;
   let seen = 0;
+  // An EXPLAIN answers with one long drawing rather than a table, so it is
+  // gathered here and painted at the end instead of going through the grid.
+  const asPlan = state.plan;
+  state.plan = null;
+  const plan = [];
   state.columns = null;
   resetPaging();
   setRunning(true);
@@ -1076,13 +1124,18 @@ function stream(sql) {
     {
       columns: ({ columns }) => {
         sawColumns = true;
-        state.columns = columns;
-        grid.reset(columns);
+        state.columns = asPlan ? null : columns;
+        if (!asPlan) grid.reset(columns);
       },
       rows: (message) => {
         rows += message.rows.length;
-        grid.append(message.rows);
-        status(`${(seen + rows).toLocaleString()} rows…`);
+        if (asPlan) {
+          // The drawing is the last column; the first only says which plan it is.
+          for (const row of message.rows) plan.push(String(row[row.length - 1] ?? ''));
+        } else {
+          grid.append(message.rows);
+          status(`${(seen + rows).toLocaleString()} rows…`);
+        }
       },
       affected: ({ rows_affected }) => {
         if (!sawColumns) grid.message(`${rows_affected} row(s) affected`);
@@ -1090,6 +1143,17 @@ function stream(sql) {
       },
       end: ({ rows: inPage, page, elapsed_ms, more }) => {
         if (!current()) return;
+        if (asPlan) {
+          showPlan(plan.join('\n'));
+          setRunning(false);
+          status(
+            asPlan === 'analyze'
+              ? `plan and actual, in ${elapsed_ms} ms — the query was run`
+              : `plan in ${elapsed_ms} ms — estimates only; hold Shift for the real numbers`,
+          );
+          paintPaging();
+          return;
+        }
         if (!sawColumns && inPage === 0 && page === 1) {
           grid.message('statement completed, no rows returned');
         } else {
