@@ -47,9 +47,10 @@ async fn joins_postgres_to_sql_server() {
     // Each import is written in its own dialect — `top` is T-SQL, `limit` is not.
     let (columns, rows) = run(
         &state,
-        "-- @duckdb\n\
-         -- @import pg = pg-dev/alkyon_demo : select id, name, credit from sales.customer where id <= 5 order by id\n\
-         -- @import ms = mssql-dev/alkyon_demo : select top 5 id, name, credit from sales.customer order by id\n\
+        "DEFINE\n\
+             IMPORT pg = pg-dev/alkyon_demo AS ( select id, name, credit from sales.customer where id <= 5 order by id )\n\
+             IMPORT ms = mssql-dev/alkyon_demo AS ( select top 5 id, name, credit from sales.customer order by id )\n\
+         EVALUATE\n\
          \n\
          select p.id, p.name, p.credit as pg_credit, m.credit as ms_credit\n\
          from pg p join ms m on m.id = p.id\n\
@@ -80,8 +81,9 @@ async fn an_imported_decimal_is_a_number_not_text() {
     // `sum` over a VARCHAR would fail outright, which is the point of the test.
     let (columns, rows) = run(
         &state,
-        "-- @duckdb\n\
-         -- @import c = pg-dev/alkyon_demo : select credit from sales.customer\n\
+        "DEFINE\n\
+             IMPORT c = pg-dev/alkyon_demo AS ( select credit from sales.customer )\n\
+         EVALUATE\n\
          select count(*) as n, sum(credit) as total, typeof(credit) as kind from c group by kind;",
     )
     .await
@@ -107,8 +109,9 @@ async fn integers_and_dates_survive_the_round_trip() {
 
     let (_, rows) = run(
         &state,
-        "-- @duckdb\n\
-         -- @import o = pg-dev/alkyon_demo : select order_id, line_no, shipped_on from sales.order_line\n\
+        "DEFINE\n\
+             IMPORT o = pg-dev/alkyon_demo AS ( select order_id, line_no, shipped_on from sales.order_line )\n\
+         EVALUATE\n\
          select typeof(order_id), typeof(line_no), typeof(shipped_on),\n\
                 count(shipped_on) as shipped, count(*) - count(shipped_on) as missing\n\
          from o group by 1, 2, 3;",
@@ -145,8 +148,9 @@ async fn an_import_is_not_capped() {
 
     let (_, rows) = run(
         &state,
-        "-- @duckdb\n\
-         -- @import big = pg-dev/alkyon_demo : select i, i * 2 as double from generate_series(1, 1200000) g(i)\n\
+        "DEFINE\n\
+             IMPORT big = pg-dev/alkyon_demo AS ( select i, i * 2 as double from generate_series(1, 1200000) g(i) )\n\
+         EVALUATE\n\
          select count(*) as n, sum(double) as total, max(i) as biggest from big;",
     )
     .await
@@ -177,8 +181,9 @@ async fn an_opt_in_cap_still_fails_loudly() {
     // threads of one process, so a global would leak into every other test.
     let error = run_with(
         &state,
-        "-- @duckdb\n\
-         -- @import o = pg-dev/alkyon_demo : select * from sales.order_line\n\
+        "DEFINE\n\
+             IMPORT o = pg-dev/alkyon_demo AS ( select * from sales.order_line )\n\
+         EVALUATE\n\
          select count(*) from o;",
         Limits {
             max_import_rows: Some(100),
@@ -209,7 +214,7 @@ async fn a_federated_session_cannot_read_the_filesystem() {
         "install httpfs",
         "set allowed_directories = ['C:/']",
     ] {
-        let sql = format!("-- @duckdb\n{attempt};");
+        let sql = format!("EVALUATE\n{attempt};");
         assert!(
             run(&state, &sql).await.is_err(),
             "`{attempt}` should have been refused"
@@ -240,8 +245,9 @@ async fn reads_and_writes_files_in_the_open_folder() {
     // every file is addressed — a relative path is refused by the confinement.
     let (columns, rows) = run(
         &state,
-        "-- @duckdb\n\
-         -- @import c = pg-dev/alkyon_demo : select id, name, credit from sales.customer where id <= 3\n\
+        "DEFINE\n\
+             IMPORT c = pg-dev/alkyon_demo AS ( select id, name, credit from sales.customer where id <= 3 )\n\
+         EVALUATE\n\
          select c.id, c.name, b.target\n\
          from c left join '${folder}/data/budget.csv' b on b.customer_id = c.id\n\
          order by c.id;",
@@ -262,8 +268,9 @@ async fn reads_and_writes_files_in_the_open_folder() {
     // so a bare relative path here would land next to the alkyon process instead.
     run(
         &state,
-        "-- @duckdb\n\
-         -- @import c = pg-dev/alkyon_demo : select id, name, credit from sales.customer where id <= 10\n\
+        "DEFINE\n\
+             IMPORT c = pg-dev/alkyon_demo AS ( select id, name, credit from sales.customer where id <= 10 )\n\
+         EVALUATE\n\
          copy (select * from c) to '${folder}/data/customers.parquet' (format parquet);",
     )
     .await
@@ -276,7 +283,7 @@ async fn reads_and_writes_files_in_the_open_folder() {
 
     let (_, rows) = run(
         &state,
-        "-- @duckdb\nselect count(*) as n, typeof(credit) as kind from '${folder}/data/customers.parquet' group by kind;",
+        "EVALUATE\nselect count(*) as n, typeof(credit) as kind from '${folder}/data/customers.parquet' group by kind;",
     )
     .await
     .expect("reading the parquet back");
@@ -298,7 +305,7 @@ async fn reads_and_writes_files_in_the_open_folder() {
         "select * from read_csv('${folder}/../escape.csv')",
         "copy (select 1) to 'C:/Windows/Temp/alkyon-nope.csv'",
     ] {
-        let sql = format!("-- @duckdb\n{outside};");
+        let sql = format!("EVALUATE\n{outside};");
         assert!(
             run(&state, &sql).await.is_err(),
             "`{outside}` should have been refused"
@@ -310,7 +317,7 @@ async fn reads_and_writes_files_in_the_open_folder() {
 
 /// The physical plan of `sql` against an attached PostgreSQL, as one blob of text.
 async fn plan_of(state: &AppState, sql: &str) -> String {
-    let buffer = format!("-- @duckdb\n-- @attach pg = pg-dev/alkyon_demo\nEXPLAIN {sql};");
+    let buffer = format!("DEFINE\n    ATTACH pg = pg-dev/alkyon_demo\nEVALUATE\nEXPLAIN {sql};");
     let (_, rows) = run(state, &buffer).await.expect("a plan");
     rows.iter()
         .filter_map(|row| row.last().and_then(Value::as_str))
@@ -329,8 +336,9 @@ async fn an_attached_server_is_queried_where_it_lives() {
     // until this query asked.
     let (columns, rows) = run(
         &state,
-        "-- @duckdb\n\
-         -- @attach pg = pg-dev/alkyon_demo\n\
+        "DEFINE\n\
+             ATTACH pg = pg-dev/alkyon_demo\n\
+         EVALUATE\n\
          select count(*) as n from pg.sales.customer;",
     )
     .await
@@ -341,8 +349,9 @@ async fn an_attached_server_is_queried_where_it_lives() {
     // A view on the remote side is a relation like any other.
     let (_, rows) = run(
         &state,
-        "-- @duckdb\n\
-         -- @attach pg = pg-dev/alkyon_demo\n\
+        "DEFINE\n\
+             ATTACH pg = pg-dev/alkyon_demo\n\
+         EVALUATE\n\
          select count(*) as n from pg.sales.order_value;",
     )
     .await
@@ -359,8 +368,9 @@ async fn mysql_attaches_too() {
     // MySQL has no schema layer, so the name has two parts rather than three.
     let (_, rows) = run(
         &state,
-        "-- @duckdb\n\
-         -- @attach my = mysql-dev/sales\n\
+        "DEFINE\n\
+             ATTACH my = mysql-dev/sales\n\
+         EVALUATE\n\
          select count(*) as n from my.customer;",
     )
     .await
@@ -413,9 +423,10 @@ async fn an_attached_server_joins_an_imported_one() {
 
     let (columns, rows) = run(
         &state,
-        "-- @duckdb\n\
-         -- @attach pg = pg-dev/alkyon_demo\n\
-         -- @import ms = mssql-dev/alkyon_demo : select top 5 id, credit from sales.customer order by id\n\
+        "DEFINE\n\
+             ATTACH pg = pg-dev/alkyon_demo\n\
+             IMPORT ms = mssql-dev/alkyon_demo AS ( select top 5 id, credit from sales.customer order by id )\n\
+         EVALUATE\n\
          select p.id, p.name, m.credit\n\
          from pg.sales.customer p join ms m on m.id = p.id\n\
          order by p.id;",
@@ -441,7 +452,7 @@ async fn an_attachment_cannot_be_written_to() {
         "delete from pg.sales.customer where id = 1",
         "create table pg.sales.nope (a int)",
     ] {
-        let sql = format!("-- @duckdb\n-- @attach pg = pg-dev/alkyon_demo\n{attempt};");
+        let sql = format!("DEFINE\n    ATTACH pg = pg-dev/alkyon_demo\nEVALUATE\n{attempt};");
         let error = run(&state, &sql)
             .await
             .expect_err(&format!("`{attempt}` should have been refused"));
@@ -472,7 +483,7 @@ async fn an_attached_session_is_still_confined() {
         // attachment of the user's own choosing, to a server alkyon never approved.
         "attach 'host=127.0.0.1 port=55432 dbname=alkyon_demo user=postgres password=alkyon-dev' as sneaky (type postgres)",
     ] {
-        let sql = format!("-- @duckdb\n-- @attach pg = pg-dev/alkyon_demo\n{attempt};");
+        let sql = format!("DEFINE\n    ATTACH pg = pg-dev/alkyon_demo\nEVALUATE\n{attempt};");
         assert!(
             run(&state, &sql).await.is_err(),
             "`{attempt}` should have been refused"
@@ -483,7 +494,7 @@ async fn an_attached_session_is_still_confined() {
     // break everything.
     let (_, rows) = run(
         &state,
-        "-- @duckdb\n-- @attach pg = pg-dev/alkyon_demo\nselect count(*) as n from pg.sales.customer;",
+        "DEFINE\n    ATTACH pg = pg-dev/alkyon_demo\nEVALUATE\nselect count(*) as n from pg.sales.customer;",
     )
     .await
     .expect("the attachment survives the confinement");
@@ -511,7 +522,7 @@ async fn a_query_cannot_load_native_code_of_its_own() {
     ] {
         // In a session that already has the community extension loaded, which is
         // the permissive case.
-        let sql = format!("-- @duckdb\n-- @attach ms = mssql-dev/alkyon_demo\n{attempt};");
+        let sql = format!("DEFINE\n    ATTACH ms = mssql-dev/alkyon_demo\nEVALUATE\n{attempt};");
         assert!(
             run(&state, &sql).await.is_err(),
             "`{attempt}` should have been refused"
@@ -523,13 +534,13 @@ async fn a_query_cannot_load_native_code_of_its_own() {
     // that nothing *new* can arrive, which is what the list above asserts.
     let already = run(
         &state,
-        "-- @duckdb\n-- @attach ms = mssql-dev/alkyon_demo\nload mssql;",
+        "DEFINE\n    ATTACH ms = mssql-dev/alkyon_demo\nEVALUATE\nload mssql;",
     )
     .await;
     assert!(already.is_ok(), "{already:?}");
 
     // And in a session that asked for nothing, even that is refused.
-    assert!(run(&state, "-- @duckdb\nload mssql;").await.is_err());
+    assert!(run(&state, "EVALUATE\nload mssql;").await.is_err());
 }
 
 /// **A gap, pinned so it cannot be forgotten**: once the community `mssql`
@@ -555,8 +566,9 @@ async fn a_community_extension_lets_a_buffer_reach_the_network_itself() {
 
     let sneaky = run(
         &state,
-        "-- @duckdb\n\
-         -- @attach ms = mssql-dev/alkyon_demo\n\
+        "DEFINE\n\
+             ATTACH ms = mssql-dev/alkyon_demo\n\
+         EVALUATE\n\
          attach 'mssql://sa:Alkyon-dev-1@127.0.0.1:51433?database=alkyon_demo' as sneaky (type mssql);",
     )
     .await;
@@ -569,8 +581,9 @@ async fn a_community_extension_lets_a_buffer_reach_the_network_itself() {
     // The disk stays shut, which is the half that did hold.
     assert!(run(
         &state,
-        "-- @duckdb\n\
-         -- @attach ms = mssql-dev/alkyon_demo\n\
+        "DEFINE\n\
+             ATTACH ms = mssql-dev/alkyon_demo\n\
+         EVALUATE\n\
          select * from read_csv('C:/Windows/win.ini');",
     )
     .await
@@ -592,8 +605,9 @@ async fn sql_server_attaches_through_the_community_extension() {
 
     let (columns, rows) = run(
         &state,
-        "-- @duckdb\n\
-         -- @attach ms = mssql-dev/alkyon_demo\n\
+        "DEFINE\n\
+             ATTACH ms = mssql-dev/alkyon_demo\n\
+         EVALUATE\n\
          select count(*) as n from ms.sales.customer;",
     )
     .await
@@ -604,8 +618,9 @@ async fn sql_server_attaches_through_the_community_extension() {
     // A remote view, and a date that stayed a date rather than becoming text.
     let (_, rows) = run(
         &state,
-        "-- @duckdb\n\
-         -- @attach ms = mssql-dev/alkyon_demo\n\
+        "DEFINE\n\
+             ATTACH ms = mssql-dev/alkyon_demo\n\
+         EVALUATE\n\
          select typeof(shipped_on) as kind from ms.sales.order_line limit 1;",
     )
     .await
@@ -625,8 +640,9 @@ async fn a_filter_reaches_sql_server_even_though_the_plan_is_quiet_about_it() {
 
     let (_, rows) = run(
         &state,
-        "-- @duckdb\n\
-         -- @attach ms = mssql-dev/alkyon_demo\n\
+        "DEFINE\n\
+             ATTACH ms = mssql-dev/alkyon_demo\n\
+         EVALUATE\n\
          explain analyze select count(*) from ms.sales.customer where country = 'BE';",
     )
     .await
@@ -674,7 +690,7 @@ async fn sql_server_refuses_require_rather_than_quietly_weakening_it() {
 
     let error = run(
         &state,
-        "-- @duckdb\n-- @attach ms = mssql-strict\nselect 1;",
+        "DEFINE\n    ATTACH ms = mssql-strict\nEVALUATE\nselect 1;",
     )
     .await
     .expect_err("Require cannot be honoured here")
@@ -691,7 +707,7 @@ async fn mongodb_says_why_it_cannot_be_attached() {
         eprintln!("skipped: ALKYON_SOURCES is not set");
         return;
     };
-    let error = run(&state, "-- @duckdb\n-- @attach x = mongo-dev\nselect 1;")
+    let error = run(&state, "DEFINE\n    ATTACH x = mongo-dev\nEVALUATE\nselect 1;")
         .await
         .expect_err("no mongo extension")
         .to_string();
@@ -701,9 +717,9 @@ async fn mongodb_says_why_it_cannot_be_attached() {
 
 #[tokio::test]
 async fn a_plain_buffer_is_not_federated() {
-    // No `-- @duckdb`, so nothing here reaches DuckDB at all.
+    // Neither DEFINE nor EVALUATE, so nothing here reaches DuckDB.
     assert!(!federation::program::is_federated(
         "select * from sales.customer"
     ));
-    assert!(federation::program::is_federated("-- @duckdb\nselect 1"));
+    assert!(federation::program::is_federated("EVALUATE\nselect 1"));
 }

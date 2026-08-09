@@ -63,6 +63,37 @@ no binary yet.
   collection where one field is in turn an integer, a string, a double, a document
   and an array.
 
+### A federated buffer is `DEFINE … EVALUATE`
+
+- **Breaking: the `-- @import` comments are gone.** A federated buffer now declares
+  what it needs and then says what to return, the shape DAX uses:
+
+  ```sql
+  DEFINE
+      ATTACH pg     = pg-prod/warehouse
+      IMPORT orders = mssql-prod/sales AS (
+          SELECT TOP 1000 order_id, customer_id, unit_price
+          FROM sales.order_line
+      )
+  EVALUATE
+      select c.name, sum(o.unit_price) from pg.sales.customer c
+      join orders o on o.customer_id = c.id group by c.name;
+  ```
+
+- **Why**: the comment form was readable to a parser and not to a person. No
+  highlighting, no completion, and native SQL crammed onto one line because a
+  comment ends at the newline. Declarations are now code — highlighted as code,
+  commentable with `--`, and after `ATTACH x =` the completion offers the sources
+  you have registered and nothing else.
+- **`EVALUATE` alone** is a federated buffer with nothing declared. That is what the
+  toolbar's mode button writes: it wraps the buffer you already have.
+- **Line numbers survive.** Only the query reaches DuckDB, preceded by a blank line
+  for each line the declarations occupied, so an error names the line you are
+  looking at. What was given up is the buffer being a valid `.sql` that psql parses.
+- The parser is a real scanner, because it has to be: `AS ( select 'a)b' )` must not
+  end at the bracket inside the string, and neither must one in a `--` comment, a
+  `/* */` block, a quoted identifier or a T-SQL `[bracket]`. A test covers each.
+
 ### Editing a source
 
 - **✎ on a source row reopens the dialogue on it** — rename it, point it at another

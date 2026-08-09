@@ -80,3 +80,19 @@ export function qualifyLoosely(dialect, dotted, reserved) {
     )
     .join('.');
 }
+
+/**
+ * Is this buffer meant for DuckDB rather than for a single source?
+ *
+ * Mirrors `federation::program::is_federated`, which is the rule that actually
+ * decides — this one only paints the badge and the mode toggle, and the two must
+ * agree or the chrome lies about what pressing Run will do.
+ *
+ * `DEFINE` or `EVALUATE` has to be the **first** thing in the buffer, past any
+ * leading comments. Not anywhere in it: a column called `define` two hundred lines
+ * down would otherwise change which engine a long script runs on.
+ */
+export function looksFederated(text) {
+  const head = String(text).replace(/^(?:\s+|--[^\n]*|\/\*[\s\S]*?\*\/)*/, '');
+  return /^(?:DEFINE|EVALUATE)\b/i.test(head);
+}

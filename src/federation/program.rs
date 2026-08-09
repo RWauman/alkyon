@@ -1,24 +1,41 @@
-//! Parsing the federated preamble.
+//! Parsing a federated buffer.
 //!
-//! Every directive is written as a **SQL comment**, which is why a federated
-//! buffer is still a valid `.sql` file: opened in SSMS or psql it parses, and the
-//! directives are simply ignored. It also means the text handed to DuckDB is the
-//! buffer verbatim — no stripping, so error line numbers still line up.
+//! A federated buffer declares what it needs, then says what to return — the shape
+//! DAX uses, and for the same reason: the declarations are the interesting part and
+//! they deserve to be readable.
 //!
 //! ```text
-//! -- @duckdb
-//! -- @import customer = user:pg-dev/alkyon_demo : select id, name from sales.customer
-//! -- @import trips    = taxi/*.parquet
-//! -- @excel  budget   = budgets/2026.xlsx#Sheet1
+//! DEFINE
+//!     ATTACH pg      = pg-prod/warehouse
+//!     IMPORT orders  = mssql-prod/sales AS (
+//!         SELECT TOP 1000 order_id, customer_id, unit_price
+//!         FROM sales.order_line
+//!         WHERE shipped_on >= '2026-01-01'
+//!     )
+//!     FILES  trips   = taxi/*.parquet
+//!     EXCEL  budget  = budgets/2026.xlsx#Forecast
 //!
-//! select c.name, b.target
-//! from customer c join budget b on b.id = c.id;
+//! EVALUATE
+//!     SELECT c.name, sum(o.unit_price) AS total
+//!     FROM pg.sales.customer c
+//!     JOIN orders o ON o.customer_id = c.id
+//!     GROUP BY c.name;
 //! ```
 //!
-//! The second form has no `:` because there is no SQL to run on a folder — and
-//! that is also what tells the two apart.
+//! `EVALUATE` on its own is a federated buffer with nothing declared — DuckDB, and
+//! whatever the open folder holds.
+//!
+//! **This replaced a set of `-- @import` comments.** Those kept the file a valid
+//! `.sql` that psql would parse, which was worth something; what it cost was a
+//! whole class of unreadability — no highlighting, no completion, and native SQL
+//! crammed onto one line. Only the query reaches DuckDB now, preceded by as many
+//! blank lines as the declarations occupied, so an error still names the line you
+//! are looking at.
 
 use crate::error::{Error, Result};
+
+/// The declarations a `DEFINE` block may hold.
+const KINDS: [&str; 4] = ["attach", "import", "files", "excel"];
 
 /// Something made available to the DuckDB session before the query runs.
 ///
@@ -29,41 +46,36 @@ use crate::error::{Error, Result};
 /// once, whatever claims it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Import {
-    /// The result of native SQL run against a registered source.
+    /// `IMPORT <alias> = <source>[/<database>] AS ( <sql> )`
+    ///
+    /// The SQL is in that source's own dialect, and nothing rewrites it.
     Query {
         alias: String,
-        /// Source key or bare id, resolved by the registry.
         source: String,
         database: Option<String>,
-        /// In that source's own dialect — nothing translates it.
         sql: String,
     },
-    /// Files inside a folder source, read by DuckDB itself.
+    /// `FILES <alias> = <folder source>/<path or glob>`
     ///
-    /// The one import that does **not** travel through Alkyon: there is no SQL to
-    /// run on a folder, so the federated session reads the parquet directly. No
-    /// row cap applies, because no row is ever converted to text on the way.
+    /// The one import that does **not** travel through Alkyon: DuckDB reads the
+    /// files itself, so no row is ever converted to text on the way.
     Files {
         alias: String,
-        /// A `files` source. Any other kind has SQL to run and belongs above.
         source: String,
         /// Relative to that source's path; `*` and `**` are DuckDB's to expand.
         /// Empty when the source is itself a single file.
         pattern: String,
     },
-    /// A spreadsheet, read in-process rather than by DuckDB.
+    /// `EXCEL <alias> = <path>[#<sheet>]`, read in-process rather than by DuckDB.
     Excel {
         alias: String,
         path: String,
         sheet: Option<String>,
     },
-    /// A whole server, attached so DuckDB plans the remote read itself.
+    /// `ATTACH <alias> = <source>[/<database>]` — a whole server, planned by DuckDB.
     ///
     /// The alias is a **catalogue**, not a table, so what you write is
-    /// `pg.sales.customer` rather than a bare name. Nothing is read until the
-    /// query asks, and what the server receives is DuckDB's SQL — see
-    /// [`crate::federation::attach`] for exactly how much of the query gets
-    /// pushed down, which is less than one would hope.
+    /// `pg.sales.customer` rather than a bare name.
     Attach {
         alias: String,
         source: String,
@@ -85,194 +97,349 @@ impl Import {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Program {
     pub imports: Vec<Import>,
-    /// The buffer, verbatim. Directives are comments, so DuckDB skips them.
+    /// What runs in DuckDB: the `EVALUATE` body, preceded by a blank line for
+    /// every line the declarations took up, so a reported line number is the one
+    /// in the editor.
     pub sql: String,
 }
 
-/// Is this buffer meant for DuckDB rather than a single source?
+/// Is this buffer meant for DuckDB rather than for a single source?
 ///
-/// Only recognised in the leading run of comments and blank lines: a `-- @duckdb`
-/// buried after a hundred lines of SQL would be a nasty surprise.
+/// True when the first thing in it is `DEFINE` or `EVALUATE`. Only the *first*
+/// thing: a `DEFINE` two hundred lines down is a column called define, and a
+/// buffer should not change engine because of one.
 pub fn is_federated(buffer: &str) -> bool {
-    for line in buffer.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let Some(comment) = line.strip_prefix("--") else {
-            return false;
-        };
-        if directive(comment).is_some_and(|(name, _)| name == "duckdb") {
-            return true;
-        }
-    }
-    false
-}
-
-/// Split `@name rest` out of a comment body. `None` when it is an ordinary
-/// comment — which is also how you disable a directive: break the `@`.
-fn directive(comment: &str) -> Option<(&str, &str)> {
-    let rest = comment.trim_start().strip_prefix('@')?;
-    let end = rest.find(|c: char| c.is_whitespace()).unwrap_or(rest.len());
-    Some((&rest[..end], rest[end..].trim()))
+    let mut scanner = Scanner::new(buffer);
+    scanner.trivia();
+    matches!(scanner.peek_word().as_deref(), Some("define") | Some("evaluate"))
 }
 
 pub fn parse(buffer: &str) -> Result<Program> {
-    let mut imports = Vec::new();
+    let mut scanner = Scanner::new(buffer);
+    scanner.trivia();
 
-    for (number, line) in buffer.lines().enumerate() {
-        let trimmed = line.trim();
-        let Some(comment) = trimmed.strip_prefix("--") else {
-            continue;
-        };
-        let Some((name, rest)) = directive(comment) else {
-            continue;
-        };
-
-        let at = || format!("line {}", number + 1);
-        let import = match name {
-            "duckdb" => continue,
-            "import" => parse_query_import(rest).map_err(|e| annotate(e, &at()))?,
-            "attach" => parse_attach(rest).map_err(|e| annotate(e, &at()))?,
-            "excel" => parse_excel_import(rest).map_err(|e| annotate(e, &at()))?,
-            // An unknown `@word` is just prose in a comment.
-            _ => continue,
-        };
-
-        if let Some(clash) = imports
-            .iter()
-            .find(|i: &&Import| i.alias() == import.alias())
-        {
-            return Err(Error::BadRequest(format!(
-                "{}: `{}` is already imported — aliases must be unique",
-                at(),
-                clash.alias()
-            )));
+    let mut imports: Vec<Import> = Vec::new();
+    match scanner.peek_word().as_deref() {
+        Some("define") => {
+            scanner.take_word();
+            loop {
+                scanner.trivia();
+                // Anything that is not a declaration ends the block — including a
+                // misspelt keyword and a forgotten EVALUATE, which then get one
+                // honest message below rather than a complaint about the alias
+                // that a half-parsed declaration would have produced.
+                let Some(word) = scanner.peek_word() else { break };
+                if !KINDS.contains(&word.as_str()) {
+                    break;
+                }
+                let at = scanner.line();
+                let import = scanner.declaration().map_err(|e| annotate(e, at))?;
+                if let Some(clash) = imports.iter().find(|i| i.alias() == import.alias()) {
+                    return Err(annotate(
+                        Error::BadRequest(format!(
+                            "`{}` is already declared — each name is claimed once",
+                            clash.alias()
+                        )),
+                        at,
+                    ));
+                }
+                imports.push(import);
+            }
         }
-        imports.push(import);
+        Some("evaluate") => {}
+        _ => {
+            return Err(Error::BadRequest(
+                "a federated buffer starts with DEFINE or EVALUATE".into(),
+            ))
+        }
     }
 
-    Ok(Program {
-        imports,
-        sql: buffer.to_owned(),
-    })
+    scanner.trivia();
+    let at = scanner.line();
+    let found = scanner.take_word();
+    if found.as_deref() != Some("evaluate") {
+        let found = found.unwrap_or_else(|| "the end of the buffer".to_owned());
+        return Err(Error::BadRequest(format!(
+            "line {at}: expected another declaration or EVALUATE, found `{found}` — \
+             EVALUATE says what to return, and a declaration is one of {}",
+            KINDS.join(", ").to_uppercase()
+        )));
+    }
+
+    // Blank lines rather than a stripped prefix: the query keeps the line numbers
+    // it has in the editor, so DuckDB's complaints point at the right place.
+    let body = &buffer[scanner.at..];
+    let skipped = buffer[..scanner.at].matches('\n').count();
+    let sql = format!("{}{body}", "\n".repeat(skipped));
+
+    if sql.trim().is_empty() {
+        return Err(Error::BadRequest(
+            "EVALUATE needs a query after it".to_owned(),
+        ));
+    }
+    Ok(Program { imports, sql })
 }
 
-fn annotate(error: Error, at: &str) -> Error {
+fn annotate(error: Error, line: usize) -> Error {
     match error {
-        Error::BadRequest(message) => Error::BadRequest(format!("{at}: {message}")),
+        Error::BadRequest(message) => Error::BadRequest(format!("line {line}: {message}")),
         other => other,
     }
 }
 
-/// The scope prefixes a source key may carry. These hold the only colon that can
-/// legitimately appear before the SQL separator, so the parser steps over one.
-const SCOPES: &[&str] = &["user:", "project:"];
+/// A reader over the buffer that knows where SQL hides its punctuation.
+struct Scanner<'a> {
+    text: &'a str,
+    at: usize,
+}
 
-/// `<alias> = <source>[/<database>] : <native sql>`, or, with no `:` at all,
-/// `<alias> = <folder-source>[/<path or glob>]`.
-fn parse_query_import(rest: &str) -> Result<Import> {
-    let (alias, remainder) = split_once_trimmed(rest, '=').ok_or_else(|| {
-        Error::BadRequest("@import needs `<alias> = <source>[/<database>] : <sql>`".to_owned())
-    })?;
-    check_alias(&alias)?;
-
-    // Splitting on the first colon would cut `user:pg-dev` in half. Step past a
-    // scope prefix, then the next colon is the one that introduces the SQL — and
-    // any `::` cast in that SQL comes after it, so it is never touched.
-    let scope = SCOPES
-        .iter()
-        .find(|scope| remainder.starts_with(**scope))
-        .map_or(0, |scope| scope.len());
-    let Some(separator) = remainder[scope..].find(':').map(|index| index + scope) else {
-        // No SQL to run means the target is files, not a server. Which source
-        // kinds that is legal for is the registry's business, not the parser's.
-        return parse_files_import(alias, &remainder[..]);
-    };
-
-    let target = remainder[..separator].trim().to_owned();
-    let sql = remainder[separator + 1..].trim().to_owned();
-    if sql.is_empty() {
-        return Err(Error::BadRequest(format!("@import {alias}: no SQL given")));
+impl<'a> Scanner<'a> {
+    fn new(text: &'a str) -> Self {
+        Scanner { text, at: 0 }
     }
 
-    let (source, database) = split_target(&target, &format!("@import {alias}"))?;
-    Ok(Import::Query {
-        alias,
-        source,
-        database,
-        sql,
-    })
+    /// The 1-based line the reader is on, for an error that has to point at it.
+    fn line(&self) -> usize {
+        self.text[..self.at].matches('\n').count() + 1
+    }
+
+    fn rest(&self) -> &'a str {
+        &self.text[self.at..]
+    }
+
+    /// Whitespace and comments. A declaration block is code, so it gets commented
+    /// like code.
+    fn trivia(&mut self) {
+        loop {
+            let rest = self.rest();
+            let trimmed = rest.trim_start();
+            self.at += rest.len() - trimmed.len();
+
+            if trimmed.starts_with("--") {
+                let end = trimmed.find('\n').map_or(trimmed.len(), |index| index + 1);
+                self.at += end;
+            } else if trimmed.starts_with("/*") {
+                let end = trimmed.find("*/").map_or(trimmed.len(), |index| index + 2);
+                self.at += end;
+            } else {
+                return;
+            }
+        }
+    }
+
+    /// Horizontal whitespace only — the kind that does not end a declaration.
+    fn spaces(&mut self) {
+        let rest = self.rest();
+        let trimmed = rest.trim_start_matches([' ', '\t']);
+        self.at += rest.len() - trimmed.len();
+    }
+
+    /// The next bare word, lowercased, without consuming it.
+    fn peek_word(&self) -> Option<String> {
+        let word: String = self
+            .rest()
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+        (!word.is_empty()).then(|| word.to_lowercase())
+    }
+
+    fn take_word(&mut self) -> Option<String> {
+        let word = self.peek_word()?;
+        self.at += word.len();
+        Some(word)
+    }
+
+    /// Up to the end of the line, trimmed.
+    fn rest_of_line(&mut self) -> String {
+        let rest = self.rest();
+        let end = rest.find('\n').unwrap_or(rest.len());
+        let taken = rest[..end].trim().to_owned();
+        self.at += end;
+        taken
+    }
+
+    /// One declaration: `<KIND> <alias> = <target>`, and for `IMPORT` the
+    /// parenthesised SQL after `AS`.
+    fn declaration(&mut self) -> Result<Import> {
+        let Some(kind) = self.take_word() else {
+            return Err(Error::BadRequest(format!(
+                "expected ATTACH, IMPORT, FILES or EXCEL, found `{}`",
+                self.rest().chars().take(20).collect::<String>()
+            )));
+        };
+
+        self.trivia();
+        let alias = self.take_word().unwrap_or_default();
+        check_alias(&alias)?;
+        self.trivia();
+        if !self.rest().starts_with('=') {
+            return Err(Error::BadRequest(format!(
+                "{kind} {alias}: expected `=` after the name"
+            )));
+        }
+        self.at += 1;
+        // Spaces, not trivia: a value lives on the line its name is on. Skipping
+        // newlines here let `EXCEL b =` with nothing after it swallow the next
+        // line — and report the confusion three lines further down.
+        self.spaces();
+
+        match kind.as_str() {
+            "attach" => {
+                let (source, database) = split_target(&self.rest_of_line(), &alias)?;
+                Ok(Import::Attach {
+                    alias,
+                    source,
+                    database,
+                })
+            }
+            "import" => {
+                let target = self.until_as(&alias)?;
+                let (source, database) = split_target(&target, &alias)?;
+                let sql = self.parenthesised(&alias)?;
+                if sql.trim().is_empty() {
+                    return Err(Error::BadRequest(format!("IMPORT {alias}: no SQL given")));
+                }
+                Ok(Import::Query {
+                    alias,
+                    source,
+                    database,
+                    sql,
+                })
+            }
+            "files" => parse_files(alias, &self.rest_of_line()),
+            "excel" => parse_excel(alias, &self.rest_of_line()),
+            other => Err(Error::BadRequest(format!(
+                "`{other}` is not something that can be declared — \
+                 use ATTACH, IMPORT, FILES or EXCEL"
+            ))),
+        }
+    }
+
+    /// Everything up to the keyword `AS`, which introduces the SQL.
+    fn until_as(&mut self, alias: &str) -> Result<String> {
+        let rest = self.rest();
+        let mut at = 0;
+        while at < rest.len() {
+            // A whole word, so a source called `last` does not end the target.
+            if rest[at..].len() >= 2
+                && rest[at..at + 2].eq_ignore_ascii_case("as")
+                && rest[..at].ends_with(char::is_whitespace)
+                && rest[at + 2..]
+                    .chars()
+                    .next()
+                    .is_none_or(|c| c.is_whitespace() || c == '(')
+            {
+                let target = rest[..at].trim().to_owned();
+                self.at += at + 2;
+                return Ok(target);
+            }
+            at += rest[at..].chars().next().map_or(1, char::len_utf8);
+        }
+        Err(Error::BadRequest(format!(
+            "IMPORT {alias}: expected `AS ( … )` with the SQL to run on the source"
+        )))
+    }
+
+    /// A balanced `( … )`, stepping over anything SQL might hide a bracket inside.
+    ///
+    /// This is the whole reason there is a scanner rather than a line splitter:
+    /// `WHERE note = 'a)b'` must not end the declaration, and neither must a
+    /// `-- )` comment or a `[weird)name]` identifier.
+    fn parenthesised(&mut self, alias: &str) -> Result<String> {
+        self.trivia();
+        if !self.rest().starts_with('(') {
+            return Err(Error::BadRequest(format!(
+                "IMPORT {alias}: expected `(` after AS"
+            )));
+        }
+        let rest = self.rest();
+        let bytes = rest.as_bytes();
+        let mut depth = 0usize;
+        let mut at = 0usize;
+
+        while at < bytes.len() {
+            match bytes[at] {
+                b'(' => {
+                    depth += 1;
+                    at += 1;
+                }
+                b')' => {
+                    depth -= 1;
+                    at += 1;
+                    if depth == 0 {
+                        let sql = rest[1..at - 1].trim().to_owned();
+                        self.at += at;
+                        return Ok(sql);
+                    }
+                }
+                // A quoted string or identifier: everything to its close is text.
+                // `''` inside a string is an escaped quote, which the doubling
+                // handles for free — the second one reopens what the first closed.
+                quote @ (b'\'' | b'"' | b'`') => {
+                    at += 1;
+                    while at < bytes.len() && bytes[at] != quote {
+                        at += 1;
+                    }
+                    at += 1;
+                }
+                // T-SQL's bracket identifier. `]]` is its escape, and the same
+                // reopening trick applies.
+                b'[' => {
+                    at += 1;
+                    while at < bytes.len() && bytes[at] != b']' {
+                        at += 1;
+                    }
+                    at += 1;
+                }
+                b'-' if rest[at..].starts_with("--") => {
+                    at += rest[at..].find('\n').unwrap_or(rest.len() - at);
+                }
+                b'/' if rest[at..].starts_with("/*") => {
+                    at += rest[at..].find("*/").map_or(rest.len() - at, |end| end + 2);
+                }
+                _ => at += 1,
+            }
+        }
+        Err(Error::BadRequest(format!(
+            "IMPORT {alias}: the `(` after AS is never closed"
+        )))
+    }
 }
 
 /// `<source>[/<database>]`.
 ///
 /// A source key cannot contain `/` — ids are `[A-Za-z0-9._-]+` and the scope
 /// prefix uses `:` — so the last one separates the database.
-fn split_target(target: &str, what: &str) -> Result<(String, Option<String>)> {
+fn split_target(target: &str, alias: &str) -> Result<(String, Option<String>)> {
     let (source, database) = match target.rsplit_once('/') {
         Some((source, database)) => (source.trim().to_owned(), Some(database.trim().to_owned())),
         None => (target.trim().to_owned(), None),
     };
     if source.is_empty() {
-        return Err(Error::BadRequest(format!("{what}: no source given")));
+        return Err(Error::BadRequest(format!("{alias}: no source given")));
     }
     Ok((source, database))
 }
 
-/// `<alias> = <source>[/<database>]`
-///
-/// No `:` and no SQL, and that is the point: there is nothing to write in the
-/// source's dialect because DuckDB generates the remote query itself.
-fn parse_attach(rest: &str) -> Result<Import> {
-    let (alias, target) = split_once_trimmed(rest, '=').ok_or_else(|| {
-        Error::BadRequest("@attach needs `<alias> = <source>[/<database>]`".to_owned())
-    })?;
-    check_alias(&alias)?;
-
-    // Someone who has been writing `@import` all morning will type a colon here.
-    // Saying why there is no SQL to write is more use than "unexpected character".
-    // Past the scope prefix, which carries the one colon that is legitimate.
-    let scope = SCOPES
-        .iter()
-        .find(|scope| target.starts_with(**scope))
-        .map_or(0, |scope| scope.len());
-    if target[scope..].contains(':') {
-        return Err(Error::BadRequest(format!(
-            "@attach {alias}: takes no SQL — DuckDB writes the remote query itself. Drop the \
-             `:` to attach the whole database, or write `@import {alias} = … : <sql>` to run \
-             that SQL on the server instead."
-        )));
-    }
-
-    let (source, database) = split_target(&target, &format!("@attach {alias}"))?;
-    Ok(Import::Attach {
-        alias,
-        source,
-        database,
-    })
-}
-
-/// `<alias> = <folder-source>[/<path or glob>]`
+/// `<folder source>/<path or glob>`
 ///
 /// Split on the **first** `/`, not the last: an id cannot contain one, and the
-/// pattern very much can (`2022/*.parquet`). That is the opposite of the SQL form
+/// pattern very much can (`2022/*.parquet`). That is the opposite of the rule
 /// above, where the last `/` introduces a database.
-fn parse_files_import(alias: String, target: &str) -> Result<Import> {
+fn parse_files(alias: String, target: &str) -> Result<Import> {
     let (source, pattern) = match target.split_once('/') {
         Some((source, pattern)) => (source.trim().to_owned(), pattern.trim().to_owned()),
         None => (target.trim().to_owned(), String::new()),
     };
     if source.is_empty() {
-        return Err(Error::BadRequest(format!(
-            "@import {alias}: no source given"
-        )));
+        return Err(Error::BadRequest(format!("FILES {alias}: no source given")));
     }
     // The pattern is resolved against the source's own directory, so anything
     // that could climb out of it is refused before DuckDB ever sees it.
     if pattern.starts_with('/') || pattern.starts_with('\\') || pattern.contains("..") {
         return Err(Error::BadRequest(format!(
-            "@import {alias}: `{pattern}` must stay inside the source — no `..`, no absolute path"
+            "FILES {alias}: `{pattern}` must stay inside the source — no `..`, no absolute path"
         )));
     }
     Ok(Import::Files {
@@ -282,38 +449,30 @@ fn parse_files_import(alias: String, target: &str) -> Result<Import> {
     })
 }
 
-/// `<alias> = <path>[#<sheet>]`
-fn parse_excel_import(rest: &str) -> Result<Import> {
-    let (alias, target) = split_once_trimmed(rest, '=')
-        .ok_or_else(|| Error::BadRequest("@excel needs `<alias> = <path>[#<sheet>]`".to_owned()))?;
-    check_alias(&alias)?;
+/// `<path>[#<sheet>]`
+fn parse_excel(alias: String, target: &str) -> Result<Import> {
     if target.is_empty() {
-        return Err(Error::BadRequest(format!("@excel {alias}: no path given")));
+        return Err(Error::BadRequest(format!("EXCEL {alias}: no path given")));
     }
-
     let (path, sheet) = match target.split_once('#') {
         Some((path, sheet)) => (path.trim().to_owned(), Some(sheet.trim().to_owned())),
-        None => (target, None),
+        None => (target.to_owned(), None),
     };
     Ok(Import::Excel { alias, path, sheet })
-}
-
-fn split_once_trimmed(text: &str, separator: char) -> Option<(String, String)> {
-    let (left, right) = text.split_once(separator)?;
-    Some((left.trim().to_owned(), right.trim().to_owned()))
 }
 
 /// The alias becomes a DuckDB identifier, so keep it to something that needs no
 /// quoting — and refuse anything that could be injected into the DDL.
 fn check_alias(alias: &str) -> Result<()> {
     if alias.is_empty() {
-        return Err(Error::BadRequest("an import needs an alias".to_owned()));
+        return Err(Error::BadRequest("a declaration needs a name".to_owned()));
     }
     if !alias.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
         || alias.starts_with(|c: char| c.is_ascii_digit())
     {
         return Err(Error::BadRequest(format!(
-            "`{alias}` is not a usable alias — letters, digits and underscore, not starting with a digit"
+            "`{alias}` is not a usable name — letters, digits and underscore, not starting \
+             with a digit"
         )));
     }
     Ok(())
@@ -324,156 +483,195 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_a_leading_directive_switches_mode() {
-        assert!(is_federated("-- @duckdb\nselect 1"));
-        assert!(is_federated("\n\n  --   @duckdb  \nselect 1"));
-        assert!(is_federated("-- a note\n-- @duckdb\nselect 1"));
+    fn only_a_leading_keyword_switches_mode() {
+        assert!(is_federated("DEFINE\n  ATTACH pg = pg-dev\nEVALUATE\nselect 1"));
+        assert!(is_federated("evaluate select 1"));
+        assert!(is_federated("\n\n  -- a note\n  DEFINE\n"));
+        assert!(is_federated("/* a note */ EVALUATE select 1"));
 
         assert!(!is_federated("select 1"));
         // Buried after real SQL: not a mode switch, or a long script would change
-        // engine because of a comment near the bottom.
-        assert!(!is_federated("select 1;\n-- @duckdb\nselect 2"));
-        // Broken on purpose is how you turn it off.
-        assert!(!is_federated("-- x@duckdb\nselect 1"));
-        assert!(!is_federated("-- duckdb\nselect 1"));
+        // engine because of a column called `define`.
+        assert!(!is_federated("select define from t"));
+        assert!(!is_federated("select 1;\nDEFINE\n"));
+        assert!(!is_federated(""));
     }
 
     #[test]
-    fn parses_a_query_import() {
+    fn parses_every_kind_of_declaration() {
         let program = parse(
-            "-- @duckdb\n\
-             -- @import customer = user:pg-dev/alkyon_demo : select id, name from sales.customer\n\
-             select * from customer;",
+            "DEFINE\n\
+             \x20   ATTACH pg     = user:pg-dev/warehouse\n\
+             \x20   IMPORT orders = mssql-dev/sales AS ( select top 5 id from sales.order_line )\n\
+             \x20   FILES  trips  = taxi/2022/*.parquet\n\
+             \x20   EXCEL  budget = budgets/2026.xlsx#Forecast\n\
+             EVALUATE\n\
+             select 1;",
         )
         .unwrap();
 
         assert_eq!(
             program.imports,
-            [Import::Query {
-                alias: "customer".into(),
-                source: "user:pg-dev".into(),
-                database: Some("alkyon_demo".into()),
-                sql: "select id, name from sales.customer".into(),
-            }]
+            [
+                Import::Attach {
+                    alias: "pg".into(),
+                    source: "user:pg-dev".into(),
+                    database: Some("warehouse".into()),
+                },
+                Import::Query {
+                    alias: "orders".into(),
+                    source: "mssql-dev".into(),
+                    database: Some("sales".into()),
+                    sql: "select top 5 id from sales.order_line".into(),
+                },
+                Import::Files {
+                    alias: "trips".into(),
+                    source: "taxi".into(),
+                    pattern: "2022/*.parquet".into(),
+                },
+                Import::Excel {
+                    alias: "budget".into(),
+                    path: "budgets/2026.xlsx".into(),
+                    sheet: Some("Forecast".into()),
+                },
+            ]
         );
-        // The buffer goes to DuckDB verbatim: directives are comments already.
-        assert!(program.sql.contains("-- @import"));
+    }
+
+    /// The query keeps the line numbers it has in the editor, so an error DuckDB
+    /// reports points at the line you are looking at.
+    #[test]
+    fn the_query_keeps_its_line_numbers() {
+        let program = parse(
+            "DEFINE\n\
+             \x20   ATTACH pg = pg-dev\n\
+             \n\
+             EVALUATE\n\
+             select 1;",
+        )
+        .unwrap();
+        // `select 1;` is the buffer's fifth line, and it is the fifth line of what
+        // DuckDB is handed: four blank ones stand in for the declarations.
+        assert_eq!(program.sql, "\n\n\n\nselect 1;");
+        assert_eq!(program.sql.trim(), "select 1;");
+        assert_eq!(program.sql.lines().count(), 5);
+    }
+
+    /// A buffer with nothing to declare is still a federated one.
+    #[test]
+    fn evaluate_alone_declares_nothing() {
+        let program = parse("EVALUATE\nselect * from 'x.parquet';").unwrap();
+        assert!(program.imports.is_empty());
+        assert_eq!(program.sql.trim(), "select * from 'x.parquet';");
+    }
+
+    /// The reason there is a scanner and not a line splitter.
+    #[test]
+    fn a_bracket_inside_the_sql_does_not_end_the_declaration() {
+        for (sql, why) in [
+            ("select 'a)b' as x", "a bracket in a string literal"),
+            ("select \"od)d\" from t", "a quoted identifier"),
+            ("select [od)d] from t", "a T-SQL bracket identifier"),
+            ("select 1 -- )\n, 2", "a line comment"),
+            ("select 1 /* ) */, 2", "a block comment"),
+            ("select coalesce(a, (b)) from t", "nested brackets"),
+            ("select 'it''s )' as x", "a doubled quote inside a string"),
+        ] {
+            let program = parse(&format!(
+                "DEFINE\n  IMPORT x = pg-dev AS ( {sql} )\nEVALUATE\nselect 1;"
+            ))
+            .unwrap_or_else(|e| panic!("{why}: {e}"));
+            let Import::Query { sql: got, .. } = &program.imports[0] else {
+                panic!("a query import");
+            };
+            assert_eq!(got, sql, "{why}");
+        }
+    }
+
+    /// Native SQL over several lines is the point of the parenthesised form.
+    #[test]
+    fn the_sql_may_span_lines() {
+        let program = parse(
+            "DEFINE\n\
+             \x20   IMPORT orders = mssql-dev/sales AS (\n\
+             \x20       SELECT TOP 1000 order_id, unit_price\n\
+             \x20       FROM sales.order_line\n\
+             \x20       WHERE shipped_on >= '2026-01-01'\n\
+             \x20   )\n\
+             EVALUATE\n\
+             select * from orders;",
+        )
+        .unwrap();
+        let Import::Query { sql, .. } = &program.imports[0] else {
+            panic!("a query import");
+        };
+        assert!(sql.contains("SELECT TOP 1000"), "{sql}");
+        assert!(sql.contains("WHERE shipped_on"), "{sql}");
+        assert_eq!(sql.lines().count(), 3);
+    }
+
+    /// A declaration block is code, so it gets commented like code.
+    #[test]
+    fn declarations_can_be_commented() {
+        let program = parse(
+            "DEFINE\n\
+             \x20   -- last quarter only\n\
+             \x20   ATTACH pg = pg-dev\n\
+             \x20   /* not this one yet\n\
+             \x20   ATTACH ms = mssql-dev */\n\
+             EVALUATE\n\
+             select 1;",
+        )
+        .unwrap();
+        assert_eq!(program.imports.len(), 1);
+        assert_eq!(program.imports[0].alias(), "pg");
     }
 
     #[test]
     fn the_database_is_optional() {
-        let program = parse("-- @import c = pg-dev : select 1").unwrap();
+        let program = parse("DEFINE\n  ATTACH pg = pg-dev\nEVALUATE\nselect 1;").unwrap();
         assert_eq!(
             program.imports,
-            [Import::Query {
-                alias: "c".into(),
+            [Import::Attach {
+                alias: "pg".into(),
                 source: "pg-dev".into(),
                 database: None,
-                sql: "select 1".into(),
             }]
         );
     }
 
-    /// A scope-qualified key carries a colon of its own. Splitting on the first
-    /// colon cut `user:pg-dev` in half, leaving `source: "user"`.
+    /// A scope-qualified key carries a colon of its own, which must survive.
     #[test]
-    fn a_scope_qualified_key_is_not_cut_in_half() {
-        for (key, expected) in [
-            ("user:pg-dev", "user:pg-dev"),
-            ("project:warehouse", "project:warehouse"),
-        ] {
+    fn a_scope_qualified_key_is_kept_whole() {
+        for key in ["user:pg-dev", "project:warehouse"] {
             let program = parse(&format!(
-                "-- @import c = {key}/alkyon_demo : select a::text from t"
+                "DEFINE\n  IMPORT c = {key}/alkyon_demo AS ( select a::text from t )\nEVALUATE\nselect 1;"
             ))
             .unwrap();
             assert_eq!(
                 program.imports,
                 [Import::Query {
                     alias: "c".into(),
-                    source: expected.into(),
+                    source: key.into(),
                     database: Some("alkyon_demo".into()),
-                    // The `::` cast sits after the separator, so it survives.
+                    // The `::` cast is inside the brackets, so nothing touches it.
                     sql: "select a::text from t".into(),
                 }],
                 "{key}"
             );
         }
-
-        // Without a database, too.
-        let program = parse("-- @import c = user:pg-dev : select 1").unwrap();
-        assert_eq!(
-            program.imports,
-            [Import::Query {
-                alias: "c".into(),
-                source: "user:pg-dev".into(),
-                database: None,
-                sql: "select 1".into(),
-            }]
-        );
     }
 
     #[test]
-    fn native_sql_may_contain_colons_and_equals() {
-        let program =
-            parse("-- @import c = pg-dev : select a::text as x from t where b = 1 and c = 2")
-                .unwrap();
-        let Import::Query { sql, .. } = &program.imports[0] else {
-            panic!("a query import");
-        };
-        assert_eq!(sql, "select a::text as x from t where b = 1 and c = 2");
-    }
-
-    /// No `:` means there is no SQL to run, which means the target is files.
-    #[test]
-    fn an_import_without_sql_is_a_file_import() {
-        let program = parse("-- @import taxi = nytc-parquet-test/*.parquet").unwrap();
-        assert_eq!(
-            program.imports,
-            [Import::Files {
-                alias: "taxi".into(),
-                source: "nytc-parquet-test".into(),
-                pattern: "*.parquet".into(),
-            }]
-        );
-    }
-
-    /// The pattern may contain `/`; the id may not. So the split is on the first
-    /// one — the opposite of the SQL form, where the last `/` names a database.
-    #[test]
-    fn the_pattern_keeps_its_own_slashes() {
-        for (target, source, pattern) in [
-            ("data/2022/*.parquet", "data", "2022/*.parquet"),
-            ("user:data/**/*.csv", "user:data", "**/*.csv"),
-            (
-                "project:exports/one.parquet",
-                "project:exports",
-                "one.parquet",
-            ),
-            // A single-file source has nothing to select inside it.
-            ("budget", "budget", ""),
-        ] {
-            let program = parse(&format!("-- @import x = {target}")).unwrap();
-            assert_eq!(
-                program.imports,
-                [Import::Files {
-                    alias: "x".into(),
-                    source: source.into(),
-                    pattern: pattern.into(),
-                }],
-                "{target}"
-            );
-        }
-    }
-
-    #[test]
-    fn a_file_import_cannot_climb_out_of_its_source() {
+    fn a_files_declaration_cannot_climb_out_of_its_source() {
         for pattern in [
             "../secrets/*.parquet",
             "a/../../b.csv",
             "/etc/passwd",
             "\\\\host\\share",
         ] {
-            let buffer = format!("-- @import x = data/{pattern}");
+            let buffer =
+                format!("DEFINE\n  FILES x = data/{pattern}\nEVALUATE\nselect 1;");
             assert!(
                 parse(&buffer).is_err(),
                 "`{pattern}` should have been refused"
@@ -482,105 +680,18 @@ mod tests {
     }
 
     #[test]
-    fn parses_an_attach() {
-        let program = parse(
-            "-- @duckdb\n\
-             -- @attach pg = user:pg-dev/warehouse\n\
-             select * from pg.sales.customer;",
-        )
-        .unwrap();
-        assert_eq!(
-            program.imports,
-            [Import::Attach {
-                alias: "pg".into(),
-                source: "user:pg-dev".into(),
-                database: Some("warehouse".into()),
-            }]
-        );
-
-        // The database is optional here too — the source's own is used.
-        let program = parse("-- @attach pg = pg-dev").unwrap();
-        assert_eq!(
-            program.imports,
-            [Import::Attach {
-                alias: "pg".into(),
-                source: "pg-dev".into(),
-                database: None,
-            }]
-        );
-    }
-
-    /// Anyone who has been writing `@import` all morning will reach for the colon.
-    /// Saying why there is no SQL to write beats "unexpected character".
-    #[test]
-    fn an_attach_with_sql_explains_itself() {
-        let error = parse("-- @attach pg = pg-dev : select 1")
-            .expect_err("no SQL belongs here")
-            .to_string();
-        assert!(error.contains("takes no SQL"), "{error}");
-        assert!(error.contains("@import"), "{error}");
-
-        // But a scope prefix carries a legitimate colon of its own.
-        assert!(parse("-- @attach pg = user:pg-dev/warehouse").is_ok());
-    }
-
-    /// One alias, one meaning — whichever directive claimed it.
-    #[test]
-    fn an_attach_clashes_with_an_import_of_the_same_name() {
-        let error = parse(
-            "-- @attach c = pg-dev\n\
-             -- @import c = mssql-dev : select 1",
-        )
-        .expect_err("clash")
-        .to_string();
-        assert!(error.contains("already imported"), "{error}");
-    }
-
-    #[test]
-    fn parses_an_excel_import() {
-        let program = parse("-- @excel budget = budgets/2026.xlsx#Forecast").unwrap();
-        assert_eq!(
-            program.imports,
-            [Import::Excel {
-                alias: "budget".into(),
-                path: "budgets/2026.xlsx".into(),
-                sheet: Some("Forecast".into()),
-            }]
-        );
-
-        let program = parse("-- @excel budget = 2026.xlsx").unwrap();
-        assert_eq!(
-            program.imports,
-            [Import::Excel {
-                alias: "budget".into(),
-                path: "2026.xlsx".into(),
-                sheet: None,
-            }]
-        );
-    }
-
-    #[test]
-    fn ordinary_comments_are_left_alone() {
-        let program = parse(
-            "-- @duckdb\n\
-             -- joins the warehouse against last year's budget\n\
-             -- TODO: @someone should check the rounding\n\
-             select 1;",
-        )
-        .unwrap();
-        assert!(program.imports.is_empty());
-    }
-
-    #[test]
-    fn bad_directives_say_which_line() {
+    fn bad_declarations_say_which_line() {
         for (buffer, expected) in [
-            ("-- @duckdb\n-- @import oops", "line 2"),
-            ("-- @import c = : select 1", "no source"),
-            ("-- @import c = pg-dev :", "no SQL"),
-            ("-- @import c = /x.parquet", "no source"),
-            ("-- @import c = data/../../etc/passwd", "must stay inside"),
-            ("-- @import c = data//absolute", "must stay inside"),
-            ("-- @excel b =", "no path"),
+            ("DEFINE\n\n  NONSENSE x = y\nEVALUATE\nselect 1;", "found `nonsense`"),
+            ("DEFINE\n  ATTACH = pg-dev\nEVALUATE\nselect 1;", "needs a name"),
+            ("DEFINE\n  ATTACH pg pg-dev\nEVALUATE\nselect 1;", "expected `=`"),
+            ("DEFINE\n  IMPORT c = pg-dev\nEVALUATE\nselect 1;", "expected `AS ("),
+            ("DEFINE\n  IMPORT c = pg-dev AS ( \nEVALUATE\nselect 1;", "never closed"),
+            ("DEFINE\n  IMPORT c = pg-dev AS ( )\nEVALUATE\nselect 1;", "no SQL"),
+            ("DEFINE\n  ATTACH pg = pg-dev\nselect 1;", "found `select`"),
+            ("DEFINE\n  EXCEL b =\nEVALUATE\nselect 1;", "no path"),
+            ("EVALUATE\n", "needs a query"),
+            ("select 1", "starts with DEFINE or EVALUATE"),
         ] {
             let error = parse(buffer).expect_err(buffer).to_string();
             assert!(error.contains(expected), "{buffer} gave {error}");
@@ -588,25 +699,38 @@ mod tests {
     }
 
     #[test]
-    fn an_alias_cannot_smuggle_sql() {
-        for alias in ["c; drop table t", "c d", "1c", "\"c\"", "c-d", ""] {
-            let buffer = format!("-- @import {alias} = pg-dev : select 1");
+    fn a_name_cannot_smuggle_sql() {
+        for alias in ["c; drop table t", "1c", "\"c\"", "c-d", ""] {
+            let buffer = format!("DEFINE\n  ATTACH {alias} = pg-dev\nEVALUATE\nselect 1;");
             assert!(
                 parse(&buffer).is_err(),
                 "`{alias}` should have been refused"
             );
         }
-        assert!(parse("-- @import c_2 = pg-dev : select 1").is_ok());
+        assert!(parse("DEFINE\n  ATTACH c_2 = pg-dev\nEVALUATE\nselect 1;").is_ok());
     }
 
     #[test]
-    fn duplicate_aliases_are_refused() {
+    fn a_name_is_claimed_once() {
         let error = parse(
-            "-- @import c = pg-dev : select 1\n\
-             -- @import c = mssql-dev : select 2",
+            "DEFINE\n\
+             \x20   ATTACH c = pg-dev\n\
+             \x20   IMPORT c = mssql-dev AS ( select 1 )\n\
+             EVALUATE\n\
+             select 1;",
         )
         .expect_err("clash")
         .to_string();
-        assert!(error.contains("already imported"), "{error}");
+        assert!(error.contains("already declared"), "{error}");
+    }
+
+    /// Case is not the point: SQL people shout their keywords, or do not.
+    #[test]
+    fn keywords_are_case_insensitive() {
+        let program = parse(
+            "define\n  attach pg = pg-dev\n  import o = ms-dev as ( select 1 )\nevaluate\nselect 1;",
+        )
+        .unwrap();
+        assert_eq!(program.imports.len(), 2);
     }
 }

@@ -53,8 +53,8 @@ with a `source_file` column — and you write DuckDB SQL against them. It gets t
 autocompletion and the search like any other source, and it can read nothing outside the path
 you gave it.
 
-**Federated.** A buffer that starts with `-- @duckdb` runs in DuckDB, over tables you pull in
-with `-- @import` and files in the open folder — join two servers against a spreadsheet, or
+**Federated.** A buffer that starts with `DEFINE` runs in DuckDB, over tables it declares with
+`ATTACH`, `IMPORT` and `FILES` — join two servers against a spreadsheet, or
 export a table straight to Parquet. Each import is still written in *its own* source's
 dialect; only the query on top is DuckDB's. A buffer without the directive never touches
 DuckDB.
@@ -117,7 +117,7 @@ and cancellation, the keychain, the schema explorer and cross-schema search, tab
 save, the open folder, the PTY terminal, and DuckDB federation over Postgres, SQL Server,
 MySQL, CSV and Parquet. Folder and file sources are covered by tests that need no server.
 
-Excel is read in-process by calamine, as a folder or file source and through `-- @excel`,
+Excel is read in-process by calamine, as a folder or file source and through an `EXCEL` declaration,
 against workbooks committed under `tests/fixtures/`.
 
 Written but not yet exercised: Windows integrated authentication and Entra ID token auth —

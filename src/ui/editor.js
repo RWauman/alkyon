@@ -6,6 +6,48 @@ import { dialectForMime, qualifyLoosely } from './dialect.js';
 import { targetAt } from './target.js';
 
 /**
+ * A declaration line inside a `DEFINE` block: its keyword, name, `=` and value.
+ */
+const DECLARATION = /^[ \t]*(ATTACH|IMPORT|FILES|EXCEL)[ \t]+(\w*)[ \t]*(=?)/i;
+
+/**
+ * Completions inside a `DEFINE` block, or null when the cursor is not in one.
+ *
+ * The whole reason the declarations moved out of comments: after `ATTACH pg =`
+ * the only words that mean anything are the sources you have registered, and a
+ * comment could never have said so. Without this the SQL hint answers with
+ * whatever keyword happens to share a prefix.
+ */
+function declarationCompletions(cm, sources) {
+  const cursor = cm.getCursor();
+  const text = cm.getValue();
+  // Only above EVALUATE: below it the buffer is ordinary SQL and the ordinary
+  // completions are the right ones.
+  const evaluate = text.search(/^[ \t]*EVALUATE\b/im);
+  if (evaluate === -1) return null;
+  const before = text.slice(0, cm.indexFromPos(cursor));
+  if (before.length > evaluate) return null;
+
+  const line = cm.getLine(cursor.line) ?? '';
+  const match = DECLARATION.exec(line);
+  if (!match || !match[3]) return null;
+
+  // The value starts after the `=`; complete the source id in it, and leave a
+  // `/database` or a glob alone.
+  const start = line.indexOf('=', match[1].length) + 1;
+  const value = line.slice(start);
+  const offset = value.length - value.trimStart().length;
+  const typed = line.slice(start + offset, cursor.ch);
+  if (typed.includes('/') || cursor.ch < start + offset) return null;
+
+  return {
+    list: sources.filter((name) => name.toLowerCase().startsWith(typed.toLowerCase())),
+    from: CodeMirror.Pos(cursor.line, start + offset),
+    to: CodeMirror.Pos(cursor.line, Math.max(cursor.ch, start + offset)),
+  };
+}
+
+/**
  * Completions for the target of a `TARGET`, or null when that is not what is
  * being typed.
  *
@@ -214,6 +256,8 @@ function byBareName(cm, result, tables, inScope) {
 function quotingSqlHint(cm, options) {
   const target = targetCompletions(cm, options.sources ?? []);
   if (target) return target;
+  const declaring = declarationCompletions(cm, options.sources ?? []);
+  if (declaring) return declaring;
 
   // CTEs are read from the buffer *here* rather than kept in step on every
   // keystroke: the parse is cheap, it only matters while the list is open, and
@@ -269,6 +313,12 @@ for (const mime of ['text/x-sql', 'text/x-pgsql', 'text/x-mssql', 'text/x-mysql'
   if (keywords) {
     keywords.target = true;
     keywords.swap = true;
+    // And the federated block, for the same reason twice over: these words are
+    // the buffer's structure, and left in plain text they read as prose. This is
+    // what a declaration block being *code* rather than a comment buys.
+    for (const word of ['define', 'evaluate', 'attach', 'import', 'files', 'excel']) {
+      keywords[word] = true;
+    }
   }
 }
 
@@ -375,22 +425,40 @@ export function createEditor(element, { onRun, onOpen, onSave, onSaveAs, onNew, 
     },
 
     /**
-     * Add or remove the `-- @duckdb` line. The directive is the only state that
-     * decides which engine runs the buffer, so the button edits the text rather
-     * than holding a flag of its own — that is what makes it survive a save.
+     * Put the buffer into DuckDB mode, or take it out.
+     *
+     * The text is the only state that decides which engine runs — there is no flag
+     * beside it — which is what makes the mode survive a save and a reopen.
+     *
+     * Turning it on wraps what is already there in `EVALUATE`, because that is
+     * what the buffer was: the thing to return. Turning it off unwraps it, and a
+     * `DEFINE` block is dropped with a confirmation the caller shows, since those
+     * declarations are not recoverable from anywhere else.
      */
     setFederated(on) {
-      const DIRECTIVE = '-- @duckdb';
-      const lines = editor.getValue().split('\n');
-      const at = lines.findIndex((line) => /^\s*--\s*@duckdb\b/.test(line));
+      const text = editor.getValue();
+      const head = text.replace(/^(?:\s|--[^\n]*\n|\/\*[\s\S]*?\*\/)*/, '');
+      const already = /^(?:DEFINE|EVALUATE)\b/i.test(head);
 
-      if (on && at === -1) {
-        editor.replaceRange(`${DIRECTIVE}\n`, { line: 0, ch: 0 });
-      } else if (!on && at !== -1) {
-        editor.replaceRange(
-          '',
-          { line: at, ch: 0 },
-          { line: at + 1, ch: 0 },
+      if (on === already) return;
+      if (on) {
+        // Indented under EVALUATE, so it reads as the block it now is.
+        const body = text
+          .split('\n')
+          .map((line) => (line.trim() ? `    ${line}` : line))
+          .join('\n');
+        editor.setValue(`EVALUATE\n${body}`);
+      } else {
+        // Everything from EVALUATE onwards is the query; the declarations above it
+        // have no meaning outside DuckDB mode and go.
+        const at = text.search(/^[ \t]*EVALUATE[ \t]*$/im);
+        const body = at === -1 ? text : text.slice(text.indexOf('\n', at) + 1);
+        editor.setValue(
+          body
+            .split('\n')
+            .map((line) => line.replace(/^ {4}/, ''))
+            .join('\n')
+            .trimStart(),
         );
       }
       editor.focus();

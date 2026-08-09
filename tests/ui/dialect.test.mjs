@@ -7,7 +7,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { previewSql, qualifyLoosely, quoteFor } from '../../src/ui/dialect.js';
+import { previewSql, qualifyLoosely, quoteFor, looksFederated } from '../../src/ui/dialect.js';
 
 test('each engine gets the quoting it actually accepts', () => {
   assert.equal(quoteFor('tsql', 'orders'), '[orders]');
@@ -60,4 +60,22 @@ test('the preview limits rows the way each engine spells it', () => {
   assert.equal(previewSql('mysql', '`sales`.`customer`'), 'SELECT * FROM `sales`.`customer` LIMIT 10000;');
   assert.equal(previewSql('duckdb', '"main"."trips"'), 'SELECT * FROM "main"."trips" LIMIT 10000;');
   assert.equal(previewSql('tsql', '[t]', 5), 'SELECT TOP 5 * FROM [t];');
+});
+
+/**
+ * The badge and the toggle must agree with `federation::program::is_federated`,
+ * which is the rule that actually decides which engine runs the buffer. When they
+ * disagree the chrome lies about what pressing Run will do.
+ */
+test('DEFINE or EVALUATE, and only as the first thing', () => {
+  assert.equal(looksFederated('DEFINE\n  ATTACH pg = pg-dev\nEVALUATE\nselect 1'), true);
+  assert.equal(looksFederated('evaluate select 1'), true);
+  assert.equal(looksFederated('\n\n-- a note\nDEFINE\n'), true);
+  assert.equal(looksFederated('/* a note */ EVALUATE select 1'), true);
+
+  assert.equal(looksFederated('select 1'), false);
+  // A column called `define` must not change which engine a long script runs on.
+  assert.equal(looksFederated('select define from t'), false);
+  assert.equal(looksFederated('select 1;\nDEFINE\n'), false);
+  assert.equal(looksFederated(''), false);
 });

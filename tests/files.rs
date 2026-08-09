@@ -70,7 +70,7 @@ async fn query(state: &AppState, key: &str, sql: &str) -> Result<(Vec<String>, V
     collect(connection.execute(sql)).await
 }
 
-/// Run a `-- @duckdb` buffer and gather the whole result.
+/// Run a federated buffer and gather the whole result.
 async fn federated(state: &AppState, sql: &str) -> Result<(Vec<String>, Vec<Vec<Value>>)> {
     let program = alkyon::federation::program::parse(sql)?;
     collect(alkyon::federation::execute(
@@ -960,7 +960,7 @@ async fn a_project_source_resolves_its_path_against_the_open_folder() {
     assert!(error.to_string().contains("relative path"), "{error}");
 }
 
-/// A folder source is a source, so `@import` reaches it like any other — which
+/// A folder source is a source, so `IMPORT` reaches it like any other — which
 /// is what makes "join a database table to a parquet file" work without a single
 /// line of federation code that knows about folders.
 #[tokio::test]
@@ -987,9 +987,10 @@ async fn a_folder_source_can_be_imported_into_a_federated_query() {
 
     let (columns, rows) = federated(
         &state,
-        "-- @duckdb\n\
-         -- @import c = sales : select id, name, credit from customers\n\
-         -- @import t = budget : select name, target from targets\n\
+        "DEFINE\n\
+             IMPORT c = sales AS ( select id, name, credit from customers )\n\
+             IMPORT t = budget AS ( select name, target from targets )\n\
+         EVALUATE\n\
          select c.name, c.credit, t.target from c join t on t.name = c.name order by c.name;",
     )
     .await
@@ -1001,7 +1002,7 @@ async fn a_folder_source_can_be_imported_into_a_federated_query() {
     assert_eq!(rows[0][2].as_i64(), Some(500));
 }
 
-/// `@import x = source/*.parquet` — no SQL, so DuckDB reads the files itself.
+/// `FILES x = source/*.parquet` — no SQL, so DuckDB reads the files itself.
 ///
 /// The point is what does *not* happen: a materialised import turns every cell
 /// into a String in this process. A scan is a view, so a glob over a folder costs
@@ -1020,8 +1021,9 @@ async fn a_glob_import_unions_files_without_copying_them() {
 
     let (columns, rows) = federated(
         &state,
-        "-- @duckdb\n\
-         -- @import t = trips/2022/*.csv\n\
+        "DEFINE\n\
+             FILES t = trips/2022/*.csv\n\
+         EVALUATE\n\
          select count(*) as n, sum(total) as total from t;",
     )
     .await
@@ -1048,7 +1050,7 @@ async fn a_glob_import_stays_inside_its_source() {
 
     // Refused by the parser, before any path is built.
     for pattern in ["../*.csv", "a/../../secret.csv"] {
-        let sql = format!("-- @duckdb\n-- @import x = data/{pattern}\nselect * from x;");
+        let sql = format!("DEFINE\n    FILES x = data/{pattern}\nEVALUATE\nselect * from x;");
         assert!(
             federated(&state, &sql).await.is_err(),
             "`{pattern}` should have been refused"
@@ -1068,7 +1070,7 @@ async fn a_glob_import_stays_inside_its_source() {
         .unwrap();
     let Err(error) = federated(
         &state,
-        "-- @duckdb\n-- @import x = pg/whatever.parquet\nselect * from x;",
+        "DEFINE\n    FILES x = pg/whatever.parquet\nEVALUATE\nselect * from x;",
     )
     .await
     else {

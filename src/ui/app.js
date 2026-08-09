@@ -1,6 +1,6 @@
 import { api, runQuery } from './api.js';
 import { createBuffers } from './buffers.js';
-import { previewSql, quoteFor } from './dialect.js';
+import { looksFederated, previewSql, quoteFor } from './dialect.js';
 import { createEditor } from './editor.js';
 import { createExplorer } from './explorer.js';
 import { createPanes } from './panes.js';
@@ -273,21 +273,6 @@ addEventListener('beforeunload', (event) => {
 });
 
 // --------------------------------------------------------------- duckdb mode
-
-/**
- * Mirrors `federation::program::is_federated` for the badge only — the server
- * decides which engine actually runs the buffer, and its rules are the ones under
- * test. Kept to the same rule: the directive must be in the leading comments.
- */
-function looksFederated(text) {
-  for (const line of text.split('\n')) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-    if (!trimmed.startsWith('--')) return false;
-    if (/^\s*@duckdb\b/.test(trimmed.slice(2))) return true;
-  }
-  return false;
-}
 
 /** Reflect the buffer's mode in the chrome. Called on every edit and tab switch. */
 function paintMode() {
@@ -831,8 +816,8 @@ async function applyQualified(sql) {
   if (found.conflict) {
     status(
       `this statement names ${found.conflict.join(' and ')} — one query goes to one ` +
-        'source. To join across them, put `-- @duckdb` at the top, then `@attach` or ' +
-        '`@import` each.',
+        'source. To join across them, start the buffer with DEFINE and declare each ' +
+        'with ATTACH or IMPORT.',
       true,
     );
     return null;

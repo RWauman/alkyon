@@ -28,7 +28,7 @@ const DIRECTIVE = /^\s*(?:TARGET|SWAP)\s+([A-Za-z0-9._:-]+)\s*(?:;|$|\n)/i;
  * anyone keeps starts with a header. Requiring it at character zero meant the
  * directive did not work in the buffer that documents it.
  *
- * The server already reads `-- @duckdb` this way, so the two rules now agree.
+ * The server reads a federated buffer the same way, so the two rules agree.
  */
 const LEADING_COMMENTS = /^(?:[ \t]*(?:--[^\n]*)?\r?\n)*/;
 

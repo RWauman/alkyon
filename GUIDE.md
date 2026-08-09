@@ -259,7 +259,7 @@ is skipped.
   schema behind autocompletion, without re-probing every server in the sidebar. **✕**
   removes it, and asks first.
 - Because it is an ordinary source, a federated buffer can join it to a database
-  table — and `-- @import x = my-folder/*.parquet` does it without copying a row.
+  table — and `FILES x = my-folder/*.parquet` does it without copying a row.
   See [importing files without copying them](#importing-files-without-copying-them).
 
 A file DuckDB cannot parse — mixed line endings are the usual culprit — fails with
@@ -349,12 +349,12 @@ The defences are a cap and an escape hatch:
 - **200 000 documents** per collection, after which the query is refused rather
   than truncated, because a join quietly missing half its rows is worse than a
   query that failed. Raise it with `ALKYON_MONGO_MAX_DOCS`.
-- **`@import` for the times the server should do the work**, written as a real
+- **`IMPORT` for the times the server should do the work**, written as a real
   aggregation pipeline — nothing is translated, and only the result travels:
 
   ```text
-  -- @duckdb
-  -- @import top = mongo-dev/alkyon_demo : [{"$group": {"_id": "$sku", "n": {"$sum": 1}}}]
+  EVALUATE
+      IMPORT top = mongo-dev/alkyon_demo AS ( [{"$group": {"_id": "$sku", "n": {"$sum": 1}}}] )
   select * from top order by n desc limit 10;
   ```
 
@@ -428,7 +428,7 @@ two, which is exactly the sort of thing not worth doing by hand.
 
 Once connected it **is** a folder source: same catalogue, same `public` schema, a
 file at the root is a table, a subdirectory is one table over its files with a
-`source_file` column, and it federates with `@import` like anything else.
+`source_file` column, and it federates with `IMPORT` like anything else.
 
 ### It reads where the data lies
 
@@ -559,7 +559,7 @@ What it gives up, and it is worth knowing before you pick it:
 - **A query cannot be cancelled** once the server has it: the *Cancel* button stops
   alkyon waiting, not the server working.
 - **Third-party code**, and encryption without certificate validation — both
-  covered under [`@attach`](#sql-server-and-the-community-extension), and both apply
+  covered under [`ATTACH`](#sql-server-and-the-community-extension), and both apply
   here. A source set to *Require* is refused rather than quietly weakened.
 
 It works against any SQL Server, not only Fabric — but if the ordinary source can
@@ -763,9 +763,9 @@ Rules worth knowing:
   `alkyon_demo.sales.customer` is both a plausible typo and ordinary T-SQL — but
   once the engine has refused, the error names the source you probably meant.
 - **One statement, one source.** Naming two is an error that says to use
-  `-- @duckdb` and import each — joining across sources is what federation is
+  `DEFINE` and declare each — joining across sources is what federation is
   for, and it cannot be done by pointing somewhere.
-- A `-- @duckdb` buffer is left alone entirely: there, each `@import` names its
+- A federated buffer is left alone entirely: there, each declaration names its
   own source and there is no single target to point at.
 
 Completion after `TARGET` offers **your registered sources and nothing else** —
@@ -796,7 +796,7 @@ matter more than the syntax.
 | work in one place for a while | the **Source** picker | the editor, until you change it |
 | switch mid-file, in the file | `TARGET pg-prod.warehouse` | the editor, from that line on |
 | send *one* statement elsewhere | `"pg-prod".warehouse.sales.customer` | the editor, as a side effect |
-| **join across sources** | `-- @duckdb` and `@import` | nothing — every import names its own |
+| **join across sources** | `DEFINE` … `EVALUATE` | nothing — every declaration names its own |
 
 The first three all end with the editor pointed somewhere, and only ever at **one**
 source: a statement goes to one engine. The fourth is the only one that reads from
@@ -820,9 +820,11 @@ select count(*) from order_line;
 select passenger_count, count(*) from "taxi-data"."2022" group by 1;
 
 -- Two sources at once: this needs federation.
--- @duckdb
--- @import live  = pg-prod/warehouse : select id, name from sales.customer
--- @import trips = taxi-data/**/*.parquet
+EVALUATE
+DEFINE
+    IMPORT live  = pg-prod/warehouse AS ( select id, name from sales.customer )
+    FILES  trips = taxi-data/**/*.parquet
+EVALUATE
 select l.name, count(*) from live l join trips t on t.customer_id = l.id group by 1;
 ```
 
@@ -967,44 +969,69 @@ out of the tree.
 
 ## Join across sources — DuckDB
 
-Put `-- @duckdb` in the leading comments and the buffer runs in DuckDB instead of
-against one source. Every directive is a **SQL comment**, so the file stays a valid
-`.sql` that opens in SSMS or psql without complaint.
+A buffer that begins with **`DEFINE`** declares what it needs, then **`EVALUATE`**
+says what to return. It runs in DuckDB instead of against one source, and it is the
+one place where several engines meet.
 
 ```sql
--- @duckdb
--- @import customer = pg-prod/warehouse  : select id, name, credit from sales.customer
--- @import orders   = mssql-prod/sales   : select top 1000 order_id, customer_id, unit_price
-                                           from sales.order_line
--- @excel  budget   = budgets/2026.xlsx#Forecast
+DEFINE
+    ATTACH pg      = pg-prod/warehouse
+    IMPORT orders  = mssql-prod/sales AS (
+        SELECT TOP 1000 order_id, customer_id, unit_price
+        FROM sales.order_line
+        WHERE shipped_on >= '2026-01-01'
+    )
+    FILES  regions = exports/regions.parquet
+    EXCEL  budget  = budgets/2026.xlsx#Forecast
 
-select c.name, sum(o.unit_price) as total, b.target
-from customer c
-join orders o on o.customer_id = c.id
-left join '${folder}/data/regions.parquet' r on r.customer_id = c.id
-left join budget b on b.customer_id = c.id
-group by c.name, b.target;
+EVALUATE
+    select c.name, sum(o.unit_price) as total, b.target
+    from pg.sales.customer c
+    join orders o on o.customer_id = c.id
+    left join regions r on r.customer_id = c.id
+    left join budget b on b.customer_id = c.id
+    group by c.name, b.target;
 ```
 
-Each `@import` is written **in its own source's dialect** — `top` above is T-SQL and
-nothing rewrites it. The federated query on top is DuckDB SQL. No translation
+Each `IMPORT` is written **in its own source's dialect** — `TOP` above is T-SQL and
+nothing rewrites it. The query after `EVALUATE` is DuckDB SQL. No translation
 anywhere.
 
 ```text
--- @import <alias> = <source>[/<database>] : <SQL in that source's dialect>
--- @import <alias> = <folder source>/<path or glob>      -- no `:` — see below
--- @attach <alias> = <source>[/<database>]               -- PostgreSQL, MySQL
--- @excel  <alias> = <path>[#<sheet>]
+DEFINE
+    ATTACH <name> = <source>[/<database>]                  -- PostgreSQL, MySQL, SQL Server
+    IMPORT <name> = <source>[/<database>] AS ( <SQL> )     -- in that source's dialect
+    FILES  <name> = <folder source>/<path or glob>
+    EXCEL  <name> = <path>[#<sheet>]
+EVALUATE
+    <DuckDB SQL>
 ```
 
-### `@attach` — let DuckDB read the server itself
+**`EVALUATE` on its own** is a federated buffer with nothing declared — DuckDB, and
+whatever the open folder holds. That is also what the **⌗** button in the toolbar
+writes: it wraps the buffer you already have, because what you had *was* the thing
+to return.
 
-`@import` runs *your* SQL on the source. `@attach` hands DuckDB the live server and
+A name is claimed once, whichever keyword claims it, and the block is code rather
+than commentary: it is highlighted as code, `--` comments work inside it, and after
+`ATTACH x =` the completion offers the sources you have registered and nothing else.
+
+> **This replaced a set of `-- @import` comments, and they no longer work.** Those
+> kept the file a valid `.sql` that psql would parse, which was worth something;
+> what they cost was unreadability — no highlighting, no completion, and native SQL
+> crammed onto one line. Only the query reaches DuckDB now, preceded by as many
+> blank lines as the declarations occupied, so an error still names the line you are
+> looking at.
+
+### `ATTACH` — let DuckDB read the server itself
+
+`IMPORT` runs *your* SQL on the source. `ATTACH` hands DuckDB the live server and
 lets its planner write the remote query:
 
 ```sql
--- @duckdb
--- @attach pg = pg-prod/warehouse
+DEFINE
+    ATTACH pg = pg-prod/warehouse
+EVALUATE
 select name, credit from pg.sales.customer where country = 'BE';
 ```
 
@@ -1025,10 +1052,10 @@ server actually receives:
 
 So **projections and filters are pushed down; aggregations and joins are not.**
 
-- **`@attach`** when you want a slice of a large remote table, or to join across
+- **`ATTACH`** when you want a slice of a large remote table, or to join across
   engines without writing SQL per engine. Browsing is cheap: only the columns you
   name cross the wire.
-- **`@import`** when the remote engine should do the work — a `group by` over a
+- **`IMPORT`** when the remote engine should do the work — a `group by` over a
   hundred million rows, a window function, a hint, anything in a dialect DuckDB
   does not speak. There the server runs your SQL verbatim and only the answer
   travels.
@@ -1036,12 +1063,16 @@ So **projections and filters are pushed down; aggregations and joins are not.**
 Both in one buffer is normal, and often right:
 
 ```sql
--- @duckdb
--- @attach pg  = pg-prod/warehouse
--- @import agg = mssql-prod/sales : select customer_id, sum(unit_price) total
-                                    from sales.order_line group by customer_id
-select p.name, a.total
-from pg.sales.customer p join agg a on a.customer_id = p.id;
+DEFINE
+    ATTACH pg  = pg-prod/warehouse
+    IMPORT agg = mssql-prod/sales AS (
+        select customer_id, sum(unit_price) total
+        from sales.order_line group by customer_id
+    )
+
+EVALUATE
+    select p.name, a.total
+    from pg.sales.customer p join agg a on a.customer_id = p.id;
 ```
 
 **Which engines, and whose code.** PostgreSQL and MySQL use DuckDB's own **core**
@@ -1050,7 +1081,7 @@ once and run inside alkyon. That distinction is real and is covered below.
 
 MongoDB is not offered: its community extension is not published for every DuckDB
 build, and alkyon reads MongoDB itself anyway — see [MongoDB, queried in
-SQL](#mongodb-queried-in-sql). `@attach` on one says so and points at `@import`,
+SQL](#mongodb-queried-in-sql). `ATTACH` on one says so and points at `IMPORT`,
 which for it is not a workaround but the supported path.
 
 #### SQL Server, and the community extension
@@ -1059,15 +1090,16 @@ This is the interesting one, because it is a way into a place alkyon's own SQL
 Server path cannot reach:
 
 ```sql
--- @duckdb
--- @attach fab = fabric-endpoint
+DEFINE
+    ATTACH fab = fabric-endpoint
+EVALUATE
 select top_customers.name from fab.dbo.top_customers;
 ```
 
 The extension speaks TDS natively and takes an **Entra bearer token**, which is
 exactly what the browser sign-in already mints — so a Fabric or Azure SQL endpoint
 that the native connector cannot log into is worth trying here. Sign the source in
-as usual; `@attach` hands the token over. Filters reach the server: measured on the
+as usual; `ATTACH` hands the token over. Filters reach the server: measured on the
 demo schema, `where country = 'BE'` produced 83 rows at the scan rather than 250.
 
 Three things to know before relying on it.
@@ -1080,7 +1112,7 @@ Three things to know before relying on it.
   connection-string parameter changes that, and a certificate that cannot match the
   host is accepted anyway. So a source set to *Require*, which means *validate*, is
   **refused** rather than quietly given a weaker connection than it asked for. Use
-  `@import` for it, or set the source to *Trust certificate* if that is genuinely
+  `IMPORT` for it, or set the source to *Trust certificate* if that is genuinely
   acceptable there.
 - **A buffer can open its own connection.** Once the extension is in the session,
   an `ATTACH` written in your SQL reaches the network even though external access is
@@ -1089,13 +1121,13 @@ Three things to know before relying on it.
   alkyon never approved; a test pins the behaviour so the day it changes, the guide
   gets corrected.
 
-**It is READ_ONLY, with no opt-out.** `@import` cannot write at all, so this would
+**It is READ_ONLY, with no opt-out.** `IMPORT` cannot write at all, so this would
 otherwise be the one path in the program that mutates a production server. An
 `insert` against an attachment is refused by DuckDB itself.
 
 **The credential is DuckDB's to use, not alkyon's.** It opens its own connection, so
 it needs a login and a password: `integrated`, an Entra sign-in or a bearer token
-cannot be handed over, and `@attach` says so before anything is tried. Your
+cannot be handed over, and `ATTACH` says so before anything is tried. Your
 encryption choice does carry over — *Require* becomes libpq's `verify-full` and not
 its `require`, which encrypts without checking the certificate.
 
@@ -1113,8 +1145,10 @@ exception noted above.)
 Drop the `:` and the SQL, and the import becomes a **path**:
 
 ```sql
--- @duckdb
--- @import trips = taxi/*.parquet
+EVALUATE
+DEFINE
+    FILES trips = taxi/*.parquet
+EVALUATE
 select count(*) as rides, round(sum(total_amount)) as revenue from trips;
 ```
 
@@ -1123,8 +1157,8 @@ pattern is relative to the source's own path, and `*` / `**` are DuckDB's to
 expand — so `taxi/2022/*.parquet` and `taxi/**/*.csv` both work, and a dozen files
 become one table.
 
-**This is the one import that does not travel through Alkyon.** A normal `@import`
-pulls every row into this process and turns each cell into text; a path import is
+**This is the one import that does not travel through Alkyon.** A normal `IMPORT`
+pulls every row into this process and turns each cell into text; a FILES declaration is
 a *view* over the files, so DuckDB reads only the columns your query touches. On
 39.7 M rows across twelve parquet files: **270 ms**, and no row cap, because no row
 is ever copied.
@@ -1133,14 +1167,16 @@ It works on folder and file sources only — anything else has SQL to run, and s
 so. The pattern cannot leave the source: `..` and absolute paths are refused before
 a path is built, and the sandbox refuses whatever slips past.
 
-`@import` takes **any** registered source, folder sources included — so a parquet
+`IMPORT` takes **any** registered source, folder sources included — so a parquet
 file joins a production table without either side knowing about the other:
 
 ```sql
--- @duckdb
--- @import live  = pg-prod/warehouse : select id, name from sales.customer
--- @import bench = exports           : select id, target from benchmarks
-select l.name, b.target from live l join bench b on b.id = l.id;
+DEFINE
+    IMPORT live  = pg-prod/warehouse AS ( select id, name from sales.customer )
+    IMPORT bench = exports           AS ( select id, target from benchmarks )
+
+EVALUATE
+    select l.name, b.target from live l join bench b on b.id = l.id;
 ```
 
 **Exporting.** Straight DuckDB:
@@ -1157,8 +1193,8 @@ consulted.
 
 ### What to expect
 
-- **The rows travel through Alkyon** — for `@import … : <sql>` and `@excel`, not for
-  a path import or an `@attach`. Everything you wrote is pushed down, because the
+- **The rows travel through Alkyon** — for `IMPORT … AS ( … )` and `EXCEL`, not for
+  a FILES declaration or an `ATTACH`. Everything you wrote is pushed down, because the
   server is the one running it; what comes back is the result.
 - **There is no row cap.** There used to be one at a million rows, and it was really
   a memory limit wearing a row count: every cell was held as a `String` in this
@@ -1174,7 +1210,7 @@ consulted.
   had to be chosen; cast explicitly in the import if you need more.
 - **Sandbox**: each federated session can reach the open folder and nothing else,
   and is then frozen so a query cannot undo it. With no folder open it gets no file
-  access at all. Anything the session needs — an extension, an `@attach` — is
+  access at all. Anything the session needs — an extension, an `ATTACH` — is
   fetched *before* the freeze; your SQL is refused all of it, `install` included.
   Treat it as defence in depth, not a guarantee.
 
@@ -1216,8 +1252,8 @@ The theme button cycles Auto → Light → Dark and remembers your choice.
 | `ALKYON_SHELL` | PowerShell / `$SHELL` | what the terminal spawns |
 | `ALKYON_TERMINAL` | loopback only | `always` to expose the terminal elsewhere |
 | `ALKYON_PAGE_ROWS` | `50000` | rows in one page of a result |
-| `ALKYON_IMPORT_MAX_ROWS` | — | opt-in ceiling on one federated `@import` |
-| `ALKYON_COMMUNITY_EXTENSIONS` | on | `off` refuses DuckDB community extensions, and with them `@attach` on SQL Server |
+| `ALKYON_IMPORT_MAX_ROWS` | — | opt-in ceiling on one federated `IMPORT` |
+| `ALKYON_COMMUNITY_EXTENSIONS` | on | `off` refuses DuckDB community extensions, and with them `ATTACH` on SQL Server |
 | `ALKYON_LOG` | `alkyon=info` | `tracing` filter |
 
 `ALKYON_CONFIG_DIR` is what makes a container or a portable install work — the
