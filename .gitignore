@@ -1,6 +1,7 @@
 # Credentials
 .env
 .env-github/
+/.claude
 
 # An ALKYON_SOURCES import file, which does carry passwords. Anchored to the root
 # on purpose: a project's `.alkyon/sources.json` holds no credential and is meant
@@ -31,3 +32,12 @@
 # `python docker/seed/make-sample-files.py`. Regenerated on demand, so the script
 # is the artefact worth committing and its output is not.
 /sample-data
+
+# Carries the GitHub App ids and reads the key beside them. Neither is a secret,
+# but it belongs next to the credentials it uses rather than in the history.
+.github-release.py
+
+# Release artefacts, built into the working tree and uploaded from it.
+alkyon-*-x86_64
+alkyon-*-x86_64.exe
+SHA256SUMS

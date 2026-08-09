@@ -10,6 +10,12 @@ no binary yet.
 
 ## 0.2.0 — 2026-08-09
 
+**The Linux binary needs `libdbus-1.so.3`** — `libdbus-1-3` on Debian and Ubuntu,
+`dbus-libs` on Fedora. It is there on any desktop; a slim container has to install
+it, or alkyon exits before it prints anything. The credential vault reaches the
+keychain through the Secret Service, which is what pulls it in — including when
+you run with `ALKYON_VAULT=memory` and never touch a keychain at all.
+
 ### Folder sources, rebuilt around directories
 
 - **A file at the root is a table, and a subdirectory is one table over its files** —
