@@ -190,7 +190,7 @@
 
 <dialog id="source-dialog">
   <form id="source-form" method="dialog">
-    <h2>Register a source</h2>
+    <h2 id="source-title">Register a source</h2>
 
     <!-- Engine first: it decides which of the fields below even apply, so
          choosing it before naming the thing is the order the form works in. -->
@@ -313,6 +313,9 @@
     </label>
     <label class="auth-password">Username <input name="username"></label>
     <label class="auth-password">Password <input name="password" type="password"></label>
+    <!-- Only while editing: the password never comes back out of the API, so an
+         empty box is the only thing a reopened form can mean by "unchanged". -->
+    <p class="hint edit-only" id="password-hint" hidden>Leave the password empty to keep the stored one.</p>
     <label class="auth-aad_token">Access token <input name="token" type="password"
       placeholder="az account get-access-token --resource https://database.windows.net/"></label>
 

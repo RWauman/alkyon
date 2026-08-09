@@ -551,6 +551,7 @@ const explorer = createExplorer($('explorer'), {
     if (source.key === state.source?.key) paintSourceStatus();
   },
   onSelectSource: (source) => selectSource(source.key),
+  onEditSource: (source) => openSourceDialog(null, source),
   // Awaited so the database list is in place before we pick from it — otherwise
   // a slow `/databases` response resets the choice a moment later.
   onSelectDatabase: async (source, db) => {
@@ -1543,9 +1544,89 @@ function inWorkspace(relative) {
  * cannot say is which CSV options the files need, so those stay at their sniffed
  * defaults — the prefill saves the typing, not the thinking.
  */
-function openSourceDialog(entry = null) {
+/**
+ * The source being edited, or `null` when the dialogue is adding one.
+ *
+ * Held outside the form because the *key* is what identifies the source to the
+ * API, and the form's id field is precisely the thing an edit may change.
+ */
+let editing = null;
+
+/** Fill the form from a summary. The credential is not in one, and must not be. */
+function fillFrom(source) {
+  const set = (name, value) => {
+    if (form.elements[name] && value != null) form.elements[name].value = value;
+  };
+  set('id', source.id);
+  set('scope', source.scope);
+  set('kind', source.kind);
+  set('tls', source.tls);
+  set('method', source.auth_method);
+
+  if (source.path) {
+    if (source.kind === 'adls') {
+      set('account', source.host);
+      set('adls-path', source.path);
+    } else if (source.kind === 'file') {
+      set('file-path', source.path);
+    } else {
+      $('folder-path').value = source.path;
+    }
+    if (source.options?.format) set('format', source.options.format);
+    // The rest of the format options are per-type and live under `options`.
+    for (const [key, value] of Object.entries(source.options ?? {})) {
+      if (key !== 'format') set(key, value);
+    }
+  } else {
+    set('host', source.host);
+    // A default port is the backend's to choose, so it is not written into the
+    // box — leaving it empty keeps that true after an edit.
+    if (source.port && source.port !== 0) set('port', source.port);
+    set('database', source.database);
+    set('instance', source.instance);
+  }
+
+  set('username', source.username);
+  set('tenant', source.tenant);
+  set('client_id', source.client_id);
+  // Shown, not held: there is no ticket behind it, and the credential stays where
+  // it is unless a fresh sign-in replaces it.
+  if (source.account) paintSignIn(`Signed in as ${source.account}`);
+}
+
+/**
+ * Whether this submission means "keep the credential already in the vault".
+ *
+ * The password never comes back out of the API, so a reopened form cannot send it
+ * back in. An untouched box is therefore the only way to say *unchanged* — and a
+ * changed sign-in method is the one case where the stored credential is no use,
+ * since a refresh token is not a password.
+ */
+function keepingSecret() {
+  if (!editing) return false;
+  const method = form.elements.kind.value === 'adls' ? 'entra' : form.elements.method.value;
+  if (method !== editing.auth_method) return false;
+  switch (method) {
+    case 'password':
+      return !form.elements.password.value;
+    case 'aad_token':
+      return !form.elements.token.value;
+    // A finished sign-in in the dialogue replaces the stored one; without it,
+    // the refresh token already in the vault is what keeps the source working.
+    case 'entra':
+      return !(signIn.ticket && signIn.account);
+    default:
+      return true;
+  }
+}
+
+function openSourceDialog(entry = null, source = null) {
+  editing = source;
   form.reset();
   note();
+  $('source-title').textContent = source ? `Edit ${source.key}` : 'Register a source';
+  $('source-save').textContent = source ? 'Connect and save' : 'Connect and save';
+  $('password-hint').hidden = !source;
   // `form.reset()` does not know about a sign-in held outside the form.
   resetSignIn();
   // A project source has nowhere to live without an open folder.
@@ -1568,6 +1649,8 @@ function openSourceDialog(entry = null) {
     form.elements.scope.value = 'project';
   }
 
+  if (source) fillFrom(source);
+
   syncDialogFields();
   // `form.reset()` restores the values, but the last folder's file list is still
   // in the DOM.
@@ -1578,7 +1661,10 @@ function openSourceDialog(entry = null) {
 
 $('add-source').addEventListener('click', () => openSourceDialog());
 
-$('source-cancel').addEventListener('click', () => dialog.close());
+$('source-cancel').addEventListener('click', () => {
+  editing = null;
+  dialog.close();
+});
 
 /** The one line of feedback under the form. No argument clears it. */
 function note(text, kind) {
@@ -1723,7 +1809,9 @@ async function withFeedback(button, busyLabel, action) {
  * Returns the complaint, or nothing when there is none.
  */
 function complaint(config) {
-  if (config.auth.method === 'entra' && !config.auth.ticket) {
+  // An edit that keeps the stored credential has nothing to sign in for: the
+  // refresh token in the vault is what the source has been using all along.
+  if (config.auth.method === 'entra' && !config.auth.ticket && !keepingSecret()) {
     return signIn.ticket ? 'wait for the sign-in to finish' : 'sign in first';
   }
   if (config.kind === 'adls') {
@@ -1745,7 +1833,11 @@ $('source-test').addEventListener('click', () => {
   if (wrong) return note(`${wrong} to test`, 'bad');
 
   withFeedback($('source-test'), 'Testing…', async () => {
-    const result = await api.testConnection(config);
+    // Testing an edit has to use the same credential saving it would, or the
+    // button would contradict the sentence under the password box.
+    const result = await api.testConnection(
+      keepingSecret() ? { ...config, keep_secret_of: editing.key } : config,
+    );
     note(
       files
         ? `Readable in ${result.latency_ms} ms.`
@@ -1761,14 +1853,24 @@ form.addEventListener('submit', (event) => {
   const wrong = complaint(config);
   if (wrong) return note(wrong, 'bad');
   withFeedback($('source-save'), 'Connecting…', async () => {
-    const summary = await api.addSource(config);
+    const summary = editing
+      ? await api.updateSource(editing.key, { ...config, keep_secret: keepingSecret() })
+      : await api.addSource(config);
+    const renamed = editing && editing.key !== summary.key;
     dialog.close();
     // The ticket was spent registering it; holding on to a stale one would let
     // the next dialogue think it is already signed in.
     resetSignIn();
     await loadSources({ keep: false });
     await selectSource(summary.key);
-    status(`registered ${summary.key}`);
+    status(
+      editing
+        ? renamed
+          ? `renamed ${editing.key} to ${summary.key}`
+          : `updated ${summary.key}`
+        : `registered ${summary.key}`,
+    );
+    editing = null;
   });
 });
 

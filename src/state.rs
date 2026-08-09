@@ -448,6 +448,86 @@ impl AppState {
         Ok(summary)
     }
 
+    /// Put `config` in place of the source at `key`, which it may rename, move to
+    /// the other registry, or point somewhere else entirely.
+    ///
+    /// A replace rather than a remove-then-register, because the two halves must
+    /// not be separable: a rename that failed after the removal would have thrown
+    /// the source away to save an edit. The old vault entry goes only when the new
+    /// credential lives somewhere else — writing it and then deleting "the old one"
+    /// under an unchanged key would erase what was just stored.
+    pub async fn replace(&self, key: &str, config: SourceConfig) -> Result<SourceSummary> {
+        let old = self.record(key).await?;
+        let old_key = old.key();
+        let old_vault = self.vault_key(&old).await;
+
+        let (record, secret) = config.split();
+        if record.scope == Scope::Project && self.workspace().await.is_none() {
+            return Err(Error::BadRequest(
+                "a project source needs an open folder to live in".into(),
+            ));
+        }
+        let new_key = record.key();
+        let new_vault = self.vault_key(&record).await;
+
+        // A cached schema must not outlive the source it describes — and after a
+        // rename it would be filed under a name nothing asks about again.
+        self.schema.forget(&old_key).await;
+
+        let mut sources = self.sources.write().await;
+        if new_key != old_key && sources.contains_key(&new_key) {
+            return Err(Error::DuplicateSource(new_key));
+        }
+
+        if let Some(secret) = secret {
+            self.vault.store(&new_vault, &secret)?;
+        }
+        if new_vault != old_vault {
+            self.vault.delete(&old_vault)?;
+        }
+
+        sources.remove(&old_key);
+        let summary = record.summary(self.dialect(record.kind));
+        sources.insert(new_key, record);
+        self.persist(&sources).await?;
+        Ok(summary)
+    }
+
+    /// Fill `config` in with the credential already in the vault.
+    ///
+    /// What lets the dialogue reopen on an existing source without the password
+    /// ever coming back out of the API to be shown in a form and posted again. An
+    /// empty box therefore means *keep it*, and changing one means change it.
+    pub async fn keep_secret(&self, key: &str, config: SourceConfig) -> Result<SourceConfig> {
+        let record = self.record(key).await?;
+        let (mut incoming, _) = config.split();
+
+        // The account is display-only and the form has no box for it, so an edit
+        // that kept the sign-in would otherwise blank out "signed in as …".
+        if let (crate::model::AuthKind::Entra { account, .. }, Some(old)) =
+            (&mut incoming.auth, record.auth.account())
+        {
+            if account.is_empty() {
+                *account = old.to_owned();
+            }
+        }
+
+        // The stored credential belongs to the method that stored it: a refresh
+        // token is not a password. Changing the method means supplying the new one.
+        if record.auth.method() != incoming.auth.method() {
+            return Err(Error::BadRequest(format!(
+                "the sign-in method changed from `{}` to `{}`, so the credential has to be \
+                 given again",
+                record.auth.method(),
+                incoming.auth.method()
+            )));
+        }
+        if !incoming.auth.needs_secret() {
+            return incoming.with_secret(None);
+        }
+        incoming.with_secret(self.load_secret(&record).await?)
+    }
+
     pub async fn remove(&self, key: &str) -> Result<()> {
         // Resolve first, so a bare id removes the right one — and errors the same
         // way `record` does when it is ambiguous.

@@ -59,8 +59,13 @@ export const api = {
   shells: () => call('GET', '/shells'),
   sources: () => call('GET', '/sources'),
   addSource: (config) => call('POST', '/sources', config),
+  // The body carries `keep_secret`, which is how a reopened form says the
+  // password box was left alone rather than emptied.
+  updateSource: (id, body) => call('PUT', `/sources/${q(id)}`, body),
   /** Verify credentials without registering anything. */
-  testConnection: (config) => call('POST', '/connection-test', config),
+  // `keep_secret_of` names an existing source when testing an edit, whose
+  // password the form never received and so cannot send back.
+  testConnection: (body) => call('POST', '/connection-test', body),
   /** Always resolves: `{ ok: false, error }` when the server is unreachable. */
   status: (id) => call('GET', `/sources/${q(id)}/status`),
   removeSource: (id) => call('DELETE', `/sources/${q(id)}`),

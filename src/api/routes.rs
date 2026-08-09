@@ -22,7 +22,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         // happens to be `test`.
         .route("/connection-test", post(test_connection))
         .route("/shells", get(super::terminal::shells))
-        .route("/sources/{id}", delete(remove_source))
+        .route("/sources/{id}", delete(remove_source).put(update_source))
         .route("/sources/{id}/status", get(source_status))
         .route("/sources/{id}/databases", get(databases))
         .route("/sources/{id}/tables", get(tables))
@@ -64,6 +64,18 @@ async fn add_source(
     State(state): State<Arc<AppState>>,
     Json(config): Json<SourceConfig>,
 ) -> Result<(StatusCode, Json<SourceSummary>)> {
+    check(&config)?;
+    // The sign-in becomes the credential here, before anything is stored: the
+    // record keeps the refresh token, the connection below uses an access token
+    // minted from it.
+    let config = state.redeem_sign_in(config)?;
+    prove(&state, &config).await?;
+    let summary = state.register(config).await?;
+    Ok((StatusCode::CREATED, Json(summary)))
+}
+
+/// Everything the wire format cannot say about itself.
+fn check(config: &SourceConfig) -> Result<()> {
     if config.id.trim().is_empty() {
         return Err(Error::BadRequest("source id must not be empty".into()));
     }
@@ -86,16 +98,49 @@ async fn add_source(
             "format options only apply to a folder or file source".into(),
         ));
     }
-    // The sign-in becomes the credential here, before anything is stored: the
-    // record keeps the refresh token, the connection below uses an access token
-    // minted from it.
-    let config = state.redeem_sign_in(config)?;
-    // Reject bad credentials now rather than on the first query, and before the
-    // secret goes anywhere near the vault.
+    Ok(())
+}
+
+/// Reject bad credentials now rather than on the first query, and before the
+/// secret goes anywhere near the vault.
+async fn prove(state: &AppState, config: &SourceConfig) -> Result<()> {
     let connecting = state.authorise(config.clone(), None).await?;
     state.connector(connecting.kind).connect(&connecting).await?;
-    let summary = state.register(config).await?;
-    Ok((StatusCode::CREATED, Json(summary)))
+    Ok(())
+}
+
+/// What the dialogue sends when it is editing rather than adding.
+#[derive(Deserialize)]
+struct SourceUpdate {
+    #[serde(flatten)]
+    config: SourceConfig,
+    /// Use the credential already in the vault instead of the one in `auth`.
+    ///
+    /// The password is never sent back out of the API, so a form reopened on an
+    /// existing source has no way to send it back in. An empty box means *keep
+    /// it*; typing in one means change it.
+    #[serde(default)]
+    keep_secret: bool,
+}
+
+/// Replace a source: rename it, point it elsewhere, or give it a new password.
+///
+/// The same shape as adding one, including connecting before anything is written,
+/// so an edit that would break the source fails in the dialogue rather than at the
+/// next query.
+async fn update_source(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(update): Json<SourceUpdate>,
+) -> Result<Json<SourceSummary>> {
+    check(&update.config)?;
+    let config = if update.keep_secret {
+        state.keep_secret(&id, update.config).await?
+    } else {
+        state.redeem_sign_in(update.config)?
+    };
+    prove(&state, &config).await?;
+    Ok(Json(state.replace(&id, config).await?))
 }
 
 // ---------------------------------------------------------------- Entra sign-in
@@ -168,17 +213,35 @@ async fn sign_in_status(
     Json(body)
 }
 
+/// What the dialogue's *Test* button sends.
+#[derive(Deserialize)]
+struct TestRequest {
+    #[serde(flatten)]
+    config: SourceConfig,
+    /// The source whose stored credential to use, when testing an **edit**.
+    ///
+    /// Without this, *Test* would contradict the sentence next to the password
+    /// box: the form says an empty box keeps the stored password, and then testing
+    /// would send the empty one and be told the login failed.
+    #[serde(default)]
+    keep_secret_of: Option<String>,
+}
+
 /// Try the credentials without registering anything — the dialogue's *Test*
 /// button. `POST /sources` already validates before saving; this is the same
 /// check without the commitment.
 async fn test_connection(
     State(state): State<Arc<AppState>>,
-    Json(config): Json<SourceConfig>,
+    Json(request): Json<TestRequest>,
 ) -> Result<Json<Value>> {
     let started = Instant::now();
+    let config = match &request.keep_secret_of {
+        Some(key) => state.keep_secret(key, request.config).await?,
+        None => state.borrow_sign_in(request.config)?,
+    };
     // Nothing is stored, so nothing is cached and no rotated token is written
     // back: this token is minted for one connection and dropped.
-    let config = state.authorise(state.borrow_sign_in(config)?, None).await?;
+    let config = state.authorise(config, None).await?;
     state.connector(config.kind).connect(&config).await?;
     Ok(Json(json!({
         "ok": true,

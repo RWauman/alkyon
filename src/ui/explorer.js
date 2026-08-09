@@ -16,6 +16,7 @@ import { quoteFor } from './dialect.js';
  * @param {() => Promise<Node[]>} [spec.load]  children, fetched on first expand
  * @param {() => void} [spec.onSelect]
  * @param {() => void} [spec.onActivate]  double click
+ * @param {() => void} [spec.onEdit]      shows an edit affordance
  * @param {() => void} [spec.onRemove]    shows a delete affordance
  * @param {(reload: () => Promise<void>) => void} [spec.onRefresh]  shows a reload
  *        affordance, and is handed the way to rebuild this row's children
@@ -29,6 +30,7 @@ function makeNode({
   load,
   onSelect,
   onActivate,
+  onEdit,
   onRemove,
   onRefresh,
 }) {
@@ -120,7 +122,7 @@ function makeNode({
     }
   };
 
-  if (onRefresh || onRemove) {
+  if (onRefresh || onRemove || onEdit) {
     const spacer = document.createElement('span');
     spacer.className = 'spacer';
     row.append(spacer);
@@ -135,6 +137,17 @@ function makeNode({
       onRefresh(reload);
     });
     row.append(again);
+  }
+  if (onEdit) {
+    const pencil = document.createElement('button');
+    pencil.className = 'drop';
+    pencil.title = `Edit ${label}`;
+    pencil.textContent = '✎';
+    pencil.addEventListener('click', (event) => {
+      event.stopPropagation();
+      onEdit();
+    });
+    row.append(pencil);
   }
   if (onRemove) {
     const drop = document.createElement('button');
@@ -319,6 +332,7 @@ export function createExplorer(element, hooks) {
         await hooks.onRefreshed?.(source);
         hooks.onStatus(`re-read ${source.key}`);
       },
+      onEdit: () => hooks.onEditSource(source),
       onRemove: async () => {
         const confirmed = await hooks.onConfirm({
           title: `Remove ${source.key}?`,

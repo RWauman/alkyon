@@ -3,7 +3,8 @@
 //! Pointed at the **dev SQL Server container**, not at Fabric: a Fabric endpoint is
 //! not something a test suite can conjure. What that proves is everything except
 //! the login on a routed node — the dialect, the metadata, the types, the
-//! read-only edge — which is the part this code is responsible for.
+//! read-only edge — which is the part this code is responsible for. The login
+//! itself has been confirmed by hand against a real endpoint.
 //!
 //!     docker compose -f docker/compose.dev.yml up -d mssql
 //!     ALKYON_SOURCES=docker/sources.dev.json cargo test --test fabric

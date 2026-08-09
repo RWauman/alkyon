@@ -100,6 +100,25 @@ project's `warehouse` can coexist. Where a name could mean either, write
 A green dot next to each source says whether it answered. It is checked when the
 list loads and on **↻**, not on a timer.
 
+### Editing one
+
+**✎** on a source row reopens the dialogue on it — to rename it, point it at
+another host or database, move it between registries, or give it the password that
+changed this morning.
+
+**Leave the password box empty to keep the one in the vault.** That is not a
+convenience: the password never comes back out of the API, so an empty box is the
+only thing a reopened form can honestly mean by *unchanged*. Type in it and the new
+one replaces it. The same goes for a pasted token, and for a sign-in — an Entra
+source keeps its refresh token unless you sign in again in the dialogue.
+
+Changing the *method* is the one case where nothing can be kept: a refresh token is
+not a password, so alkyon says so rather than guessing.
+
+An edit **connects before it writes**, exactly as adding one does, so an edit that
+would break the source fails in the dialogue and leaves the old one working. A
+rename onto a name already taken is a conflict, not a silent overwrite.
+
 ## A folder, or one file, as a source
 
 Two separate kinds — **Folder of data files** and **One data file** — because they
@@ -1220,6 +1239,7 @@ The UI is only a client; everything is reachable directly.
 | GET | `/files?path=&format=` | the data files a folder holds, relative to it — the source dialog's file list |
 | POST | `/auth/entra` | begin a sign-in — `{"kind":"ms_sql"}` opens a browser, `"device_code":true` returns a code to type elsewhere. Answers a `ticket` |
 | GET | `/auth/entra/{ticket}` | `pending`, `ready` with the account, `failed` with why, or `unknown` once swept. A source then registers with `{"auth":{"method":"entra","ticket":…}}` |
+| PUT | `/sources/{key}` | replace it — rename, repoint, new password; connects first. `"keep_secret": true` reuses the credential in the vault |
 | DELETE | `/sources/{key}` | also deletes the keychain entry |
 | POST | `/connection-test` | try credentials without registering |
 | GET | `/sources/{key}/status` | reachable now? always 200; the answer is in the body |

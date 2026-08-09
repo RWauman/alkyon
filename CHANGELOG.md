@@ -63,6 +63,22 @@ no binary yet.
   collection where one field is in turn an integer, a string, a double, a document
   and an array.
 
+### Editing a source
+
+- **✎ on a source row reopens the dialogue on it** — rename it, point it at another
+  host or database, move it between registries, or give it a password that changed.
+  `PUT /sources/{key}` behind it, connecting before it writes exactly as adding one
+  does, so a bad edit fails in the dialogue and leaves the old source working.
+- **An empty password box keeps the stored one.** Not a convenience: the password
+  never comes back out of the API, so that is the only thing a reopened form can
+  honestly mean by *unchanged*. The same for a pasted token, and for a sign-in —
+  an Entra source keeps its refresh token unless you sign in again.
+- Changing the sign-in *method* is refused with a sentence rather than guessing: a
+  refresh token is not a password.
+- A rename onto a name already taken is a **conflict**, and takes nothing with it.
+- `/sources` now carries `username`, `tenant` and `client_id` — none of them
+  secrets, all of them things an edit would otherwise have silently reset.
+
 ### A Fabric SQL endpoint in the explorer
 
 - **New source kind: *Microsoft Fabric SQL endpoint — via DuckDB*.** It reaches the
@@ -79,9 +95,9 @@ no binary yet.
   sentence saying so), one result set per run, about a second to open every query,
   and a running query cannot be cancelled. If the ordinary SQL Server source can
   connect, prefer it.
-- Tested against the dev SQL Server container rather than Fabric — a Fabric endpoint
-  is not something a suite can conjure, so what is proven is everything except the
-  login on a routed node.
+- The suite runs against the dev SQL Server container, since a Fabric endpoint is
+  not something a test can conjure — but **a real endpoint has been connected to**,
+  which is the half the suite could not prove.
 
 ### Federation
 
@@ -98,7 +114,7 @@ no binary yet.
 - **A Fabric SQL endpoint is worth trying again.** The `mssql` extension speaks TDS
   itself and takes the Entra bearer token the browser sign-in already mints, so it
   does not go through `tiberius` and does not hit the routing wall documented in the
-  guide. Untested against a real endpoint — one `@attach` line will tell.
+  guide. **Confirmed against a real Fabric endpoint.**
 - **SQL Server refuses *Require* rather than weakening it.** That extension encrypts
   but never validates a certificate — measured: no parameter changes it, and a
   certificate that cannot match the host is accepted anyway. So a source that asked

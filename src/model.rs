@@ -546,6 +546,27 @@ impl AuthKind {
             _ => None,
         }
     }
+
+    /// The login name. **Not** a secret — the password is — and the dialogue needs
+    /// it to reopen on an existing source without wiping it.
+    pub fn username(&self) -> Option<&str> {
+        match self {
+            AuthKind::Password { username } => Some(username),
+            _ => None,
+        }
+    }
+
+    /// The Entra tenant and application this source signs in through, when they
+    /// are not the defaults. Same reason: an edit that could not see them would
+    /// silently reset them.
+    pub fn entra(&self) -> Option<(&str, &str)> {
+        match self {
+            AuthKind::Entra {
+                tenant, client_id, ..
+            } => Some((tenant, client_id)),
+            _ => None,
+        }
+    }
 }
 
 /// A registered source, as persisted and as served by the API: everything about
@@ -622,6 +643,11 @@ impl SourceRecord {
             database: self.database(),
             auth_method: self.auth.method(),
             account: self.auth.account().map(str::to_owned),
+            // Everything the dialogue needs to reopen on this source without
+            // losing something. None of it is a credential.
+            username: self.auth.username().map(str::to_owned),
+            tenant: self.auth.entra().map(|(tenant, _)| tenant.to_owned()),
+            client_id: self.auth.entra().map(|(_, client)| client.to_owned()),
             tls: self.tls,
             editor_mime: dialect.mime(),
         }
@@ -775,6 +801,15 @@ pub struct SourceSummary {
     /// Who a signed-in source is signed in as. Absent for every other method.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub account: Option<String>,
+    /// The login name of a password source. Not a secret; the password is, and it
+    /// never leaves the vault.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    /// The Entra tenant and application a signed-in source uses.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tenant: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
     pub tls: TlsMode,
     /// Which CodeMirror mode the editor should switch to for this source. The
     /// backend owns dialect knowledge; the UI just applies what it is told.

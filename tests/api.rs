@@ -32,10 +32,23 @@ async fn get(state: Arc<AppState>, uri: &str) -> (StatusCode, String) {
 }
 
 async fn post(state: Arc<AppState>, uri: &str, body: &Value) -> (StatusCode, String) {
+    send(state, "POST", uri, body).await
+}
+
+async fn put(state: Arc<AppState>, uri: &str, body: &Value) -> (StatusCode, String) {
+    send(state, "PUT", uri, body).await
+}
+
+async fn send(
+    state: Arc<AppState>,
+    method: &str,
+    uri: &str,
+    body: &Value,
+) -> (StatusCode, String) {
     let response = alkyon::api::router(state)
         .oneshot(
             Request::builder()
-                .method("POST")
+                .method(method)
                 .uri(uri)
                 .header("content-type", "application/json")
                 .body(Body::from(body.to_string()))
@@ -184,6 +197,164 @@ async fn metadata_routes_answer_without_leaking_credentials() {
         assert_eq!(id_column["is_primary_key"], true);
         assert_eq!(id_column["nullable"], false);
     }
+}
+
+/// Editing a source: rename it, point it elsewhere, change its password — without
+/// the password ever having come back out of the API to be sent back in.
+#[tokio::test]
+async fn a_source_can_be_edited_and_renamed() {
+    let Some(path) = std::env::var_os("ALKYON_SOURCES") else {
+        eprintln!("skipped: ALKYON_SOURCES is not set");
+        return;
+    };
+    let raw = std::fs::read_to_string(&path).unwrap();
+    let definitions: Vec<Value> = serde_json::from_str(&raw).unwrap();
+    let Some(original) = definitions
+        .iter()
+        .find(|source| source["kind"] == "postgres")
+        .cloned()
+    else {
+        eprintln!("skipped: no PostgreSQL source");
+        return;
+    };
+    let state = AppState::new();
+    let (status, body) = post(Arc::clone(&state), "/sources", &original).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let id = original["id"].as_str().unwrap();
+
+    // The dialogue never receives the password, so it cannot send one back. An
+    // untouched box is `keep_secret`, and the edit still has to *connect* — which
+    // it can only do with the credential in the vault.
+    let mut renamed = original.clone();
+    renamed["id"] = json!("warehouse");
+    renamed["auth"]["password"] = json!("");
+    let mut body = renamed.clone();
+    body["keep_secret"] = json!(true);
+    let (status, said) = put(Arc::clone(&state), &format!("/sources/{id}"), &body).await;
+    assert_eq!(status, StatusCode::OK, "{said}");
+
+    let listed = get_json(Arc::clone(&state), "/sources").await;
+    let ids: Vec<&str> = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["warehouse"], "the old name is gone, not duplicated");
+    // And it still works, which is the whole point of keeping the credential.
+    let databases = get_json(Arc::clone(&state), "/sources/warehouse/databases").await;
+    assert!(!databases.as_array().unwrap().is_empty());
+
+    // The same edit without `keep_secret` sends the empty password for real, and
+    // the server refuses it rather than storing something that cannot connect.
+    let (status, said) = put(Arc::clone(&state), "/sources/warehouse", &renamed).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{said}");
+    // Refused before anything was written: the source still answers.
+    let databases = get_json(Arc::clone(&state), "/sources/warehouse/databases").await;
+    assert!(!databases.as_array().unwrap().is_empty());
+}
+
+/// *Test* on an edit has to use the same credential *save* would.
+///
+/// Found by clicking it: the dialogue says an empty password box keeps the stored
+/// one, and testing sent the empty one instead — so the button contradicted the
+/// sentence right above it and reported a login failure on a source that works.
+#[tokio::test]
+async fn testing_an_edit_uses_the_stored_credential() {
+    let Some(path) = std::env::var_os("ALKYON_SOURCES") else {
+        eprintln!("skipped: ALKYON_SOURCES is not set");
+        return;
+    };
+    let raw = std::fs::read_to_string(&path).unwrap();
+    let definitions: Vec<Value> = serde_json::from_str(&raw).unwrap();
+    let Some(original) = definitions
+        .iter()
+        .find(|source| source["kind"] == "postgres")
+        .cloned()
+    else {
+        return;
+    };
+    let state = AppState::new();
+    post(Arc::clone(&state), "/sources", &original).await;
+    let id = original["id"].as_str().unwrap();
+
+    let mut blank = original.clone();
+    blank["auth"]["password"] = json!("");
+
+    // Without the hint, the empty password is taken at face value and refused.
+    let (status, _) = post(Arc::clone(&state), "/connection-test", &blank).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+
+    // With it, the vault answers for the box the form could never have filled.
+    let mut kept = blank.clone();
+    kept["keep_secret_of"] = json!(id);
+    let (status, said) = post(state, "/connection-test", &kept).await;
+    assert_eq!(status, StatusCode::OK, "{said}");
+    assert!(said.contains("\"ok\":true"), "{said}");
+}
+
+/// A rename onto a name already taken is a conflict, not a silent overwrite of
+/// somebody else's source.
+#[tokio::test]
+async fn a_rename_cannot_land_on_an_existing_source() {
+    let Some(path) = std::env::var_os("ALKYON_SOURCES") else {
+        eprintln!("skipped: ALKYON_SOURCES is not set");
+        return;
+    };
+    let raw = std::fs::read_to_string(&path).unwrap();
+    let definitions: Vec<Value> = serde_json::from_str(&raw).unwrap();
+    let Some(original) = definitions
+        .iter()
+        .find(|source| source["kind"] == "postgres")
+        .cloned()
+    else {
+        return;
+    };
+    let state = AppState::new();
+    post(Arc::clone(&state), "/sources", &original).await;
+    let mut second = original.clone();
+    second["id"] = json!("other");
+    post(Arc::clone(&state), "/sources", &second).await;
+
+    let mut body = original.clone();
+    body["id"] = json!("other");
+    body["keep_secret"] = json!(true);
+    let id = original["id"].as_str().unwrap();
+    let (status, said) = put(Arc::clone(&state), &format!("/sources/{id}"), &body).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{said}");
+
+    // Both are still there — the failed rename took nothing with it.
+    let listed = get_json(state, "/sources").await;
+    assert_eq!(listed.as_array().unwrap().len(), 2);
+}
+
+/// The stored credential belongs to the method that stored it: a refresh token is
+/// not a password, so switching method means supplying the new one.
+#[tokio::test]
+async fn keeping_a_secret_across_a_changed_method_is_refused() {
+    let Some(path) = std::env::var_os("ALKYON_SOURCES") else {
+        eprintln!("skipped: ALKYON_SOURCES is not set");
+        return;
+    };
+    let raw = std::fs::read_to_string(&path).unwrap();
+    let definitions: Vec<Value> = serde_json::from_str(&raw).unwrap();
+    let Some(original) = definitions
+        .iter()
+        .find(|source| source["kind"] == "ms_sql")
+        .cloned()
+    else {
+        return;
+    };
+    let state = AppState::new();
+    post(Arc::clone(&state), "/sources", &original).await;
+
+    let mut body = original.clone();
+    body["auth"] = json!({ "method": "integrated" });
+    body["keep_secret"] = json!(true);
+    let id = original["id"].as_str().unwrap();
+    let (status, said) = put(state, &format!("/sources/{id}"), &body).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{said}");
+    assert!(said.contains("sign-in method changed"), "{said}");
 }
 
 #[tokio::test]
