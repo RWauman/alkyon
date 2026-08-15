@@ -104,16 +104,19 @@ const buffers = createBuffers($('tab-bar'), {
 
     editor.setDoc(buffer.doc);
     editor.setDialect(state.source?.editor_mime);
-    // A tab remembers what it was last run against. Captured first, because
-    // `selectSource` will rewrite `buffer.target` as it goes.
     paintMode();
     restoreResult(buffer);
 
-    const target = buffer.target;
-    if (target) {
-      selectSource(target.sourceKey).then(() => {
-        if (target.database) selectDatabase(target.database);
-      });
+    // A tab remembers what it was last run against. Source and database go over
+    // in one call — `selectSource` reads both before it awaits anything, so the
+    // target is never half this tab's and half the previous one's.
+    if (buffer.target) {
+      selectSource(buffer.target.sourceKey, buffer.target.database);
+    } else {
+      // A tab that has never been targeted adopts what is on screen, the way
+      // SSMS does — and owns it from here, so going to another tab and back
+      // cannot leave it pointing at that other tab's source.
+      rememberTarget();
     }
   },
 });
@@ -476,8 +479,7 @@ const search = createSearch(
   {
     onStatus: status,
     onPick: async (hit) => {
-      await selectSource(hit.source);
-      selectDatabase(hit.database);
+      await selectSource(hit.source, hit.database);
       editor.insert(qualify(hit.schema, hit.table));
       editor.focus();
     },
@@ -673,12 +675,9 @@ const explorer = createExplorer($('explorer'), {
   },
   onSelectSource: (source) => selectSource(source.key),
   onEditSource: (source) => openSourceDialog(null, source),
-  // Awaited so the database list is in place before we pick from it — otherwise
-  // a slow `/databases` response resets the choice a moment later.
-  onSelectDatabase: async (source, db) => {
-    await selectSource(source.key);
-    selectDatabase(db);
-  },
+  // Both at once, so a slow `/databases` response cannot reset the choice a
+  // moment later.
+  onSelectDatabase: (source, db) => selectSource(source.key, db),
   onInsert: (qualified) => editor.insert(qualified),
   // Clicking a table peeks at it — in a tab of its own, so it neither touches
   // what you were writing nor throws away the result you were looking at.
@@ -723,14 +722,40 @@ function paintSourceStatus() {
   dot.title = health?.detail ?? 'connection state unknown';
 }
 
-async function selectSource(key) {
-  if (state.source?.key === key) return;
+/**
+ * Which retarget is the current one.
+ *
+ * Listing the databases is a round trip — a second or more against a Fabric
+ * endpoint, which opens a real connection to answer — so two tab switches in
+ * quick succession leave two of them in flight. The slower one would land last
+ * and put its database on a tab that has already gone.
+ */
+let targeting = 0;
+
+/**
+ * Point everything at `key`, and at `database` when the caller has one in mind —
+ * a tab being restored, or a `TARGET` directive.
+ *
+ * The database is applied **before** the list is fetched rather than after it
+ * arrives. Setting the source now and the database a second later leaves a
+ * window in which the target is half of one tab and half of another, and a query
+ * run in that window reaches the right server with the wrong database — which
+ * comes back as `Invalid object name`, naming a table that does exist.
+ */
+async function selectSource(key, database = null) {
+  if (state.source?.key === key) {
+    if (database) selectDatabase(database);
+    return;
+  }
+  const mine = ++targeting;
   state.source = state.sources.find((source) => source.key === key) ?? null;
+  state.database = database;
   $('source-select').value = key ?? '';
   editor.setDialect(state.source?.editor_mime);
   editor.clearSchema();
   paintSourceStatus();
-  await populateDatabases();
+  await populateDatabases({ prefer: database, token: mine });
+  if (mine !== targeting) return;
   rememberTarget();
 }
 
@@ -756,21 +781,29 @@ function selectDatabase(db) {
  * The database list is best-effort: a source whose server is unreachable still
  * has to be selectable, so it falls back to the source's own database.
  */
-async function populateDatabases() {
+async function populateDatabases({ prefer = null, token = null } = {}) {
   const select = $('database-select');
-  if (!state.source) {
+  const source = state.source;
+  if (!source) {
     select.replaceChildren();
     state.database = null;
     return;
   }
 
-  const fallback = [state.source.database];
+  const fallback = [source.database];
   let databases = fallback;
+  let failure = null;
   try {
-    databases = await api.databases(state.source.key);
+    databases = await api.databases(source.key);
   } catch (e) {
-    status(`${state.source.key}: ${e.message}`, true);
+    failure = e.message;
   }
+
+  // A newer retarget has taken over while this list was on its way: it describes
+  // a source nothing is pointing at any more, and writing it down would move the
+  // tab that is on screen now.
+  if (token !== null && token !== targeting) return;
+  if (failure) status(`${source.key}: ${failure}`, true);
 
   select.replaceChildren(...databases.map((db) => {
     const option = document.createElement('option');
@@ -779,9 +812,20 @@ async function populateDatabases() {
     return option;
   }));
 
-  state.database = databases.includes(state.source.database)
-    ? state.source.database
-    : databases[0] ?? null;
+  // What the caller asked for wins over the source's own default: it is the
+  // database this tab was last run against, and the list is only how it gets
+  // offered. It may not be in the list — an unreachable server lists nothing —
+  // and then it gets an option of its own rather than being silently dropped,
+  // the way `selectDatabase` treats one named by TARGET.
+  state.database = prefer ?? (databases.includes(source.database)
+    ? source.database
+    : databases[0] ?? null);
+  if (state.database && !databases.includes(state.database)) {
+    const option = document.createElement('option');
+    option.value = state.database;
+    option.textContent = state.database;
+    select.append(option);
+  }
   select.value = state.database ?? '';
   loadSchema();
 }
@@ -820,10 +864,13 @@ async function loadSources({ keep = true } = {}) {
   ]);
 
   const previous = keep ? state.source?.key : null;
+  // The database as well as the source: re-reading the registry is a refresh of
+  // the list, not a reason for the active tab to land back on `master`.
+  const database = keep ? state.database : null;
   const next = state.sources.find((source) => source.key === previous) ?? state.sources[0];
   state.source = null;
   if (next) {
-    await selectSource(next.key);
+    await selectSource(next.key, next.key === previous ? database : null);
   } else {
     $('database-select').replaceChildren();
     status('no sources registered — use + in the explorer to add one');
@@ -858,8 +905,7 @@ async function applyTargets(sql) {
   let retargeted = null;
   for (const target of parsed.targets) {
     const key = resolveSourceKey(target.id);
-    await selectSource(key);
-    if (target.database) selectDatabase(target.database);
+    await selectSource(key, target.database ?? null);
     retargeted = `${key} · ${state.database ?? ''}`;
   }
 
@@ -960,8 +1006,7 @@ async function applyQualified(sql) {
   }
 
   const key = resolveSourceKey(found.source);
-  await selectSource(key);
-  if (found.database) selectDatabase(found.database);
+  await selectSource(key, found.database ?? null);
   detail(`${key} · ${found.database ?? state.database ?? ''}`);
   return { sql: found.sql };
 }

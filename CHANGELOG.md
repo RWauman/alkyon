@@ -8,6 +8,31 @@ than an evening spent reading diffs.
 Dates are the day the tag was cut. Anything under **Unreleased** is on `dev` and in
 no binary yet.
 
+## Unreleased
+
+### Fixed
+
+- **A query could reach the right server with another tab's database.** Two Fabric
+  endpoints open in two tabs, and the statement in the second came back with
+  `Invalid object name 'control.perimeter'` — naming a table that is there.
+  Activating a tab reapplied its target in two steps: the source at once, the
+  database only once `/sources/{id}/databases` had answered. Against a Fabric
+  endpoint that answer costs a real connection and takes a second or more, and for
+  the whole of it the target was half this tab's and half the previous one's — long
+  enough to run something in. The source and the database now travel together, and
+  are in place before that listing is asked for.
+- **Two tab switches in quick succession could leave a tab on the wrong database
+  for good.** Both listings were in flight at once and the slower one landed last,
+  writing its database over the tab already on screen. A listing that arrives after
+  another retarget has taken over is now dropped, the way a schema snapshot already
+  was.
+- **A tab that had never been targeted followed whichever tab you visited in
+  between.** It now adopts what is on screen the first time it is activated and
+  owns that target from then on.
+- **Refreshing the explorer put you back on the source's default database.**
+  Re-reading the registry is a refresh of the list, not a reason to leave the
+  database you were working in.
+
 ## 0.2.0 — 2026-08-09
 
 **The Linux binary needs `libdbus-1.so.3`** — `libdbus-1-3` on Debian and Ubuntu,
