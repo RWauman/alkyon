@@ -43,7 +43,10 @@
 # but it belongs next to the credentials it uses rather than in the history.
 .github-release.py
 
-# Release artefacts, built into the working tree and uploaded from it.
+# Release artefacts, built into the working tree and uploaded from it. The
+# installer needs its own line: it ends in `-setup.exe`, so the glob above --
+# anchored on `-x86_64.exe` -- does not reach it.
 alkyon-*-x86_64
 alkyon-*-x86_64.exe
+alkyon-*-setup.exe
 SHA256SUMS

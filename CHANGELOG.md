@@ -38,8 +38,11 @@ it with `--no-default-features` and none of this applies.
   does not second-guess: it neither moves the port nor attaches to whatever is there.
 - The Linux window needs `libwebkit2gtk-4.1-0`, beside the `libdbus-1-3` the keychain
   already wanted. Windows 10 and 11 ship WebView2; macOS has WKWebView built in.
-- Icons are generated from `logo/alkyon-icon-1024.png`; the config declares NSIS, `.deb` and
-  AppImage targets, built with `npx @tauri-apps/cli build`.
+- **Windows ships two ways**: an NSIS installer, and the bare `.exe` beside it for anyone who
+  would rather not install anything. Both are the same binary. Neither is signed yet, so
+  SmartScreen will ask before running one.
+- Icons are generated from `logo/alkyon-icon-1024.png`; the config also declares `.deb` and
+  AppImage targets, which have not been built.
 
 ### Fixed
 
