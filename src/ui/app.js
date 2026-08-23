@@ -1,4 +1,4 @@
-import { api, runQuery } from './api.js';
+import { api, complete, runQuery } from './api.js';
 import { createBuffers } from './buffers.js';
 import { looksFederated, previewSql, quoteFor } from './dialect.js';
 import { createEditor } from './editor.js';
@@ -43,6 +43,161 @@ function detail(text) {
   $('status-detail').textContent = text;
 }
 
+// ------------------------------------------------------------------ settings
+
+/**
+ * Ask the server what this project's editor may do, and tell the editor.
+ *
+ * Re-read whenever the open folder changes, because that is where the settings
+ * live: opening another project can turn ghost text on or off, and the page has
+ * no other way to hear about it.
+ */
+let settings = null;
+
+/** Put what the server described into effect, and keep it for the dialogue. */
+function applySettings(described) {
+  settings = described;
+  const completion = described.completion ?? {};
+  editor.setCompletion({
+    dropdown: completion.dropdown !== false,
+    ghostText: Boolean(completion.ghost_text),
+    debounceMs: completion.debounce_ms,
+  });
+  // Asked for and impossible is the one case worth saying out loud — otherwise
+  // the switch is on, nothing ever appears, and there is nothing to look at.
+  if (completion.requested && !completion.configured) {
+    status(
+      `ghost text is on in this folder but no model key is set — see ${described.key_variable}`,
+      true,
+    );
+  }
+}
+
+async function loadSettings() {
+  try {
+    applySettings(await api.settings());
+  } catch {
+    // Not worth a line in the status bar: the editor keeps the dropdown, which
+    // is what it had before any of this existed.
+  }
+}
+
+// ---------------------------------------------------------- settings dialogue
+
+const settingsDialog = $('settings-dialog');
+const settingsForm = $('settings-form');
+
+function settingsNote(text, kind) {
+  const element = $('settings-note');
+  element.textContent = text ?? '';
+  element.className = kind ? `note ${kind}` : 'note';
+  element.hidden = !text;
+}
+
+/** The layer the *Save to* box is pointing at. */
+function chosenLayer() {
+  const wanted = settingsForm.elements.scope.value;
+  return (settings?.scopes ?? []).find((layer) => layer.scope === wanted) ?? null;
+}
+
+const layerOf = (scope) => (settings?.scopes ?? []).find((layer) => layer.scope === scope);
+
+/**
+ * Everything in the dialogue that depends on a box in it.
+ *
+ * The boxes always show what is **in force** — the two layers merged — while
+ * *Save to* only decides where a change is written. Showing one file's contents
+ * instead would answer a question nobody asks: what matters is why the editor is
+ * behaving the way it is.
+ */
+function paintSettings() {
+  const ghost = settingsForm.elements.ghost_text.value === 'true';
+  // With ghost text off, none of its knobs mean anything.
+  for (const element of settingsForm.querySelectorAll('.ghost-only')) element.hidden = !ghost;
+
+  const layer = chosenLayer();
+  $('settings-where').textContent = layer
+    ? `${layer.present ? 'Editing' : 'Will create'} ${layer.file}`
+    : '';
+  $('settings-save').disabled = !layer?.writable;
+
+  // Every reason the dialogue has to say something, in one place — the note
+  // wraps, so several can be true at once and all of them get said.
+  const project = layerOf('project');
+  const lines = [];
+  if (!layer?.writable) {
+    lines.push('These settings belong to a folder — open one, or save them as yours.');
+  }
+  if (layer?.scope === 'user' && project?.present) {
+    lines.push(`This folder has its own ${project.file}, and it wins over yours field by field.`);
+  }
+  if (ghost && !settings?.completion?.configured) {
+    lines.push(`Ghost text needs ${settings?.key_variable ?? 'a key'} set where alkyon was started; nothing is asked without it.`);
+  }
+  settingsNote(lines.join('\n'), lines.length ? 'bad' : undefined);
+}
+
+for (const name of ['ghost_text', 'scope']) {
+  settingsForm.elements[name].addEventListener('change', paintSettings);
+}
+
+function openSettings() {
+  const completion = settings?.completion ?? {};
+  const project = layerOf('project');
+
+  // Open on the layer whose values are the ones in force: if the folder has a
+  // file of its own, that is the one an edit most likely means.
+  settingsForm.elements.scope.value = project?.present ? 'project' : 'user';
+  settingsForm.elements.scope.querySelector('option[value="project"]').disabled =
+    !project?.writable;
+
+  settingsForm.elements.dropdown.value = String(completion.dropdown !== false);
+  // `requested` rather than `ghost_text`: the dialogue shows what the files ask
+  // for, not what a missing key reduced it to — otherwise saving would quietly
+  // turn off a switch the user never touched.
+  settingsForm.elements.ghost_text.value = String(Boolean(completion.requested));
+  settingsForm.elements.model.value = completion.model ?? '';
+  settingsForm.elements.debounce_ms.value = completion.debounce_ms ?? 250;
+  settingsForm.elements.max_tables.value = completion.max_tables ?? 12;
+  $('settings-key-variable').textContent = settings?.key_variable ?? 'ANTHROPIC_API_KEY';
+
+  paintSettings();
+  settingsDialog.showModal();
+}
+
+$('open-settings').addEventListener('click', openSettings);
+$('settings-cancel').addEventListener('click', () => settingsDialog.close());
+
+settingsForm.addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const data = new FormData(settingsForm);
+  const wrote = chosenLayer()?.file;
+  const body = {
+    scope: data.get('scope'),
+    completion: {
+      dropdown: data.get('dropdown') === 'true',
+      ghost_text: data.get('ghost_text') === 'true',
+      model: data.get('model').trim(),
+      debounce_ms: Number(data.get('debounce_ms')),
+      max_tables: Number(data.get('max_tables')),
+    },
+  };
+
+  const save = $('settings-save');
+  save.disabled = true;
+  try {
+    // Painted from what is now *in force*, not from what was sent: the other
+    // layer may override part of it, and a missing key turns ghost text back off.
+    applySettings(await api.saveSettings(body));
+    settingsDialog.close();
+    status(`settings saved to ${wrote}`);
+  } catch (e) {
+    settingsNote(e.message, 'bad');
+  } finally {
+    save.disabled = false;
+  }
+});
+
 // --------------------------------------------------------------- components
 
 // The filter's count goes in the detail slot rather than in the status line: the
@@ -54,6 +209,21 @@ const grid = new ResultGrid($('grid'), (text) => {
 
 const editor = createEditor($('editor-pane'), {
   onRun: run,
+  // Ghost text asks through here, so the editor never has to know which source
+  // is selected — and a suggestion is not even attempted without one, since the
+  // schema is the whole reason it would be any good.
+  onComplete: ({ prefix, suffix, tables, signal }) =>
+    state.source
+      ? complete({
+          source: state.source.key,
+          database: state.database,
+          prefix,
+          suffix,
+          tables,
+          signal,
+        })
+      : Promise.resolve(null),
+  onStatus: (text) => status(text, true),
   onOpen: () => openIntoTabs(),
   onSave: () => save(),
   onSaveAs: () => save({ as: true }),
@@ -593,8 +763,9 @@ $('folder-cancel').addEventListener('click', () => folderDialog.close());
  */
 async function openFolder(path) {
   const opened = await workspace.open(path);
-  // The folder brings its own sources with it.
+  // The folder brings its own sources with it — and its own settings.
   await loadSources();
+  await loadSettings();
   paintRecent(opened.recent);
   status(`opened ${opened.root} — ${opened.files.length} file(s)`);
   // The working directory is fixed when the shell is spawned, so an open
@@ -648,8 +819,9 @@ $('start-add-source').addEventListener('click', () => $('add-source').click());
 $('close-folder').addEventListener('click', async () => {
   try {
     await workspace.close();
-    // Its project sources go with it.
+    // Its project sources go with it, and its settings with them.
     await loadSources();
+    await loadSettings();
     status('folder closed');
     terminal.restart();
   } catch (e) {
@@ -2069,7 +2241,7 @@ theme.apply();
 // it survives.
 // No tab is opened here on purpose: alkyon comes up on the start screen, where
 // the first thing to decide is where you are working rather than what to type.
-// `Alt+N`, the `+` in the tab bar, opening a `.sql` file or clicking a table all
+// `Ctrl+N`, the `+` in the tab bar, opening a `.sql` file or clicking a table all
 // open one.
 paintStart();
 paintMode();
@@ -2084,5 +2256,15 @@ try {
   status('cannot reach the alkyon backend', true);
 }
 
-const [, , opened] = await Promise.all([loadSources(), loadShells(), workspace.refresh()]);
+// Alongside the rest rather than after it. The settings do not wait on any of
+// these — the server already knows which folder is open, `workspace.refresh()`
+// is only the page finding out — and sequencing them last left a window of a
+// second or two where the editor ran on the defaults: in a project that turns
+// the dropdown off, it could still pop up while the schema was loading.
+const [, , opened] = await Promise.all([
+  loadSources(),
+  loadShells(),
+  workspace.refresh(),
+  loadSettings(),
+]);
 paintRecent(opened?.recent);

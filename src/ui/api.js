@@ -56,6 +56,11 @@ export const api = {
   startSignIn: (body) => call('POST', '/auth/entra', body),
   signInStatus: (ticket) => call('GET', `/auth/entra/${q(ticket)}`),
 
+  /** What the open folder's `.alkyon/settings.json` says the editor may do. */
+  settings: () => call('GET', '/settings'),
+  /** Write it, creating the file the first time. Answers with what was stored. */
+  saveSettings: (body) => call('PUT', '/settings', body),
+
   shells: () => call('GET', '/shells'),
   sources: () => call('GET', '/sources'),
   addSource: (config) => call('POST', '/sources', config),
@@ -82,6 +87,30 @@ export const api = {
   search: (query, limit = 50) =>
     call('GET', `/search?q=${q(query)}&limit=${limit}`),
 };
+
+/**
+ * Ask for the text that goes at the cursor.
+ *
+ * Separate from `call` because this is the one request that is routinely
+ * abandoned: every keystroke supersedes the last one. `signal` is what aborts
+ * it — and since axum drops a handler whose client has gone, aborting here is
+ * expected to cancel the upstream model call too rather than pay for an answer
+ * nobody will read.
+ */
+export async function complete({ prefix, suffix, tables, source, database, signal }) {
+  const response = await fetch('/complete', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ source, database, prefix, suffix, tables }),
+    signal,
+  });
+  const text = await response.text();
+  const parsed = text ? JSON.parse(text) : null;
+  if (!response.ok) {
+    throw new Error(parsed?.error ?? `${response.status} ${response.statusText}`);
+  }
+  return parsed;
+}
 
 export function socketUrl(path) {
   const scheme = location.protocol === 'https:' ? 'wss:' : 'ws:';

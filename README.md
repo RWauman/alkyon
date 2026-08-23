@@ -25,6 +25,11 @@ Alkyon is a single Rust binary. It exposes an HTTP + WebSocket API and serves a 
 UI that consumes it. That is the entire architecture — there is no second codebase for the
 desktop build.
 
+**It is a desktop application.** Tauri opens the platform's own webview on that same server,
+so the window and a browser tab run byte-identical code. No browser is bundled: the webview
+is the one the OS already ships, which is why the window costs kilobytes rather than the
+hundred megabytes of a packaged Chromium. `--headless` gets the plain server back.
+
 It connects to **SQL Server** (on-prem, Azure SQL, Microsoft Fabric), **PostgreSQL**,
 **MySQL/MariaDB**, and **a folder or a single file** on disk — and gives you a schema
 explorer, a multi-dialect SQL editor with cross-schema search, a streaming result grid, an
@@ -66,12 +71,34 @@ DuckDB.
 - Results arrive a page at a time over WebSocket, the query staying open between pages so
   the next one is read on rather than re-fetched with an `OFFSET`
 - Sources come from your own registry and, optionally, a committable one in the project
+- **Two kinds of completion, switched separately.** The dropdown is built from the schema
+  alkyon already holds — offline, and unable to offer a name that is not there. **Ghost
+  text** is the greyed suggestion a model writes at the cursor, off until you turn it on
+  because it sends the schema and the buffer to a third party. Never a row of data.
+- Settings live in `settings.json`, yours or the project's, the folder's laid over yours
+  field by field — the **⚙** in the header writes either
 - Night Owl and Light Owl themes, following the OS unless you say otherwise
 
 ## Running it
 
 ```sh
-cargo run          # http://127.0.0.1:8787
+cargo run                     # a window, on its own server at 127.0.0.1:8787
+cargo run -- --headless       # no window: the server alone, as it always was
+```
+
+The server is the same either way, and the API stays where it was — so a browser tab, `curl`
+and an agent driving the HTTP surface all work while the window is open. Launching a second
+time does not start a second server: if the first is already answering on the default
+address, the new process opens another window onto it, because two servers over one config
+directory would race each other writing `sources.json`.
+
+The window needs a webview from the platform. Windows 10 and 11 ship WebView2; macOS has
+WKWebView built in; on Linux it is `libwebkit2gtk-4.1-0` — installed on a desktop, and one
+more thing a slim container has to add, beside the `libdbus-1-3` the keychain already needs.
+A container has no display anyway, so build it without the shell entirely:
+
+```sh
+cargo build --release --no-default-features   # no Tauri, no webview, no window
 ```
 
 The first build compiles DuckDB from source and takes a few minutes — optimised even
@@ -120,15 +147,21 @@ MySQL, CSV and Parquet. Folder and file sources are covered by tests that need n
 Excel is read in-process by calamine, as a folder or file source and through an `EXCEL` declaration,
 against workbooks committed under `tests/fixtures/`.
 
-Written but not yet exercised: Windows integrated authentication and Entra ID token auth —
-both need servers this has not been run against.
+Entra ID sign-in is exercised: browser and device-code flows against Microsoft Fabric SQL
+analytics endpoints, with the refresh token in the keychain and an access token minted per
+connection. Windows integrated authentication is written and still not exercised — it needs
+a domain this has not been run against.
 
 Not built yet:
 
 - **Skills and agents** — the Git-versioned folder of Markdown skills meant to be injected
   into the terminal's context. The terminal is there; the skills are not.
-- **Packaging** — no Tauri installer and no Docker image yet, though the architecture is
-  built for both. Today it is `cargo run`.
+- **Installers** — the Tauri config declares NSIS, `.deb` and AppImage targets and
+  `npx @tauri-apps/cli build` produces them, but only the Windows one has been built and run.
+  No Docker image yet either.
+- **A console still opens behind the window on Windows.** The binary is a console
+  application, which is what keeps `--headless` able to print; hiding it costs that, and the
+  trade has not been made yet.
 - **`ATTACH`-based federation**, for when predicate pushdown matters more than keeping the
   import in its native dialect.
 - **Blob-storage sources.** Local folders and files are in; anything over the network needs

@@ -778,6 +778,10 @@ dialog {
   padding: 1rem 1.2rem;
 }
 dialog::backdrop { background: rgb(0 0 0 / .45); }
+/* The one dialogue that is mostly prose. `min-width` alone lets a paragraph lay
+   itself out on a single line and drag the whole dialogue past the edge of the
+   window, which is what the sentence about what leaves the machine did. */
+#settings-dialog { max-width: min(34rem, 92vw); }
 dialog h2 { margin: 0 0 .8rem; font-size: 14px; }
 dialog label { display: grid; grid-template-columns: 9rem 1fr; align-items: center; gap: .4rem; margin-bottom: .4rem; }
 /* A row that is not a label: the sign-in buttons sit where an input would, so

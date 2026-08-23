@@ -4,6 +4,7 @@
 import { cteColumns, mask as maskLiterals, referencedTables } from './cte.js';
 import { dialectForMime, qualifyLoosely } from './dialect.js';
 import { importAt } from './federation.js';
+import { createGhost } from './ghost.js';
 import { targetAt } from './target.js';
 
 /**
@@ -340,7 +341,10 @@ for (const mime of ['text/x-sql', 'text/x-pgsql', 'text/x-mssql', 'text/x-mysql'
   }
 }
 
-export function createEditor(element, { onRun, onOpen, onSave, onSaveAs, onNew, onClose, onChange }) {
+export function createEditor(
+  element,
+  { onRun, onOpen, onSave, onSaveAs, onNew, onClose, onChange, onComplete, onStatus },
+) {
   // `tables` is what CodeMirror's sql-hint completes from: qualified table name
   // to column names. Table names are registered as soon as a database is
   // expanded; the columns fill in when a table is.
@@ -351,6 +355,14 @@ export function createEditor(element, { onRun, onOpen, onSave, onSaveAs, onNew, 
   let aliases = new Set();
   // alias → that source's own schema, for completing the SQL inside its brackets.
   let inside = {};
+
+  // Ghost text, once the editor exists to hang it on. Held here because the
+  // keymap below has to ask it whether Tab and Esc mean something else.
+  let ghost = null;
+  // Whether the dropdown may open itself. `false` only stops it *popping up*:
+  // Ctrl+Space is an explicit request for the list and stays answered, since
+  // nobody who turns the automatic list off means to turn that off too.
+  let dropdown = true;
 
   const editor = CodeMirror(element, {
     value: [
@@ -406,7 +418,16 @@ export function createEditor(element, { onRun, onOpen, onSave, onSaveAs, onNew, 
       // looks it up verbatim, so Shift must come first or the binding is dead.
       'Shift-Ctrl-H': 'replaceAll',
       'Alt-G': 'jumpToLine',
-      Esc: 'clearSearch',
+      // Tab accepts a suggestion when one is showing, and is otherwise the
+      // Tab it has always been — `CodeMirror.Pass` is what hands it back.
+      Tab: () => (ghost?.accept() ? undefined : CodeMirror.Pass),
+      Esc: (cm) => {
+        if (ghost?.visible()) {
+          ghost.cancel();
+          return;
+        }
+        CodeMirror.commands.clearSearch(cm);
+      },
 
       // VS Code's multi-cursor pair, from the sublime keymap's commands. The
       // keymap itself is not installed — only the commands it registers.
@@ -421,9 +442,13 @@ export function createEditor(element, { onRun, onOpen, onSave, onSaveAs, onNew, 
       'Shift-Cmd-S': onSaveAs,
       'Ctrl-O': onOpen,
       'Cmd-O': onOpen,
-      // Not Ctrl-N/Ctrl-W: those are browser-level shortcuts a page cannot
-      // intercept, and Ctrl-W would have closed the browser tab outright.
-      'Alt-N': onNew,
+      // `Ctrl-N` reaches us in the window: there is no browser around it to keep
+      // the shortcut for a new browser window. In a *browser tab* it still never
+      // arrives, so there the tab bar's `+` and the start screen are the way in.
+      'Ctrl-N': onNew,
+      'Cmd-N': onNew,
+      // `Alt-W` and not `Ctrl-W`, still: in a browser tab that one closes the tab
+      // outright, and losing the buffer is worse than an unfamiliar chord.
       'Alt-W': onClose,
     },
     hintOptions: { tables, sources, aliases, inside, completeSingle: false, hint: quotingSqlHint },
@@ -432,6 +457,7 @@ export function createEditor(element, { onRun, onOpen, onSave, onSaveAs, onNew, 
   // Pop the completion list up while typing a word or just after a dot, rather
   // than only on Ctrl+Space.
   editor.on('inputRead', (_, change) => {
+    if (!dropdown) return;
     if (change.origin !== '+input') return;
     if (!/^[\w.]$/.test(change.text[0] ?? '')) return;
     if (editor.state.completionActive) return;
@@ -439,6 +465,21 @@ export function createEditor(element, { onRun, onOpen, onSave, onSaveAs, onNew, 
   });
 
   if (onChange) editor.on('changes', () => onChange());
+
+  // The buffer's own reading of which tables the statement names travels with
+  // the request: it is the same parse that scopes the dropdown's columns, and
+  // sending it is what keeps a SQL parser out of the server.
+  if (onComplete) {
+    ghost = createGhost(editor, {
+      onStatus,
+      request: ({ prefix, suffix, signal }) => {
+        // `prefix.length` *is* the cursor's character offset, so the buffer is
+        // not walked twice to find it.
+        const { names } = referencedTables(editor.getValue(), prefix.length);
+        return onComplete({ prefix, suffix, tables: [...names], signal });
+      },
+    });
+  }
 
   function refreshHints() {
     editor.setOption('hintOptions', {
@@ -453,6 +494,16 @@ export function createEditor(element, { onRun, onOpen, onSave, onSaveAs, onNew, 
 
   return {
     editor,
+
+    /**
+     * Turn each kind of completion on or off. Both come from the folder's
+     * `.alkyon/settings.json` by way of the server, so a project decides how
+     * its editor behaves rather than the page guessing.
+     */
+    setCompletion({ dropdown: list = true, ghostText = false, debounceMs }) {
+      dropdown = list;
+      ghost?.configure({ enabled: ghostText, debounce: debounceMs });
+    },
 
     /** Swap in another buffer's document, keeping its history and cursor. */
     setDoc(doc) {

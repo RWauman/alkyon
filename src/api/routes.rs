@@ -29,6 +29,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/sources/{id}/columns", get(columns))
         .route("/sources/{id}/schema", get(schema))
         .route("/search", get(search))
+        .route("/settings", get(settings).put(write_settings))
+        .route("/complete", post(complete))
         .route("/files", get(data_files))
         .route("/auth/entra", post(start_sign_in))
         .route("/auth/entra/{ticket}", get(sign_in_status))
@@ -494,4 +496,176 @@ async fn columns(
     Ok(Json(
         connection.list_columns(&db, &schema, &params.table).await?,
     ))
+}
+
+// ------------------------------------------------------------------ completion
+
+/// What the editor is allowed to do in this project, and whether the half that
+/// needs a model can work at all.
+///
+/// Answered on every page load rather than baked in, because the settings live
+/// in the open folder: opening another project can turn ghost text on or off,
+/// and the page has to hear about it.
+async fn settings(State(state): State<Arc<AppState>>) -> Json<Value> {
+    Json(described(&state.settings().await, &state.settings_layers().await))
+}
+
+/// The settings as the page needs to see them.
+///
+/// Three things are added to what is on disk. **`ghost_text` is asked-for *and*
+/// possible**: the page cannot know whether a key was in the environment alkyon
+/// started from, and a switch that is on while every request fails is worse than
+/// one that is off — so the raw wish travels beside it as `requested`. **`scopes`**
+/// says where each layer is, whether it exists, and whether it can be written,
+/// which is what lets the dialogue offer the choice and grey out the half that
+/// has nowhere to go. And **`key_variable`** so the one sentence about the key
+/// names it from one place.
+fn described(settings: &crate::settings::Settings, layers: &[crate::settings::Layer]) -> Value {
+    let completion = &settings.completion;
+    json!({
+        "completion": {
+            "dropdown": completion.dropdown,
+            "ghost_text": completion.ghost_text && crate::llm::configured(),
+            "requested": completion.ghost_text,
+            "configured": crate::llm::configured(),
+            "model": completion.model,
+            "debounce_ms": completion.debounce_ms,
+            "max_tables": completion.max_tables,
+        },
+        "scopes": layers
+            .iter()
+            .map(|layer| json!({
+                "scope": layer.scope,
+                "file": layer.shown,
+                "present": layer.present,
+                // Writable and existing are different things: a folder is open,
+                // so its file can be created even though it is not there yet.
+                "writable": layer.file.is_some(),
+            }))
+            .collect::<Vec<_>>(),
+        "key_variable": crate::llm::KEY_VARIABLE,
+    })
+}
+
+/// What the settings dialogue sends: the settings, and which layer to put them in.
+#[derive(Deserialize)]
+struct SettingsUpdate {
+    #[serde(flatten)]
+    settings: crate::settings::Settings,
+    /// Defaults to the user's own, the layer that is always there.
+    #[serde(default)]
+    scope: crate::model::Scope,
+}
+
+/// Write one layer of settings, creating the file the first time.
+///
+/// Answers with the same shape `GET` does rather than an empty 200, so the page
+/// paints from what is now in force — which is not the same as what was sent: the
+/// other layer may override part of it, and a missing key turns ghost text back
+/// off.
+async fn write_settings(
+    State(state): State<Arc<AppState>>,
+    Json(update): Json<SettingsUpdate>,
+) -> Result<Json<Value>> {
+    let settings = update.settings.checked()?;
+    let layers = state.settings_layers().await;
+    let layer = layers
+        .iter()
+        .find(|layer| layer.scope == update.scope)
+        .ok_or_else(|| Error::BadRequest("no such settings scope".into()))?;
+
+    let file = layer.file.as_deref().ok_or_else(|| match update.scope {
+        // The one that can be missing in practice: these settings belong to a
+        // folder, so there has to be one.
+        crate::model::Scope::Project => Error::BadRequest(
+            "these settings belong to a folder, and none is open — save them as yours instead"
+                .into(),
+        ),
+        crate::model::Scope::User => Error::BadRequest(
+            "there is no config directory to write to — set ALKYON_CONFIG_DIR".into(),
+        ),
+    })?;
+    crate::settings::store(file, &settings)?;
+
+    // Re-read rather than echo: the layer just written may be the one the other
+    // overrides, and what the editor should apply is the result of both.
+    Ok(Json(described(
+        &state.settings().await,
+        &state.settings_layers().await,
+    )))
+}
+
+/// What the editor sends to fill in the cursor.
+///
+/// `tables` is the editor's own reading of the statement — the same parse that
+/// scopes the completion dropdown. It travels with the request so that this side
+/// needs no SQL parser to know which tables' columns are worth sending.
+#[derive(Deserialize)]
+struct CompleteRequest {
+    source: String,
+    #[serde(default)]
+    database: Option<String>,
+    /// The buffer up to the cursor, and what follows it.
+    prefix: String,
+    #[serde(default)]
+    suffix: String,
+    #[serde(default)]
+    tables: Vec<String>,
+}
+
+/// The text that goes at the cursor, or nothing.
+///
+/// **The schema is read from the cache only.** Snapshotting it here would open a
+/// connection — a second or more against a Fabric endpoint — and a keystroke is
+/// not the moment to do that. Until the explorer has loaded the schema, the
+/// suggestion is made from the buffer alone.
+async fn complete(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<CompleteRequest>,
+) -> Result<Json<Value>> {
+    let settings = state.settings().await;
+    if !settings.completion.ghost_text {
+        return Err(Error::BadRequest(
+            "ghost text is off — turn it on in the settings dialogue".into(),
+        ));
+    }
+
+    let record = state.record(&body.source).await?;
+    let database = body.database.unwrap_or_else(|| record.database());
+    let snapshot = state.schema().get(&record.key(), &database).await;
+
+    let started = Instant::now();
+    let suggestion = crate::llm::suggest(
+        &crate::llm::context::Ask {
+            dialect: state.dialect(record.kind),
+            source: &record.key(),
+            database: &database,
+            snapshot: snapshot.as_deref(),
+            tables: &body.tables,
+            prefix: &body.prefix,
+            suffix: &body.suffix,
+            max_tables: settings.completion.max_tables,
+        },
+        &settings.completion.model,
+    )
+    .await?;
+    let ms = started.elapsed().as_millis() as u64;
+
+    // Logged at debug because this is the number the whole design is judged on,
+    // and a suggestion nobody can time is one nobody can tune.
+    tracing::debug!(
+        source = %record.key(),
+        ms,
+        input_tokens = suggestion.input_tokens,
+        output_tokens = suggestion.output_tokens,
+        schema = snapshot.is_some(),
+        "ghost text"
+    );
+
+    Ok(Json(json!({
+        "text": suggestion.text,
+        "ms": ms,
+        "input_tokens": suggestion.input_tokens,
+        "output_tokens": suggestion.output_tokens,
+    })))
 }

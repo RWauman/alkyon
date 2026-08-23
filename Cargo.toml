@@ -1,6 +1,6 @@
 [package]
 name = "alkyon"
-version = "0.2.0"
+version = "1.0.0"
 edition = "2021"
 description = "A portable data workbench: real dialect SQL, optional federation, and a terminal your LLM agent can drive."
 # PolyForm Noncommercial has no SPDX identifier, so the file is named instead of
@@ -9,7 +9,21 @@ license-file = "LICENSE"
 publish = false
 default-run = "alkyon"
 
+[features]
+# The desktop shell. On by default because that is how alkyon is used; a
+# container has no display and no webview, so the image builds with
+# `--no-default-features` and never pulls Tauri or its system dependency in.
+default = ["desktop"]
+desktop = ["dep:tauri", "dep:tauri-build"]
+
 [dependencies]
+# Tauri drives the webview the platform already ships — WebView2 on Windows,
+# WebKitGTK on Linux, WKWebView on macOS — so nothing here bundles a browser and
+# the binary stays the size DuckDB made it. The window is pointed at alkyon's own
+# HTTP server rather than at embedded assets: that is what keeps one UI, served
+# one way, whether it is in this window or in a browser tab.
+tauri = { version = "2", optional = true , features = [] }
+
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
 axum = { version = "0.8", features = ["ws"] }
 tower-http = { version = "0.6", features = ["trace"] }
@@ -93,6 +107,9 @@ keyring = { version = "3", features = ["apple-native"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 keyring = { version = "3", features = ["sync-secret-service"] }
+
+[build-dependencies]
+tauri-build = { version = "2", optional = true }
 
 [dev-dependencies]
 # `oneshot` drives the router without binding a socket; the WebSocket tests need

@@ -95,6 +95,9 @@ pub struct AppState {
     workspace: RwLock<Option<PathBuf>>,
     /// Where the workspace root is remembered between runs.
     workspace_file: Option<PathBuf>,
+    /// The user's own settings. The project's live in the open folder, so they
+    /// are resolved from the workspace rather than held here.
+    settings_file: Option<PathBuf>,
     /// Folders opened before, most recent first — what the start screen offers.
     recent: RwLock<Vec<PathBuf>>,
     /// A shell over HTTP is a different risk class from a query endpoint, so it
@@ -139,6 +142,7 @@ impl AppState {
             file: None,
             workspace: RwLock::new(None),
             workspace_file: None,
+            settings_file: None,
             recent: RwLock::new(Vec::new()),
             terminal_enabled: true,
             schema: SchemaCache::default(),
@@ -192,6 +196,7 @@ impl AppState {
             file: Some(file),
             workspace: RwLock::new(workspace),
             workspace_file: Some(workspace_file),
+            settings_file: Some(dir.join(crate::settings::USER_FILE)),
             recent: RwLock::new(stored.recent),
             terminal_enabled,
             schema: SchemaCache::default(),
@@ -330,6 +335,28 @@ impl AppState {
         };
         std::fs::write(file, serde_json::to_string_pretty(&stored)?)?;
         Ok(())
+    }
+
+    // ---------------------------------------------------------------- settings
+
+    /// Where each layer of settings lives, and whether it is there yet.
+    ///
+    /// The user's file is fixed for the run; the project's follows whichever
+    /// folder is open, which is why this is resolved on every ask rather than
+    /// held.
+    pub async fn settings_layers(&self) -> Vec<crate::settings::Layer> {
+        crate::settings::layers(
+            self.settings_file.as_deref(),
+            self.workspace().await.as_deref(),
+        )
+    }
+
+    /// The settings in force: the user's, with the open folder's laid over them.
+    pub async fn settings(&self) -> crate::settings::Settings {
+        crate::settings::load(
+            self.settings_file.as_deref(),
+            self.workspace().await.as_deref(),
+        )
     }
 
     pub fn vault(&self) -> &Vault {

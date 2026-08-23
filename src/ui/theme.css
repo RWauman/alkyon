@@ -177,6 +177,23 @@ li.CodeMirror-hint-active {
 li.CodeMirror-hint-active .hint-name,
 li.CodeMirror-hint-active .hint-where { color: var(--bg); }
 
+/* ------------------------------------------------------ ghost text, both */
+
+/* Grey and italic, and *not* selectable: it is a proposal parked in the line,
+   not text in the document. Copying a line has to give what was typed, and a
+   drag-select across the cursor must not pick up something that is not there —
+   the suggestion is a DOM widget, so without this it would be caught by both. */
+.cm-ghost {
+  color: color-mix(in srgb, var(--fg-muted) 80%, transparent);
+  font-style: italic;
+  user-select: none;
+  -webkit-user-select: none;
+  pointer-events: none;
+  /* Whatever it says, the line it sits in must not grow: the buffer's own
+     characters keep their positions while a suggestion is on screen. */
+  white-space: pre;
+}
+
 /* ------------------------------------------ search dialog and match marks */
 
 .CodeMirror-dialog {

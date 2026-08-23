@@ -8,7 +8,38 @@ than an evening spent reading diffs.
 Dates are the day the tag was cut. Anything under **Unreleased** is on `dev` and in
 no binary yet.
 
-## Unreleased
+## 1.0.0 — 2026-08-23
+
+**The Linux binary needs `libwebkit2gtk-4.1-0` and glibc ≥ 2.34** — Debian 12 or Ubuntu
+22.04 and later. Both come from the window: Tauri needs webkit2gtk **4.1**, and the oldest
+Debian that packages it is bookworm, which is what moved the glibc floor from the 2.30 of
+earlier releases. Measured on the binary rather than read off the base image — the highest
+symbol it asks for is `GLIBC_2.34`. It also links GTK 3, libsoup 3, cairo and gdk-pixbuf,
+which a desktop has and a slim container does not. A container has no display anyway: build
+it with `--no-default-features` and none of this applies.
+
+### Alkyon is a desktop application
+
+- **A window, not a browser tab.** Tauri opens the webview the platform already ships —
+  WebView2 on Windows, WebKitGTK on Linux, WKWebView on macOS — pointed at alkyon's own
+  server. Nothing is bundled and nothing is duplicated: `tauri.conf.json` gives a *URL* as
+  its `frontendDist`, so Tauri embeds no assets of its own and the UI stays the one
+  `rust-embed` already carries. The window and a browser tab therefore run byte-identical
+  code, and the HTTP API keeps answering while the window is open.
+- **`--headless`**, or `ALKYON_HEADLESS`, is the server alone — under Docker, on a machine
+  with no display, or when the point is the API. And `--no-default-features` builds without
+  Tauri at all, so a container never pulls the webview in.
+- **Launching twice opens a second window, not a second server.** Two servers over one
+  config directory would race each other writing `sources.json`. If the default address is
+  already answering *as alkyon* — `/health` names itself, so an unrelated service on the port
+  is not adopted — the new process just opens a window onto it. When the port is taken by
+  something else, the window gets a port the OS picks instead.
+- **An explicit `ALKYON_BIND` turns both of those off.** An address you chose is one alkyon
+  does not second-guess: it neither moves the port nor attaches to whatever is there.
+- The Linux window needs `libwebkit2gtk-4.1-0`, beside the `libdbus-1-3` the keychain
+  already wanted. Windows 10 and 11 ship WebView2; macOS has WKWebView built in.
+- Icons are generated from `logo/alkyon-icon-1024.png`; the config declares NSIS, `.deb` and
+  AppImage targets, built with `npx @tauri-apps/cli build`.
 
 ### Fixed
 

@@ -21,7 +21,7 @@ one you opened before, add a source, or start a query anyway.
 |---|---|
 | **Open a folder…** | a path on this machine; the `.sql` tree and the terminal follow it |
 | **Recent folders** | the last eight, most recent first; ones that have gone are not offered |
-| **New query** | `Alt+N`, or the **+** in the tab bar |
+| **New query** | `Ctrl+N`, or the **+** in the tab bar |
 | **Add a source…** | the same dialogue as **+** in the *Sources* pane |
 
 Closing the last tab brings the start screen back rather than conjuring an empty
@@ -911,12 +911,15 @@ wearing a close button.
 
 | Key | Does |
 |---|---|
-| `Alt+N` / `Alt+W` | new tab / close tab |
+| `Ctrl+N` / `Alt+W` | new tab / close tab |
 | `Ctrl+O` | open files |
 | `Ctrl+S` / `Ctrl+Shift+S` | save / save as |
 
-`Alt+N` rather than `Ctrl+N` because Chrome keeps `Ctrl+N`, `Ctrl+T` and `Ctrl+W`
-for itself — a page never sees them.
+`Ctrl+N` works in the window, where no browser is holding on to it. Opened in a
+**browser tab** instead, alkyon never sees `Ctrl+N`, `Ctrl+T` or `Ctrl+W` — Chrome
+keeps those — so there the tab bar's **+** is how a tab is opened. Closing is
+`Alt+W` in both, because `Ctrl+W` in a tab would close the tab and take the buffer
+with it.
 
 A leading UTF-8 BOM is stripped on read. SSMS writes one by default, and left in
 place it becomes an invisible first character that both engines reject with a
@@ -1267,7 +1270,7 @@ listener is loopback**, or `ALKYON_TERMINAL=always` says otherwise.
 | `Ctrl+D` | add the next occurrence to the selection |
 | `Ctrl+/` | toggle comment |
 | `Alt+G` | go to line |
-| `Alt+N` / `Alt+W` | new tab / close tab |
+| `Ctrl+N` / `Alt+W` | new tab / close tab |
 | `Ctrl+O` / `Ctrl+S` / `Ctrl+Shift+S` | open / save / save as |
 
 The theme button cycles Auto → Light → Dark and remembers your choice.
@@ -1276,7 +1279,8 @@ The theme button cycles Auto → Light → Dark and remembers your choice.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `ALKYON_BIND` | `127.0.0.1:8787` | address to listen on |
+| `ALKYON_BIND` | `127.0.0.1:8787` | address to listen on — setting it also stops the port moving and stops a running instance being adopted |
+| `ALKYON_HEADLESS` | — | set to anything, or pass `--headless`, to run the server without a window |
 | `ALKYON_CONFIG_DIR` | platform config dir | where `sources.json` lives |
 | `ALKYON_VAULT` | `keyring` | `memory` keeps credentials out of the keychain |
 | `ALKYON_SOURCES` | — | JSON file of sources to *import* at startup |
@@ -1286,6 +1290,13 @@ The theme button cycles Auto → Light → Dark and remembers your choice.
 | `ALKYON_IMPORT_MAX_ROWS` | — | opt-in ceiling on one federated `IMPORT` |
 | `ALKYON_COMMUNITY_EXTENSIONS` | on | `off` refuses DuckDB community extensions, and with them `ATTACH` on SQL Server |
 | `ALKYON_LOG` | `alkyon=info` | `tracing` filter |
+
+The window is a webview the platform provides, so nothing about the server changes when it
+is open: the HTTP API answers on the same address, and a browser tab pointed at it shows the
+same workbench. Launching alkyon twice opens a second window onto the first server rather
+than starting another one — two servers writing one `sources.json` would race. An explicit
+`ALKYON_BIND` turns that off, along with the fallback to another port when the default one is
+taken: an address you chose is one alkyon does not second-guess.
 
 `ALKYON_CONFIG_DIR` is what makes a container or a portable install work — the
 directory next to an installed `.exe` is usually not writable.

@@ -71,6 +71,8 @@
 
   <button id="theme-toggle" title="Cycle theme">◐ Auto</button>
   <button id="toggle-terminal" aria-pressed="false">Terminal</button>
+  <button id="open-settings" class="icon" aria-label="Settings"
+          title="How this folder's editor completes — written to .alkyon/settings.json">&#x2699;</button>
   <span class="muted" id="build"></span>
 </header>
 
@@ -138,7 +140,7 @@
   <section id="work">
     <div id="tab-bar-row" class="panel panel-top">
       <div id="tab-bar" role="tablist"></div>
-      <button id="new-tab" title="New tab (Alt+N)">+</button>
+      <button id="new-tab" title="New tab (Ctrl+N)">+</button>
       <span class="spacer"></span>
       <button id="open-file" title="Open .sql (Ctrl+O)">Open</button>
       <button id="save-file" title="Save (Ctrl+S)">Save</button>
@@ -154,7 +156,7 @@
       <h1>Alkyon</h1>
       <div class="start-actions">
         <button id="start-open-folder">Open a folder…</button>
-        <button id="start-new-query">New query <kbd>Alt+N</kbd></button>
+        <button id="start-new-query">New query <kbd>Ctrl+N</kbd></button>
         <button id="start-add-source">Add a source…</button>
       </div>
       <div id="start-recent"></div>
@@ -391,6 +393,56 @@
 <!-- Anything that cannot be undone asks first. Its own dialogue rather than the
      browser's `confirm`, which Chrome lets you silence for the rest of the session
      — and a silenced confirmation is a source deleted without being asked. -->
+<dialog id="settings-dialog">
+  <form id="settings-form" method="dialog">
+    <h2>Settings</h2>
+
+    <label>Save to
+      <select name="scope">
+        <option value="user">Mine — kept in my config directory</option>
+        <option value="project">This folder — .alkyon/settings.json, committable</option>
+      </select>
+    </label>
+    <p class="hint" id="settings-where"></p>
+
+    <fieldset>
+      <legend>Completion</legend>
+      <!-- Two switches and not one, because they are two different things: the
+           list comes from the schema alkyon already holds, the greyed suggestion
+           comes from a model. -->
+      <label>Dropdown
+        <select name="dropdown">
+          <option value="true">On — names from the schema, offline</option>
+          <option value="false">Off — Ctrl+Space still opens it</option>
+        </select>
+      </label>
+      <label>Ghost text
+        <select name="ghost_text">
+          <option value="false">Off</option>
+          <option value="true">On — asks a model as you type</option>
+        </select>
+      </label>
+      <label class="ghost-only">Model <input name="model" spellcheck="false" size="28"></label>
+      <label class="ghost-only">Idle before asking
+        <input name="debounce_ms" type="number" min="50" max="5000" step="50">
+      </label>
+      <label class="ghost-only">Tables with columns
+        <input name="max_tables" type="number" min="0" max="200"
+               title="How many of the tables a statement reads travel with their columns. The rest go as bare names.">
+      </label>
+      <p class="hint ghost-only">Ghost text sends the schema of the selected source and the
+        text you are writing to the model. It never sends a row of data. The key comes from
+        <code id="settings-key-variable"></code> in the environment alkyon was started from.</p>
+    </fieldset>
+
+    <p class="note" id="settings-note" hidden></p>
+    <div class="actions">
+      <button type="button" id="settings-cancel">Cancel</button>
+      <button type="submit" id="settings-save">Save</button>
+    </div>
+  </form>
+</dialog>
+
 <dialog id="confirm-dialog">
   <h2 id="confirm-title">Are you sure?</h2>
   <p class="hint" id="confirm-detail"></p>

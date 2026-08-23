@@ -15,6 +15,12 @@
 # Rust
 /target
 
+# Tauri writes its permission schemas here at build time. Generated from the
+# config and the plugins in use, so it is an artefact of the build rather than
+# something to review — alkyon declares no commands and uses no plugins, which is
+# why the capabilities file it describes does not exist.
+/gen
+
 # Release artefacts. The Linux binary is built in a container whose target
 # directory is a Docker volume, so the only way back to the host is through the
 # bind mount of this repository — it lands here rather than under /target.
